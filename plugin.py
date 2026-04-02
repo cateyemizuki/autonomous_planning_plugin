@@ -106,6 +106,31 @@ class AutonomousPlanningPlugin(BasePlugin):
                     default="",
                     description="自定义日程生成提示词（如\"今天想多运动\"、\"专注学习\"等，留空则使用默认风格）"
                 ),
+                "auto_infer_next_day_prompt": ConfigField(
+                    type=bool,
+                    default=False,
+                    description="是否在晚间自动推断次日策略提示词（默认关闭）"
+                ),
+                "infer_time": ConfigField(
+                    type=str,
+                    default="22:30",
+                    description="次日策略推断时间（HH:MM格式）"
+                ),
+                "infer_lookback_days": ConfigField(
+                    type=int,
+                    default=3,
+                    description="次日策略推断时回看历史天数（1-7）"
+                ),
+                "infer_max_prompt_chars": ConfigField(
+                    type=int,
+                    default=300,
+                    description="次日策略推断结果最大字符数"
+                ),
+                "infer_use_completion_signal": ConfigField(
+                    type=bool,
+                    default=True,
+                    description="推断时是否参考活动状态和进度"
+                ),
                 "max_future_activities": ConfigField(
                     type=int,
                     default=3,
