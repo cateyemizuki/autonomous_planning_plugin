@@ -90,6 +90,13 @@ auto_schedule_time = "00:30"  # 每天生成时间
 ```toml
 [autonomous_planning.schedule]
 custom_prompt = "今天想多运动，至少3小时运动时间"
+
+# 可选：让插件在晚间自动推断“明天该怎么安排”
+auto_infer_next_day_prompt = true
+infer_time = "22:30"
+infer_lookback_days = 3
+infer_max_prompt_chars = 300
+infer_use_completion_signal = true
 ```
 
 #### 使用示例
@@ -114,9 +121,23 @@ custom_prompt = "今天想多运动，至少3小时运动时间"
 | `quality_threshold` | 0.85 | 质量阈值（0.80-0.90） |
 | `min_description_length` | 20 | 活动描述最小字符数 |
 | `custom_prompt` | "" | 自定义日程风格 ⭐ |
+| `auto_infer_next_day_prompt` | false | 是否自动推断次日策略提示词 ⭐ |
+| `infer_time` | "22:30" | 次日策略推断时间 |
+| `infer_lookback_days` | 3 | 推断时回看历史天数（1-7） |
+| `infer_max_prompt_chars` | 300 | 次日策略提示词最大长度 |
+| `infer_use_completion_signal` | true | 推断时是否参考完成状态/进度 |
 | `max_future_activities` | 3 | 智能注入显示的未来活动数 ⭐ |
 | `auto_schedule_time` | "00:30" | 定时生成时间 |
 | `admin_users` | [] | 管理员QQ号列表 |
+
+### 次日自动推断（新功能）
+
+当 `auto_infer_next_day_prompt = true` 时，插件会在 `infer_time` 自动读取最近 `infer_lookback_days` 天的日程，
+由 LLM 生成一段“次日策略提示词”，并在第二天自动生成日程时优先使用该提示词。
+
+- 推断失败会自动回退到 `custom_prompt`，不会中断日程生成
+- 不会替换你原有配置，只是对次日生成做动态增强
+- 推断结果会缓存到 `data/next_day_prompt.json`（便于重启后继续使用）
 
 ### 智能注入配置（v3.3.0优化）⭐
 
