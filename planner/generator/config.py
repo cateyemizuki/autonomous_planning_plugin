@@ -13,11 +13,11 @@ Example:
     8
 """
 
+import logging
 from typing import Any, Dict, Optional
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.config")
+logger = logging.getLogger(__name__)
 
 
 class ScheduleGeneratorConfig:
@@ -84,6 +84,12 @@ class ScheduleGeneratorConfig:
 
         # === 自定义模型配置 ===
         self.custom_model = config_dict.get('custom_model', {})
+
+        # === v4 新增：LLM 任务名 + bot 全局配置（由 plugin 注入） ===
+        self.llm_task_name = str(config_dict.get('llm_task_name', 'replyer')).strip() or 'replyer'
+        self.bot_profile = dict(config_dict.get('bot_profile', {}) or {})
+        # 时区（由 plugin 注入；旧版默认 Asia/Shanghai）
+        self.timezone = config_dict.get('timezone', 'Asia/Shanghai')
 
         # 保存原始配置字典（用于传递给子组件）
         self._raw_config = config_dict
@@ -195,6 +201,10 @@ class ScheduleGeneratorConfig:
             'cache_ttl': self.cache_ttl,
             'cache_max_size': self.cache_max_size,
             'custom_model': self.custom_model,
+            # v4 新增：LLM 任务名 + bot 全局配置 + 时区
+            'llm_task_name': self.llm_task_name,
+            'bot_profile': self.bot_profile,
+            'timezone': self.timezone,
         }
 
     def __repr__(self) -> str:

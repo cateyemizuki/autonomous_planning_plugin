@@ -1,288 +1,388 @@
-"""麦麦自主规划插件 - 主文件"""
+"""麦麦自主规划插件 v4 - 正式骨架（阶段 1 产物）
+
+完整 7 个组件外壳已就位，业务逻辑下沉到 ``services/`` 各占位 service。
+后续阶段在 service 中填充 v3 迁移过来的业务代码即可，无需再动 plugin.py。
+
+组件总览：
+- 4 个 ``@Tool``      ：manage_goal_v4 / get_planning_status_v4 / generate_schedule_v4 / apply_schedule_v4
+- 1 个 ``@Command``   ：planning_v4 (``/plan`` 或 ``/规划``)
+- 1 个 ``@EventHandler`` ：autonomous_planner_v4 (ON_START)
+- 1 个 ``@HookHandler``  ：schedule_inject_v4 (maisaka.planner.before_request) ⭐ v4 新注入入口
+"""
+
+from pathlib import Path
+from typing import Any, ClassVar, Dict, List, Tuple
 
 import asyncio
-from typing import List, Tuple
+import logging
 
-from src.plugin_system import BasePlugin, register_plugin, ConfigField
-from src.common.logger import get_logger
+from maibot_sdk import Command, EventHandler, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
-from .tools import ManageGoalTool, GetPlanningStatusTool, GenerateScheduleTool, ApplyScheduleTool
-from .handlers import AutonomousPlannerEventHandler, ScheduleInjectEventHandler
-from .commands import PlanningCommand
-from .planner.auto_scheduler import ScheduleAutoScheduler
+from .config_models import AutonomousPlanningV4Config
+from .services import CleanupService, CommandService, InjectService, ToolsService
 
-logger = get_logger("autonomous_planning")
 
-@register_plugin
-class AutonomousPlanningPlugin(BasePlugin):
-    """麦麦自主规划插件"""
+logger = logging.getLogger(__name__)
 
-    plugin_name: str = "autonomous_planning_plugin"
-    enable_plugin: bool = True
-    dependencies: List[str] = []  # perception_plugin 是可选依赖
-    python_dependencies: List[str] = []
-    config_file_name: str = "config.toml"
+# get_config 路径访问的哨兵值（区分 "字段不存在" 和 "字段值为 None"）
+_SENTINEL = object()
 
-    config_section_descriptions = {
-        "plugin": "插件基本配置",
-        "autonomous_planning": "自主规划总配置",
-        "autonomous_planning.schedule": "日程管理配置",
-        "autonomous_planning.schedule.inject": "智能注入配置",
-        "autonomous_planning.schedule.custom_model": "自定义模型配置"
-    }
 
-    config_schema: dict = {
-        "plugin": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用插件"
+class AutonomousPlanningPluginV4(MaiBotPlugin):
+    """麦麦自主规划插件 v4"""
+
+    config_model: ClassVar[type[PluginConfigBase]] = AutonomousPlanningV4Config
+
+    def __init__(self) -> None:
+        """初始化插件基础字段，service 实例延迟到 ``on_load`` 创建。"""
+        super().__init__()
+        self._plugin_root: Path = Path(__file__).resolve().parent
+        self._tools_svc: ToolsService | None = None
+        self._cmd_svc: CommandService | None = None
+        self._inject_svc: InjectService | None = None
+        self._cleanup_svc: CleanupService | None = None
+        self._bg_tasks: List[asyncio.Task] = []
+        # v4 新增：bot 全局配置缓存（on_load 时一次性拉取）
+        self._bot_profile: Dict[str, str] = {}
+
+    # ============================================================
+    # 生命周期
+    # ============================================================
+
+    async def on_load(self) -> None:
+        """插件加载完成：建立数据目录、初始化 services、启动后台任务。"""
+        # 仅当插件被启用时才初始化 service 与启动后台任务
+        if not self.config.plugin.enabled:
+            logger.warning("[v4] 插件已禁用（plugin.enabled=False），跳过初始化")
+            return
+
+        data_dir = self._plugin_root / "data"
+        data_dir.mkdir(exist_ok=True)
+        db_path = str(data_dir / "goals.db")
+
+        # v4 新增：预拉取 bot 全局配置（personality / bot.nickname 等）一次性缓存
+        # PromptBuilder 不再运行时调用 config_api.get_global_config
+        self._bot_profile = await self._prefetch_bot_profile()
+
+        # 初始化 services（依赖注入：plugin 自身 + 数据库路径）
+        self._tools_svc = ToolsService(self, db_path=db_path)
+        self._cmd_svc = CommandService(self)
+        self._inject_svc = InjectService(self)
+        self._cleanup_svc = CleanupService(self)
+
+        # 启动后台任务（清理循环 + 自动调度循环 + 注入缓存预热）
+        self._bg_tasks.append(asyncio.create_task(self._cleanup_svc.run_cleanup_loop()))
+        self._bg_tasks.append(asyncio.create_task(self._cleanup_svc.run_scheduler_loop()))
+        self._bg_tasks.append(asyncio.create_task(self._inject_svc.preheat_cache()))
+
+        logger.info("[v4] 自主规划插件 v4 已加载，data_dir=%s", data_dir)
+
+    async def _prefetch_bot_profile(self) -> Dict[str, str]:
+        """预拉取 bot 全局配置（人设、回复风格、兴趣、昵称）。
+
+        失败时返回空字典，PromptBuilder 会使用内置默认值。
+
+        Returns:
+            ``{"personality": str, "reply_style": str, "interest": str, "bot_name": str}``
+        """
+        profile: Dict[str, str] = {}
+        try:
+            personality = await self.ctx.config.get("personality.personality", "")
+            reply_style = await self.ctx.config.get("personality.reply_style", "")
+            interest = await self.ctx.config.get("personality.interest", "")
+            bot_name = await self.ctx.config.get("bot.nickname", "")
+            profile = {
+                "personality": str(personality or ""),
+                "reply_style": str(reply_style or ""),
+                "interest": str(interest or ""),
+                "bot_name": str(bot_name or ""),
+            }
+            logger.debug("[v4] bot_profile 已预拉取: %s", profile)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[v4] 预拉取 bot_profile 失败，使用空值: %s", exc)
+        return profile
+
+    async def on_unload(self) -> None:
+        """插件卸载：通知所有循环停止 → cancel 后台任务 → 等待退出。"""
+        if self._cleanup_svc is not None:
+            await self._cleanup_svc.stop()
+
+        for task in self._bg_tasks:
+            if not task.done():
+                task.cancel()
+
+        # 等待全部任务退出（异常吞掉，避免阻塞卸载）
+        for task in self._bg_tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
+                logger.debug("后台任务退出: %s", exc)
+
+        self._bg_tasks.clear()
+        logger.info("[v4] 自主规划插件 v4 已卸载")
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        """处理配置热重载事件。
+
+        Args:
+            scope: 变更范围 (``self`` / ``bot`` / ``model``)
+            config_data: 当前范围最新配置数据
+            version: 配置版本号
+        """
+        del config_data
+        logger.info("[v4] 配置热更新 scope=%s version=%s", scope, version)
+        # services 持有 plugin 引用，配置通过 self.config.xxx 动态读取，无需特殊处理
+        # 阶段 4 起若有需要重置的状态（如重建缓存）再补充
+
+    # ============================================================
+    # 兼容辅助：v3 风格的 dotted key 配置访问
+    # ============================================================
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """通过点分割路径访问强类型配置。
+
+        v3 时代 BasePlugin 提供 ``get_config(path, default)``，业务代码（特别是
+        ``planner/auto_scheduler.py``）大量使用。v4 强类型 ``self.config.xxx.yyy``
+        语义等价但语法不同；本方法做点分割路径 → 属性访问的桥接，减少业务代码改动。
+
+        Args:
+            key: 点分割路径，如 ``"autonomous_planning.schedule.auto_schedule_time"``
+            default: 路径不存在时的回退值
+
+        Returns:
+            配置值；路径无效时返回 ``default``
+        """
+        if not key:
+            return default
+        try:
+            obj: Any = self.config
+            for part in key.split("."):
+                if isinstance(obj, dict):
+                    obj = obj.get(part, _SENTINEL)
+                else:
+                    obj = getattr(obj, part, _SENTINEL)
+                if obj is _SENTINEL:
+                    return default
+            return obj
+        except Exception:
+            return default
+
+    # ============================================================
+    # Tool 组件（4 个，对应 v3 的 4 个 BaseTool 子类）
+    # ============================================================
+
+    @Tool(
+        "manage_goal_v4",
+        description="管理麦麦的长期目标，支持创建、查看、更新、暂停、恢复、完成、取消、删除目标",
+        parameters=[
+            ToolParameterInfo(
+                name="action",
+                param_type=ToolParamType.STRING,
+                description="操作类型: create / list / get / update / pause / resume / complete / cancel / delete",
+                required=True,
             ),
-        },
-        "autonomous_planning": {
-            "cleanup_interval": ConfigField(
-                type=int,
-                default=3600,
-                description="清理间隔（秒）"
+            ToolParameterInfo(
+                name="goal_id",
+                param_type=ToolParamType.STRING,
+                description="目标 ID（除 create 和 list 外都需要）",
+                required=False,
             ),
-            "cleanup_old_goals_days": ConfigField(
-                type=int,
-                default=30,
-                description="保留历史记录天数"
+            ToolParameterInfo(
+                name="name",
+                param_type=ToolParamType.STRING,
+                description="目标名称（create 时必需）",
+                required=False,
             ),
-            "schedule": {
-                # 日程注入功能
-                "inject_schedule": ConfigField(
-                    type=bool,
-                    default=True,
-                    description="在对话时自然提到当前活动"
-                ),
-                "auto_generate": ConfigField(
-                    type=bool,
-                    default=True,
-                    description="询问日程时自动检查并生成"
-                ),
-                # 🆕 智能注入配置（v1.1.0新增）
-                "inject": {
-                    "inject_mode": ConfigField(
-                        type=str,
-                        default="smart",
-                        description="注入模式：smart(智能注入) 或 traditional(传统模式)"
-                    ),
-                    "enable_intent_classification": ConfigField(
-                        type=bool,
-                        default=True,
-                        description="启用意图分类（识别用户询问类型）"
-                    ),
-                    "enable_state_analysis": ConfigField(
-                        type=bool,
-                        default=True,
-                        description="启用状态分析（生成情感化活动描述）"
-                    ),
-                    "enable_inject_optimization": ConfigField(
-                        type=bool,
-                        default=True,
-                        description="启用注入优化（防止重复注入和无效打扰）"
-                    ),
-                    "casual_chat_inject_probability": ConfigField(
-                        type=float,
-                        default=0.5,
-                        description="闲聊时的注入概率（0.0-1.0）"
-                    ),
-                    "context_max_turns": ConfigField(
-                        type=int,
-                        default=3,
-                        description="对话上下文保留轮数"
-                    ),
-                    "context_ttl": ConfigField(
-                        type=int,
-                        default=600,
-                        description="对话上下文过期时间（秒）"
-                    ),
-                },
-                # 🎨 自定义提示词配置
-                "custom_prompt": ConfigField(
-                    type=str,
-                    default="",
-                    description="自定义日程生成提示词（如\"今天想多运动\"、\"专注学习\"等，留空则使用默认风格）"
-                ),
-                "auto_infer_next_day_prompt": ConfigField(
-                    type=bool,
-                    default=False,
-                    description="是否在晚间自动推断次日策略提示词（默认关闭）"
-                ),
-                "infer_time": ConfigField(
-                    type=str,
-                    default="22:30",
-                    description="次日策略推断时间（HH:MM格式）"
-                ),
-                "infer_lookback_days": ConfigField(
-                    type=int,
-                    default=3,
-                    description="次日策略推断时回看历史天数（1-7）"
-                ),
-                "infer_max_prompt_chars": ConfigField(
-                    type=int,
-                    default=300,
-                    description="次日策略推断结果最大字符数"
-                ),
-                "infer_use_completion_signal": ConfigField(
-                    type=bool,
-                    default=True,
-                    description="推断时是否参考活动状态和进度"
-                ),
-                "max_future_activities": ConfigField(
-                    type=int,
-                    default=3,
-                    description="智能注入时最多显示的未来活动数量"
-                ),
-                # 🎯 多轮生成配置
-                "use_multi_round": ConfigField(
-                    type=bool,
-                    default=True,
-                    description="启用多轮生成机制（通过多轮优化提升日程质量）"
-                ),
-                "max_rounds": ConfigField(
-                    type=int,
-                    default=2,
-                    description="最多生成轮数（1-3轮，推荐2轮）"
-                ),
-                "quality_threshold": ConfigField(
-                    type=float,
-                    default=0.85,
-                    description="质量阈值（0.80-0.90，达到此分数即停止优化）"
-                ),
-                # 📊 生成参数配置
-                "min_activities": ConfigField(
-                    type=int,
-                    default=8,
-                    description="最少活动数量（建议8-10个）"
-                ),
-                "max_activities": ConfigField(
-                    type=int,
-                    default=15,
-                    description="最多活动数量（建议12-15个）"
-                ),
-                "enable_detailed_description": ConfigField(
-                    type=bool,
-                    default=True,
-                    description="是否启用详细活动描述（关闭后生成、注入、命令都不显示详细描述）"
-                ),
-                "min_description_length": ConfigField(
-                    type=int,
-                    default=20,
-                    description="活动描述最小字符数"
-                ),
-                "max_description_length": ConfigField(
-                    type=int,
-                    default=50,
-                    description="活动描述最大字符数"
-                ),
-                "max_tokens": ConfigField(
-                    type=int,
-                    default=8192,
-                    description="AI生成的最大token数"
-                ),
-                "generation_timeout": ConfigField(
-                    type=float,
-                    default=180.0,
-                    description="单次生成超时时间（秒，推荐120-300秒）"
-                ),
-                # 💾 缓存配置
-                "cache_ttl": ConfigField(
-                    type=int,
-                    default=300,
-                    description="日程缓存有效期（秒，默认5分钟）"
-                ),
-                "cache_max_size": ConfigField(
-                    type=int,
-                    default=100,
-                    description="缓存最大条目数（LRU策略）"
-                ),
-                # ⏰ 定时自动生成配置
-                "auto_schedule_enabled": ConfigField(
-                    type=bool,
-                    default=True,
-                    description="每天定时自动生成日程"
-                ),
-                "auto_schedule_time": ConfigField(
-                    type=str,
-                    default="00:30",
-                    description="自动生成时间（HH:MM格式，如00:30表示凌晨0点30分）"
-                ),
-                "timezone": ConfigField(
-                    type=str,
-                    default="Asia/Shanghai",
-                    description="时区设置（如Asia/Shanghai、UTC等）"
-                ),
-                # 🔐 权限配置
-                "admin_users": ConfigField(
-                    type=list,
-                    default=[],
-                    description="管理员QQ号列表（如[\\\"12345\\\", \\\"67890\\\"]，留空则所有人可用）"
-                ),
-                # 🤖 自定义模型配置
-                "custom_model": {
-                    "enabled": ConfigField(
-                        type=bool,
-                        default=False,
-                        description="使用自定义AI模型（不使用主回复模型）"
-                    ),
-                    "model_name": ConfigField(
-                        type=str,
-                        default="",
-                        description="模型名称（如gpt-4、claude-3-opus等）"
-                    ),
-                    "api_base": ConfigField(
-                        type=str,
-                        default="",
-                        description="API地址（如https://api.openai.com/v1）"
-                    ),
-                    "api_key": ConfigField(
-                        type=str,
-                        default="",
-                        description="API密钥（建议使用环境变量）"
-                    ),
-                    "provider": ConfigField(
-                        type=str,
-                        default="",
-                        description="提供商类型（openai、anthropic、azure等）"
-                    ),
-                    "temperature": ConfigField(
-                        type=float,
-                        default=0.7,
-                        description="生成温度参数（0.0-1.0，越高越随机）"
-                    ),
-                },
-            },
-        },
-    }
+            ToolParameterInfo(
+                name="description",
+                param_type=ToolParamType.STRING,
+                description="目标描述（create 时必需）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="goal_type",
+                param_type=ToolParamType.STRING,
+                description="目标类型: health_check / social_maintenance / learn_topic / custom",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="priority",
+                param_type=ToolParamType.STRING,
+                description="优先级: high / medium / low",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="time_window",
+                param_type=ToolParamType.STRING,
+                description="时间窗口，格式 'HH:MM-HH:MM'（如 '09:00-10:30'）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="deadline_hours",
+                param_type=ToolParamType.FLOAT,
+                description="截止时间（从现在开始的小时数）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="parameters",
+                param_type=ToolParamType.STRING,
+                description="目标参数（JSON 字符串）",
+                required=False,
+            ),
+        ],
+    )
+    async def handle_manage_goal(self, **kwargs: Any) -> Dict[str, Any]:
+        """目标管理工具入口。"""
+        if self._tools_svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await self._tools_svc.manage_goal(**kwargs)
 
-    def __init__(self, *args, **kwargs):
-        """初始化插件"""
-        super().__init__(*args, **kwargs)
-        self.scheduler = None
-        logger.debug("自主规划插件初始化完成")
-        # 延迟启动调度器，确保插件系统完全初始化
-        asyncio.create_task(self._start_scheduler_after_delay())
+    @Tool(
+        "get_planning_status_v4",
+        description="查看今日日程安排，按时间顺序显示正在进行和即将到来的活动",
+        parameters=[
+            ToolParameterInfo(
+                name="detailed",
+                param_type=ToolParamType.BOOLEAN,
+                description="是否显示详细信息",
+                required=False,
+            ),
+        ],
+    )
+    async def handle_get_planning_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """规划状态查询工具入口。"""
+        if self._tools_svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await self._tools_svc.get_planning_status(**kwargs)
 
-    async def _start_scheduler_after_delay(self):
-        """延迟启动调度器（10秒后）"""
-        await asyncio.sleep(10)
-        self.scheduler = ScheduleAutoScheduler(self)
-        await self.scheduler.start()
+    @Tool(
+        "generate_schedule_v4",
+        description="自动生成并应用全局每日/每周/每月计划，使用 LLM 根据 bot 人设智能生成",
+        parameters=[
+            ToolParameterInfo(
+                name="schedule_type",
+                param_type=ToolParamType.STRING,
+                description="日程类型: daily / weekly / monthly",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="auto_apply",
+                param_type=ToolParamType.BOOLEAN,
+                description="是否立即应用日程（默认 true）",
+                required=False,
+            ),
+        ],
+    )
+    async def handle_generate_schedule(self, **kwargs: Any) -> Dict[str, Any]:
+        """日程生成工具入口。"""
+        if self._tools_svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await self._tools_svc.generate_schedule(**kwargs)
 
-    def get_plugin_components(self) -> List[Tuple]:
-        """获取插件组件"""
-        return [
-            # Tools - 供 LLM 直接调用的工具
-            (ManageGoalTool.get_tool_info(), ManageGoalTool),
-            (GetPlanningStatusTool.get_tool_info(), GetPlanningStatusTool),
-            (GenerateScheduleTool.get_tool_info(), GenerateScheduleTool),
-            (ApplyScheduleTool.get_tool_info(), ApplyScheduleTool),
-            # Event Handlers - 事件处理器
-            (AutonomousPlannerEventHandler.get_handler_info(), AutonomousPlannerEventHandler),
-            (ScheduleInjectEventHandler.get_handler_info(), ScheduleInjectEventHandler),
-            # Commands - 命令处理
-            (PlanningCommand.get_command_info(), PlanningCommand),
-        ]
+    @Tool(
+        "apply_schedule_v4",
+        description="应用之前生成的日程，将日程项转换为全局可执行的目标",
+        parameters=[
+            ToolParameterInfo(
+                name="schedule_data",
+                param_type=ToolParamType.STRING,
+                description="日程数据（从 generate_schedule 获取，JSON 字符串）",
+                required=True,
+            ),
+        ],
+    )
+    async def handle_apply_schedule(self, **kwargs: Any) -> Dict[str, Any]:
+        """日程应用工具入口。"""
+        if self._tools_svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await self._tools_svc.apply_schedule(**kwargs)
+
+    # ============================================================
+    # Command 组件
+    # ============================================================
+
+    @Command(
+        "planning_v4",
+        description="麦麦自主规划系统管理命令（支持 /plan 与 /规划）",
+        pattern=r"(?P<planning_cmd>^/(plan|规划).*$)",
+    )
+    async def handle_planning_command(
+        self,
+        text: str = "",
+        stream_id: str = "",
+        user_id: str = "",
+        platform: str = "",
+        group_id: str = "",
+        matched_groups: Any = None,
+        **kwargs: Any,
+    ) -> Tuple[bool, str, bool]:
+        """``/plan`` 命令入口，转发给 CommandService。"""
+        del kwargs
+        if self._cmd_svc is None:
+            if stream_id:
+                await self.ctx.send.text("插件未启用", stream_id)
+            return False, "插件未启用", True
+        return await self._cmd_svc.execute(
+            text=text,
+            stream_id=stream_id,
+            user_id=user_id,
+            platform=platform,
+            group_id=group_id,
+            matched_groups=matched_groups if isinstance(matched_groups, dict) else {},
+        )
+
+    # ============================================================
+    # EventHandler 组件（ON_START 用作启动信号；POST_LLM 不再使用，见 POC_RESULT.md）
+    # ============================================================
+
+    @EventHandler(
+        "autonomous_planner_v4",
+        description="启动事件处理器：用于配合主程序生命周期发出启动日志",
+        event_type=EventType.ON_START,
+        intercept_message=False,
+        weight=10,
+    )
+    async def handle_on_start(self, **kwargs: Any) -> Tuple[bool, bool, Any, Any, Any]:
+        """主程序 ON_START 事件回调。
+
+        所有后台任务已在 ``on_load`` 中启动，这里仅做日志确认。
+        """
+        del kwargs
+        logger.info("[v4] 收到 ON_START 事件，后台任务运行中")
+        return True, True, None, None, None
+
+    # ============================================================
+    # HookHandler 组件（v4 注入入口，替代 v3 的 POST_LLM）
+    # ============================================================
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="schedule_inject_v4",
+        description="在 Maisaka 向 LLM 发起规划请求前注入当前日程信息",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def handle_inject_schedule(
+        self,
+        messages: List[Dict[str, Any]] | None = None,
+        session_id: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """日程注入 Hook 入口，转发给 InjectService。"""
+        if self._inject_svc is None or not self.config.autonomous_planning.schedule.inject_schedule:
+            return {"action": "continue"}
+        return await self._inject_svc.inject_into_planner_messages(
+            messages=messages or [],
+            session_id=session_id,
+            **kwargs,
+        )
+
+
+def create_plugin() -> AutonomousPlanningPluginV4:
+    """创建 v4 插件实例（Runner 加载入口）。
+
+    Returns:
+        AutonomousPlanningPluginV4: 新的 v4 插件实例
+    """
+    return AutonomousPlanningPluginV4()

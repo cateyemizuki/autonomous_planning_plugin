@@ -14,13 +14,12 @@
 5. 保持向后兼容的公开API
 """
 
+import logging
 import asyncio
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from src.common.logger import get_logger
-from src.plugin_system.apis import llm_api
 
 from ..core.exceptions import (
     LLMError,
@@ -40,7 +39,7 @@ from .generator import (
     ScheduleSemanticValidator,
 )
 
-logger = get_logger("autonomous_planning.schedule_generator")
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -63,14 +62,21 @@ class ScheduleGenerator:
     - ScheduleGeneratorConfig: 配置管理
     """
 
-    def __init__(self, goal_manager: GoalManager, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        goal_manager: GoalManager,
+        config: Optional[Dict[str, Any]] = None,
+        plugin: Optional[Any] = None,
+    ):
         """初始化日程生成器
 
         Args:
             goal_manager: 目标管理器
             config: 配置字典
+            plugin: 插件实例引用（用于通过 ctx.llm 调用 LLM；v4 必需）
         """
         self.goal_manager = goal_manager
+        self._plugin = plugin  # v4 新增：用于访问 ctx.llm.generate
 
         # 🆕 使用配置管理器（DRY原则）
         self.config = ScheduleGeneratorConfig(config)
@@ -525,7 +531,7 @@ class ScheduleGenerator:
         return schedule_items
 
     async def _call_llm(self, prompt: str) -> List[Dict[str, Any]]:
-        """调用LLM并解析响应
+        """调用 LLM 并解析响应（v4：通过 ctx.llm.generate）
 
         Args:
             prompt: 提示词
@@ -534,19 +540,23 @@ class ScheduleGenerator:
             日程项列表
 
         Raises:
-            LLMError: LLM调用失败
+            LLMError: LLM 调用失败
         """
-        # 获取模型配置
-        model_config, max_tokens, temperature = self.base_generator.get_model_config()
+        # 获取任务名 + 参数（v4：task_name 字符串，不再是 model_config 对象）
+        task_name, max_tokens, temperature = self.base_generator.get_model_config()
 
-        # 调用LLM
-        success, response, reasoning, model_name = await llm_api.generate_with_model(
-            prompt,
-            model_config=model_config,
-            request_type="plugin.autonomous_planning.schedule_gen",
+        # v4：必须通过插件 ctx.llm 调用，未注入 plugin 视为编程错误
+        if self._plugin is None:
+            raise LLMError("ScheduleGenerator 未注入 plugin 实例，无法调用 ctx.llm.generate")
+
+        llm_result = await self._plugin.ctx.llm.generate(
+            prompt=prompt,
+            model=task_name,
             max_tokens=max_tokens,
-            temperature=temperature
+            temperature=temperature,
         )
+        success = bool(llm_result.get("success", False))
+        response = str(llm_result.get("response", ""))
 
         if not success:
             # 智能识别错误类型

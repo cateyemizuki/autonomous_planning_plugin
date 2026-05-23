@@ -2,61 +2,66 @@
 
 This module provides prompt building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
+
+v4 改造：
+    - 删除 ``config_api.get_global_config`` 直连
+    - 全局配置（personality / bot.nickname 等）由 ``config`` 字典中的 ``bot_profile`` 段提供
+    - ``bot_profile`` 由 ``ToolsService`` 在构造 ScheduleGenerator 前从插件 ctx 拉取
 """
 
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-from src.common.logger import get_logger
-from src.plugin_system.apis import config_api
 
 # 类型提示导入
 from ...utils.timezone_manager import TimezoneManager
 
-logger = get_logger("autonomous_planning.prompt_builder")
+logger = logging.getLogger(__name__)
+
+
+# 全局配置默认值（与 v3 等价）
+_DEFAULT_PERSONALITY = "是一个女大学生"
+_DEFAULT_REPLY_STYLE = ""
+_DEFAULT_INTEREST = ""
+_DEFAULT_BOT_NAME = "麦麦"
 
 
 class PromptBuilder:
-    """提示词构建器 - 单一职责：构建LLM提示词
+    """提示词构建器 - 单一职责：构建 LLM 提示词
 
     该类负责：
-    1. 构建初始日程生成提示词
-    2. 构建带反馈的重试提示词
-    3. 整合配置、上下文、Schema约束
+        1. 构建初始日程生成提示词
+        2. 构建带反馈的重试提示词
+        3. 整合配置、上下文、Schema 约束
 
-    与BaseScheduleGenerator的区别：
-    - 只负责提示词构建，不涉及时区、模型配置、上下文加载
-    - 通过构造函数接收所有依赖（依赖注入）
+    v4 改造：
+        - 全局配置通过 ``config["bot_profile"]`` 字典传入（由插件层在 ``on_load``
+          时一次性拉取并缓存），不再运行时调用 ``config_api``
     """
 
     def __init__(self, config: Dict[str, Any], tz_manager: TimezoneManager):
-        """初始化提示词构建器
+        """初始化提示词构建器。
 
         Args:
-            config: 配置字典
+            config: 配置字典，期望含 ``bot_profile`` 子段：
+                ``{"personality": str, "reply_style": str, "interest": str, "bot_name": str}``
             tz_manager: 时区管理器（用于获取当前时间）
         """
         self.config = config
         self.tz_manager = tz_manager
 
-        # 缓存全局配置（避免重复调用config_api）
-        self._personality: Optional[str] = None
-        self._reply_style: Optional[str] = None
-        self._interest: Optional[str] = None
-        self._bot_name: Optional[str] = None
-
     def _get_cached_config(self) -> tuple[str, str, str, str]:
-        """延迟加载并缓存全局配置
+        """读取由插件层注入的 bot 配置（无 IO，纯字典访问）。
 
         Returns:
-            (personality, reply_style, interest, bot_name)
+            ``(personality, reply_style, interest, bot_name)`` 元组
         """
-        if self._personality is None:
-            self._personality = config_api.get_global_config("personality.personality", "是一个女大学生")
-            self._reply_style = config_api.get_global_config("personality.reply_style", "")
-            self._interest = config_api.get_global_config("personality.interest", "")
-            self._bot_name = config_api.get_global_config("bot.nickname", "麦麦")
-        return self._personality, self._reply_style, self._interest, self._bot_name
+        bot_profile: Dict[str, Any] = self.config.get("bot_profile", {}) or {}
+        personality = str(bot_profile.get("personality") or _DEFAULT_PERSONALITY)
+        reply_style = str(bot_profile.get("reply_style") or _DEFAULT_REPLY_STYLE)
+        interest = str(bot_profile.get("interest") or _DEFAULT_INTEREST)
+        bot_name = str(bot_profile.get("bot_name") or _DEFAULT_BOT_NAME)
+        return personality, reply_style, interest, bot_name
 
     def build_schedule_prompt(
         self,

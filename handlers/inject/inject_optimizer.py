@@ -4,15 +4,15 @@
 通过记录注入历史、检查时间间隔等方式，优化注入策略。
 """
 
+import logging
 import random
 import time
 from typing import Dict, Optional, Tuple
 
-from src.common.logger import get_logger
 
 from .intent_classifier import UserIntent
 
-logger = get_logger("autonomous_planning.inject_optimizer")
+logger = logging.getLogger(__name__)
 
 
 class InjectOptimizer:

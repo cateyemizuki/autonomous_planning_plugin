@@ -4,11 +4,11 @@ This module provides JSON Schema building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 """
 
+import logging
 from typing import Any, Dict
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.schema_builder")
+logger = logging.getLogger(__name__)
 
 
 class SchemaBuilder:

@@ -3,11 +3,11 @@
 This module provides semantic validation for schedule items.
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.validator")
+logger = logging.getLogger(__name__)
 
 
 class ScheduleSemanticValidator:

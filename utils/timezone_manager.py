@@ -4,12 +4,12 @@ This module provides centralized timezone handling functionality,
 eliminating code duplication across multiple modules.
 """
 
+import logging
 from datetime import datetime
 from typing import Optional
 
-from src.common.logger import get_logger
 
-logger = get_logger("autonomous_planning.timezone_manager")
+logger = logging.getLogger(__name__)
 
 
 class TimezoneManager:

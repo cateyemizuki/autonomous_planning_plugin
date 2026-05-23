@@ -12,15 +12,15 @@ Example:
     >>> items = parser.extract_schedule_items(data)
 """
 
+import logging
 import json
 import re
 from typing import Any, Dict, List, Optional
 
-from src.common.logger import get_logger
 
 from ...core.exceptions import LLMInvalidResponseError
 
-logger = get_logger("autonomous_planning.response_parser")
+logger = logging.getLogger(__name__)
 
 
 class LLMResponseParser:

@@ -12,18 +12,18 @@ Example:
     >>> await scheduler.start()  # Start background task
 """
 
+import logging
 import asyncio
 import datetime
 import json
 from pathlib import Path
 from typing import Optional
 
-from src.common.logger import get_logger
-from src.plugin_system.apis import llm_api
+
 from ..utils.timezone_manager import TimezoneManager
 from .generator import BaseScheduleGenerator
 
-logger = get_logger("autonomous_planning.auto_scheduler")
+logger = logging.getLogger(__name__)
 
 
 class ScheduleAutoScheduler:
@@ -57,7 +57,7 @@ class ScheduleAutoScheduler:
         self.plugin = plugin
         self.is_running = False
         self.task = None
-        self.logger = get_logger("ScheduleAutoScheduler")
+        self.logger = logging.getLogger(__name__)
 
         # 初始化时区管理器
         timezone_str = plugin.get_config("autonomous_planning.schedule.timezone", "Asia/Shanghai")
@@ -272,17 +272,22 @@ class ScheduleAutoScheduler:
 
         try:
             model_helper = BaseScheduleGenerator(goal_manager, schedule_config)
-            model_config, max_tokens, temperature = model_helper.get_model_config()
+            task_name, max_tokens, temperature = model_helper.get_model_config()
             infer_max_tokens = max(256, min(1024, int(max_tokens)))
             infer_temperature = max(0.2, min(0.8, float(temperature)))
 
-            success, response, _, _ = await llm_api.generate_with_model(
-                prompt,
-                model_config=model_config,
-                request_type="plugin.autonomous_planning.next_day_infer",
+            # v4：必须通过插件 ctx.llm 调用，未注入 plugin 视为编程错误
+            if self.plugin is None or not hasattr(self.plugin, "ctx"):
+                raise RuntimeError("ScheduleAutoScheduler 未注入 plugin 实例，无法调用 ctx.llm.generate")
+
+            llm_result = await self.plugin.ctx.llm.generate(
+                prompt=prompt,
+                model=task_name,
                 max_tokens=infer_max_tokens,
                 temperature=infer_temperature,
             )
+            success = bool(llm_result.get("success", False))
+            response = str(llm_result.get("response", ""))
             if not success or not response:
                 self.logger.warning(f"次日推断失败: {response}")
                 return False
@@ -426,7 +431,11 @@ class ScheduleAutoScheduler:
                 schedule_config["custom_prompt"] = effective_prompt
                 self.logger.info("已应用次日推断策略到今日日程生成")
 
-            schedule_generator = self.ScheduleGenerator(goal_manager=goal_manager, config=schedule_config)
+            schedule_generator = self.ScheduleGenerator(
+                goal_manager=goal_manager,
+                config=schedule_config,
+                plugin=self.plugin,  # v4: 注入 plugin 引用以便用 ctx.llm.generate
+            )
 
             schedule = await schedule_generator.generate_daily_schedule(
                 user_id="system",

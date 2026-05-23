@@ -1,0 +1,680 @@
+"""日程注入业务实现。
+
+对应旧版 ``handlers/handlers.py:ScheduleInjectEventHandler``，但**注入入口已从
+POST_LLM 事件改为 HookHandler("maisaka.planner.before_request")**（详见
+POC_RESULT.md）。
+
+业务子模块（IntentClassifier / ActivityStateAnalyzer / InjectOptimizer /
+ContentTemplateEngine / ConversationContextCache）从 v3 直接复用。
+
+核心改造：v3 修改 ``message.llm_prompt: str``（追加文本），v4 改为操作
+``messages: list[PromptMessage]``（在第一个 system 消息后插入新的 system 消息）。
+"""
+
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+import asyncio
+import logging
+import re
+import time
+
+from ..cache.lru_cache import LRUCache
+from ..planner.goal_manager import get_goal_manager
+from ..utils.time_utils import parse_time_window
+from ..utils.timezone_manager import TimezoneManager
+from ..handlers.exception_handler import handle_exception, handle_exception_silent
+
+if TYPE_CHECKING:
+    from ..plugin import AutonomousPlanningPluginV4
+
+logger = logging.getLogger(__name__)
+
+
+# 时间相关关键词（用于传统模式判断是否需要注入日程）
+_TIME_KEYWORDS = {
+    "现在", "当前", "正在", "在做", "在干",
+    "今天", "今日", "今早", "今晚",
+    "明天", "昨天", "后天", "前天",
+    "几点", "什么时候", "多久", "时间",
+    "安排", "计划", "日程", "行程",
+    "接下来", "等下", "稍后", "之后",
+    "早上", "中午", "下午", "晚上", "夜里",
+    "忙", "空闲", "有空", "在忙",
+    "做什么", "干什么", "要做",
+}
+
+# 预编译正则（一次匹配所有时间关键词）
+_TIME_KEYWORDS_PATTERN = re.compile("|".join(_TIME_KEYWORDS))
+
+
+class InjectService:
+    """日程注入服务。"""
+
+    def __init__(self, plugin: "AutonomousPlanningPluginV4") -> None:
+        """初始化 InjectService，加载智能注入组件、缓存、配置。
+
+        Args:
+            plugin: 当前插件实例
+        """
+        self._plugin = plugin
+        cfg = plugin.config.autonomous_planning.schedule
+
+        # 缓存
+        self._schedule_cache: LRUCache = LRUCache(max_size=cfg.cache_max_size)
+        self._schedule_cache_ttl: int = cfg.cache_ttl
+        self._cache_cleanup_interval: int = 600  # 10 分钟清理一次
+        self._last_cache_cleanup: float = 0.0
+
+        # 时区管理器
+        self._tz_manager: TimezoneManager = TimezoneManager(cfg.timezone)
+
+        # 智能注入组件（v3 复用）
+        self._intent_classifier: Optional[Any] = None
+        self._state_analyzer: Optional[Any] = None
+        self._content_engine: Optional[Any] = None
+        self._inject_optimizer: Optional[Any] = None
+        self._context_cache: Optional[Any] = None
+        self._activity_state_cls: Optional[Any] = None
+        self._inject_mode: str = cfg.inject.inject_mode
+
+        self._load_smart_components()
+
+        logger.debug(
+            "InjectService 初始化完成（mode=%s, cache_max=%d, cache_ttl=%d）",
+            self._inject_mode,
+            cfg.cache_max_size,
+            self._schedule_cache_ttl,
+        )
+
+    def _load_smart_components(self) -> None:
+        """加载智能注入子模块，加载失败则降级为 traditional 模式。"""
+        cfg = self._plugin.config.autonomous_planning.schedule
+        inj = cfg.inject
+
+        try:
+            from ..handlers.inject import (
+                ActivityState,
+                ActivityStateAnalyzer,
+                ContentTemplateEngine,
+                ConversationContextCache,
+                InjectOptimizer,
+                IntentClassifier,
+            )
+
+            self._intent_classifier = IntentClassifier() if inj.enable_intent_classification else None
+            self._state_analyzer = ActivityStateAnalyzer() if inj.enable_state_analysis else None
+            self._content_engine = (
+                ContentTemplateEngine(self._state_analyzer) if inj.enable_state_analysis else None
+            )
+            self._inject_optimizer = (
+                InjectOptimizer(
+                    cache_ttl=self._schedule_cache_ttl,
+                    casual_inject_probability=inj.casual_chat_inject_probability,
+                )
+                if inj.enable_inject_optimization
+                else None
+            )
+            self._context_cache = ConversationContextCache(
+                max_turns=inj.context_max_turns,
+                ttl=inj.context_ttl,
+            )
+            self._activity_state_cls = ActivityState
+
+            logger.debug(
+                "✅ 智能注入组件已加载 (mode=%s, intent=%s, state=%s, optimizer=%s, context=%d/%ds)",
+                self._inject_mode,
+                inj.enable_intent_classification,
+                inj.enable_state_analysis,
+                inj.enable_inject_optimization,
+                inj.context_max_turns,
+                inj.context_ttl,
+            )
+        except ImportError as exc:
+            logger.warning(f"智能注入组件加载失败，降级为 traditional 模式: {exc}")
+            self._inject_mode = "traditional"
+            self._intent_classifier = None
+            self._state_analyzer = None
+            self._content_engine = None
+            self._inject_optimizer = None
+            self._context_cache = None
+            self._activity_state_cls = None
+
+    # ------------------------------------------------------------
+    # 后台缓存预热
+    # ------------------------------------------------------------
+
+    @handle_exception_silent("缓存预热失败: {e}", log_level="warning")
+    async def preheat_cache(self) -> None:
+        """启动后预热缓存（异步任务）。"""
+        await asyncio.sleep(5)  # 等待系统初始化
+        logger.debug("🔥 开始预热日程缓存...")
+        self._get_current_schedule("global")
+        logger.debug("✅ 日程缓存预热完成")
+
+    # ------------------------------------------------------------
+    # Hook 主入口
+    # ------------------------------------------------------------
+
+    async def inject_into_planner_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        session_id: str,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """``maisaka.planner.before_request`` Hook 入口。
+
+        在 Maisaka 向 LLM 发起规划请求前调用，按当前日程信息构造 system 消息
+        并插入到 messages 列表，达到 v3 等价的 prompt 注入效果。
+
+        Args:
+            messages: 序列化后的 PromptMessage dict 列表
+            session_id: 当前会话 ID
+            **kwargs: 其余 hook 参数（tool_definitions / selected_history_count 等）
+
+        Returns:
+            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs": {"messages": [...]}}``
+        """
+        del kwargs
+
+        if not messages or not isinstance(messages, list):
+            return {"action": "continue"}
+
+        cfg = self._plugin.config.autonomous_planning.schedule
+        if not self._plugin.config.plugin.enabled or not cfg.inject_schedule:
+            return {"action": "continue"}
+
+        try:
+            chat_id = session_id or "global"
+
+            # 提取最后一条 user 消息用于意图分析
+            user_message = self._extract_last_user_text(messages)
+            user_id = session_id or "unknown"
+
+            # 检查对话上下文：判断是否在连续讨论日程话题
+            context_continue_inject = False
+            context_reason: Optional[str] = None
+            if self._context_cache:
+                context_continue_inject, context_reason = self._context_cache.should_continue_inject(
+                    user_id, None,
+                )
+
+            # 获取当前日程
+            current_activity, current_description, all_future_activities, activity_type = self._get_current_schedule(chat_id)
+
+            # 更新对话上下文：用当前活动重新判断
+            if self._context_cache and context_continue_inject:
+                context_continue_inject, context_reason = self._context_cache.should_continue_inject(
+                    user_id, current_activity,
+                )
+
+            # 无当前活动：仅记录上下文，不注入
+            if not current_activity:
+                if self._context_cache:
+                    self._context_cache.add_turn(
+                        user_id=user_id,
+                        user_message=user_message,
+                        intent=None,
+                        injected=False,
+                        activity=None,
+                    )
+                return {"action": "continue"}
+
+            # 按模式构造注入文本
+            inject_content, injected, detected_intent = self._build_inject_text(
+                user_message=user_message,
+                current_activity=current_activity,
+                current_description=current_description,
+                future_activities=all_future_activities,
+                activity_type=activity_type,
+                context_continue_inject=context_continue_inject,
+                context_reason=context_reason,
+                user_id=user_id,
+            )
+
+            # 记录到上下文缓存
+            if self._context_cache:
+                self._context_cache.add_turn(
+                    user_id=user_id,
+                    user_message=user_message,
+                    intent=detected_intent,
+                    injected=injected,
+                    activity=current_activity,
+                )
+
+            if not inject_content:
+                return {"action": "continue"}
+
+            # 把注入文本作为 system 消息插入 messages 列表
+            modified_messages = self._inject_system_message(messages, inject_content)
+            return {
+                "action": "continue",
+                "modified_kwargs": {"messages": modified_messages},
+            }
+
+        except Exception as exc:
+            logger.error(f"注入日程信息失败: {exc}", exc_info=True)
+            return {"action": "continue"}
+
+    # ------------------------------------------------------------
+    # 消息提取与插入
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
+        """从 PromptMessage 列表里提取最新一条 user 消息的文本内容。
+
+        Args:
+            messages: 序列化后的 PromptMessage dict 列表
+
+        Returns:
+            最后一条 user 消息的文本（多片段时取第一个文本片段；找不到时返回空串）
+        """
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, str):
+                        return part
+                    if isinstance(part, dict) and "text" in part:
+                        return str(part["text"])
+                    if isinstance(part, (list, tuple)) and len(part) >= 2:
+                        # (format, base64) 元组形式跳过
+                        continue
+            return ""
+        return ""
+
+    @staticmethod
+    def _inject_system_message(
+        messages: List[Dict[str, Any]],
+        inject_content: str,
+    ) -> List[Dict[str, Any]]:
+        """把注入文本作为一条 system 消息插入到 messages 列表。
+
+        策略：紧跟在第一条 system 消息之后插入（不破坏原始人设 prompt）；
+        若没有 system 消息，则插到列表开头。
+
+        Args:
+            messages: 原始消息列表
+            inject_content: 要注入的文本
+
+        Returns:
+            新的消息列表（深拷贝级别的副本，避免污染调用方）
+        """
+        injection: Dict[str, Any] = {
+            "role": "system",
+            "content": inject_content,
+        }
+
+        # 找到第一个 system 消息的位置
+        first_system_idx: Optional[int] = None
+        for idx, msg in enumerate(messages):
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                first_system_idx = idx
+                break
+
+        new_messages = list(messages)  # 浅拷贝列表
+        insert_at = (first_system_idx + 1) if first_system_idx is not None else 0
+        new_messages.insert(insert_at, injection)
+        return new_messages
+
+    # ------------------------------------------------------------
+    # 注入文本构建（三种模式）
+    # ------------------------------------------------------------
+
+    def _build_inject_text(
+        self,
+        user_message: str,
+        current_activity: str,
+        current_description: Optional[str],
+        future_activities: List[Tuple[str, str]],
+        activity_type: Optional[str],
+        context_continue_inject: bool,
+        context_reason: Optional[str],
+        user_id: str,
+    ) -> Tuple[Optional[str], bool, Optional[str]]:
+        """根据 inject_mode 构造注入文本。
+
+        Returns:
+            (inject_content, injected, detected_intent) 三元组
+        """
+        if self._inject_mode == "smart":
+            return self._build_smart_text(
+                user_message=user_message,
+                current_activity=current_activity,
+                current_description=current_description,
+                future_activities=future_activities,
+                activity_type=activity_type,
+                context_continue_inject=context_continue_inject,
+                context_reason=context_reason,
+            )
+        if self._inject_mode == "rule" and self._intent_classifier and self._inject_optimizer:
+            return self._build_rule_text(
+                user_message=user_message,
+                current_activity=current_activity,
+                current_description=current_description,
+                future_activities=future_activities,
+                context_continue_inject=context_continue_inject,
+                context_reason=context_reason,
+                user_id=user_id,
+            )
+        return self._build_traditional_text(
+            current_activity=current_activity,
+            current_description=current_description,
+            future_activities=future_activities,
+        )
+
+    def _build_smart_text(
+        self,
+        user_message: str,
+        current_activity: str,
+        current_description: Optional[str],
+        future_activities: List[Tuple[str, str]],
+        activity_type: Optional[str],
+        context_continue_inject: bool,
+        context_reason: Optional[str],
+    ) -> Tuple[Optional[str], bool, Optional[str]]:
+        """LLM 软注入模式（推荐）：把日程作为可选上下文，由 LLM 自行判断使用。"""
+        # 轻量级预判：技术问答 / 命令场景直接跳过
+        msg_lower = user_message.lower() if user_message else ""
+        is_command = user_message.startswith("/") or user_message.startswith("sudo") if user_message else False
+        is_tech = any(kw in msg_lower for kw in ["怎么", "如何", "报错", "错误", "bug", "代码", "配置"])
+
+        if is_command or is_tech:
+            logger.debug("Smart 模式：检测到技术/命令场景，跳过注入")
+            return None, False, "tech_or_command"
+
+        if context_continue_inject:
+            logger.info(f"📖 对话上下文触发注入: {context_reason}")
+
+        inject_content = self._build_smart_inject_prompt(
+            current_activity=current_activity,
+            description=current_description or "",
+            future_activities=future_activities,
+            user_message=user_message,
+            activity_type=activity_type,
+        )
+        logger.info(f"✅ Smart 注入: {current_activity}")
+        return inject_content, True, None
+
+    def _build_rule_text(
+        self,
+        user_message: str,
+        current_activity: str,
+        current_description: Optional[str],
+        future_activities: List[Tuple[str, str]],
+        context_continue_inject: bool,
+        context_reason: Optional[str],
+        user_id: str,
+    ) -> Tuple[Optional[str], bool, Optional[str]]:
+        """规则引擎模式：意图分类 + InjectOptimizer 判断 + ContentTemplateEngine 生成。"""
+        if self._intent_classifier is None or self._inject_optimizer is None:
+            return None, False, None
+
+        intent, confidence = self._intent_classifier.classify(user_message)
+        detected_intent = intent.value
+
+        if context_continue_inject:
+            logger.info(f"📖 对话上下文触发注入: {context_reason}")
+            should_inject = True
+            skip_reason: Optional[str] = None
+        else:
+            should_inject, skip_reason = self._inject_optimizer.should_inject(
+                user_id, intent, current_activity, confidence,
+            )
+
+        if not should_inject:
+            logger.debug(f"Rule 模式：InjectOptimizer 决定跳过注入: {skip_reason}")
+            return None, False, detected_intent
+
+        if not self._content_engine:
+            return None, False, detected_intent
+
+        enable_detailed_description = self._plugin.config.autonomous_planning.schedule.enable_detailed_description
+        desc_to_inject = current_description if enable_detailed_description else None
+        inject_content = self._content_engine.build_inject_content(
+            intent=intent,
+            current_activity=current_activity,
+            current_description=desc_to_inject,
+            activity_state=None,
+            state_desc=desc_to_inject,
+            next_activities=future_activities,
+        )
+        if self._inject_optimizer:
+            self._inject_optimizer.record_injection(user_id, current_activity, inject_content or "", intent)
+
+        logger.info(f"✅ Rule 注入: intent={detected_intent}, confidence={confidence:.2f}")
+        return inject_content, True, detected_intent
+
+    def _build_traditional_text(
+        self,
+        current_activity: str,
+        current_description: Optional[str],
+        future_activities: List[Tuple[str, str]],
+    ) -> Tuple[Optional[str], bool, Optional[str]]:
+        """传统模式：固定模板注入。"""
+        enable_detailed_description = self._plugin.config.autonomous_planning.schedule.enable_detailed_description
+        inject_content = f"【当前状态】\n这会儿正{current_activity}"
+        if enable_detailed_description and current_description:
+            inject_content += f"（{current_description}）"
+        inject_content += "\n回复时可以自然提到当前在做什么，不要刻意强调。"
+        if future_activities:
+            next_time, next_activity = future_activities[0]
+            inject_content += f"\n等下 {next_time} 要 {next_activity}。"
+        inject_content += "\n"
+        logger.info(f"✅ Traditional 注入: {current_activity}")
+        return inject_content, True, None
+
+    def _build_smart_inject_prompt(
+        self,
+        current_activity: str,
+        description: str,
+        future_activities: List[Tuple[str, str]],
+        user_message: str,
+        activity_type: Optional[str] = None,
+    ) -> str:
+        """构建 smart 模式的注入文本（LLM 软注入）。
+
+        与 v3 实现等价。
+        """
+        del activity_type  # 当前未使用，保留参数兼容未来扩展
+
+        msg_lower = (user_message or "").lower()
+        is_direct_query = any(kw in msg_lower for kw in [
+            "在干嘛", "做什么", "忙吗", "在做", "正在",
+            "日程", "计划", "安排", "行程",
+            "现在", "当前", "这会儿",
+        ])
+        is_future_query = any(kw in msg_lower for kw in [
+            "接下来", "等下", "稍后", "之后", "待会",
+            "明天", "今晚", "晚上", "下午", "上午",
+        ])
+        is_greeting = any(kw in msg_lower for kw in [
+            "早上好", "晚上好", "早安", "晚安",
+            "你好", "hi", "hello", "嗨",
+        ])
+        is_tech_question = any(kw in msg_lower for kw in [
+            "怎么", "如何", "为什么", "什么是",
+            "报错", "错误", "bug", "异常",
+            "代码", "配置", "安装", "调试",
+        ])
+        is_command = user_message.startswith("/") or user_message.startswith("sudo") if user_message else False
+
+        cfg = self._plugin.config.autonomous_planning.schedule
+        enable_detailed_description = cfg.enable_detailed_description
+        max_show = cfg.max_future_activities
+
+        prompt_parts: List[str] = ["【可选上下文 - Bot 的当前日程】"]
+        if enable_detailed_description and description:
+            prompt_parts.append(f"现在：{current_activity}（{description}）")
+        else:
+            prompt_parts.append(f"现在：{current_activity}")
+
+        if future_activities:
+            prompt_parts.append("接下来的安排:")
+            for time_str, activity_name in future_activities[:max_show]:
+                prompt_parts.append(f"  {time_str} - {activity_name}")
+        prompt_parts.append("")
+
+        # 使用指导
+        if is_command:
+            prompt_parts.append("⚠️ 用户正在执行命令，请忽略以上日程信息，专注处理命令。")
+        elif is_tech_question:
+            prompt_parts.append("⚠️ 用户在询问技术问题，请忽略以上日程信息，专注回答技术内容。")
+        elif is_direct_query:
+            prompt_parts.append("💡 用户直接询问当前状态，请如实告知当前活动及状态。")
+        elif is_future_query:
+            prompt_parts.append("💡 用户询问未来计划，请自然地介绍后续安排。")
+        elif is_greeting:
+            prompt_parts.append("💡 用户在问候，可以自然地顺便提一下今天的计划（可选，不要强行提及）。")
+        else:
+            prompt_parts.append("💡 以上是 Bot 当前的日程信息，仅供参考。")
+            prompt_parts.append("   - 如果与用户问题相关，可以自然提及")
+            prompt_parts.append("   - 如果不相关，请完全忽略此信息")
+            prompt_parts.append("   - 不要为了提及日程而刻意转移话题")
+
+        prompt_parts.extend(["", "---", ""])
+        return "\n".join(prompt_parts)
+
+    # ------------------------------------------------------------
+    # 当前日程查询（带缓存，与 v3 等价）
+    # ------------------------------------------------------------
+
+    def _cleanup_expired_cache(self, current_time: float) -> None:
+        """清理过期缓存项（线程安全）。"""
+        with self._schedule_cache._lock:
+            expired_keys: List[str] = []
+            for key, (_, cached_time) in list(self._schedule_cache.cache.items()):
+                if current_time - cached_time > self._schedule_cache_ttl:
+                    expired_keys.append(key)
+            for key in expired_keys:
+                self._schedule_cache.cache.pop(key, None)
+            if expired_keys:
+                logger.debug(f"清理了 {len(expired_keys)} 个过期缓存项")
+
+    @handle_exception("获取当前日程信息失败: {e}", log_level="warning", default_return=(None, None, [], None))
+    def _get_current_schedule(
+        self,
+        chat_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]], Optional[str]]:
+        """获取当前日程信息（带 15 分钟窗口缓存）。
+
+        Returns:
+            ``(当前活动, 活动描述, 所有未来活动列表, 当前活动类型)``
+        """
+        now = self._tz_manager.get_now()
+        current_hour = now.hour
+        current_minute = now.minute
+        current_time = time.time()
+
+        # 15 分钟窗口缓存键
+        time_window = (current_hour * 60 + current_minute) // 15
+        cache_key = f"{chat_id or 'global'}_{now.strftime('%Y%m%d')}_{time_window}"
+
+        # 定期清理过期缓存
+        if current_time - self._last_cache_cleanup > self._cache_cleanup_interval:
+            self._cleanup_expired_cache(current_time)
+            self._last_cache_cleanup = current_time
+
+        # 检查缓存
+        if cache_key in self._schedule_cache:
+            cached_result, cached_time = self._schedule_cache[cache_key]
+            if current_time - cached_time < self._schedule_cache_ttl:
+                return cached_result
+
+        # 重新查询
+        goal_manager = get_goal_manager()
+        goals = goal_manager.get_active_goals(chat_id="global")
+        if not goals and chat_id and chat_id != "global":
+            goals = goal_manager.get_active_goals(chat_id=chat_id)
+
+        if not goals:
+            result = (None, None, [], None)
+            self._schedule_cache[cache_key] = (result, current_time)
+            return result
+
+        current_time_minutes = current_hour * 60 + current_minute
+        today_date = now.strftime("%Y-%m-%d")
+
+        scheduled_goals: List[Tuple[Any, List[int], bool]] = []
+        for goal in goals:
+            tw: Optional[List[int]] = None
+            if goal.parameters and "time_window" in goal.parameters:
+                tw = goal.parameters.get("time_window")
+            elif goal.conditions:
+                tw = goal.conditions.get("time_window")
+
+            if tw:
+                is_today = False
+                if goal.created_at:
+                    if isinstance(goal.created_at, str):
+                        is_today = goal.created_at.startswith(today_date)
+                    else:
+                        is_today = goal.created_at.strftime("%Y-%m-%d") == today_date
+                scheduled_goals.append((goal, tw, is_today))
+
+        if not scheduled_goals:
+            result = (None, None, [], None)
+            self._schedule_cache[cache_key] = (result, current_time)
+            return result
+
+        def _get_start_minutes(item: Tuple[Any, List[int], bool]) -> int:
+            _, tw, _ = item
+            if not tw or len(tw) < 2:
+                return 0
+            start_val = tw[0]
+            # 兼容旧格式（小时表示）：end_val > 24 为分钟格式
+            return start_val if tw[1] > 24 else start_val * 60
+
+        scheduled_goals.sort(key=_get_start_minutes)
+
+        # 查找当前活动（仅今天创建的）
+        current_activity: Optional[str] = None
+        current_description: Optional[str] = None
+        current_activity_type: Optional[str] = None
+        current_goal_created_at: Any = None
+
+        for goal, tw, is_today in scheduled_goals:
+            start_minutes, end_minutes = parse_time_window(tw)
+            if start_minutes is None:
+                continue
+
+            # 处理跨夜窗口
+            if end_minutes > 1440:
+                is_in_window = (start_minutes <= current_time_minutes < 1440) or (
+                    0 <= current_time_minutes < (end_minutes - 1440)
+                )
+            else:
+                is_in_window = start_minutes <= current_time_minutes < end_minutes
+
+            if is_in_window and is_today:
+                # 多个今天的任务时，选创建时间最新
+                if current_activity is None or (
+                    goal.created_at and goal.created_at > current_goal_created_at
+                ):
+                    current_activity = goal.name
+                    current_description = goal.description
+                    current_activity_type = goal.goal_type
+                    current_goal_created_at = goal.created_at
+
+        # 收集所有未来活动
+        all_future_activities: List[Tuple[str, str]] = []
+        for goal, tw, _is_today in scheduled_goals:
+            start_val = tw[0] if len(tw) > 0 else 0
+            end_val = tw[1] if len(tw) > 1 else start_val + 60
+            start_minutes = start_val if end_val > 24 else start_val * 60
+
+            if start_minutes > current_time_minutes:
+                hour = start_minutes // 60
+                minute = start_minutes % 60
+                time_str = f"{hour:02d}:{minute:02d}"
+                all_future_activities.append((time_str, goal.name))
+
+        result = (current_activity, current_description, all_future_activities, current_activity_type)
+        self._schedule_cache[cache_key] = (result, current_time)
+        return result

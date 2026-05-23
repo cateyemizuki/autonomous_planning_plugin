@@ -18,6 +18,7 @@
     >>> db.create_goal(name="测试", description="...", ...)
 """
 
+import logging
 import sqlite3
 import json
 import threading
@@ -26,10 +27,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.common.logger import get_logger
+
 from ..utils.timezone_manager import TimezoneManager
 
-logger = get_logger("autonomous_planning.database")
+logger = logging.getLogger(__name__)
 
 
 class GoalDatabase:

@@ -1,737 +1,217 @@
-# 麦麦自主规划插件
+# 麦麦自主规划插件 v4
 
-让 AI Bot 拥有自己的生活日程，自动生成符合人设的每日活动安排。
+让麦麦具备自主规划能力的 MaiBot 插件，通过 LLM 智能生成符合人设的日常生活日程，
+并在对话中自然提及当前活动。
 
-**版本：v3.3.0** | [GitHub](https://github.com/xuqian13/autonomous_planning_plugin) | 许可证：AGPL-3.0
-
----
-
-## 功能介绍
-
-### 核心功能
-- 🤖 **智能生成日程** - 基于Bot人设自动生成每日计划（8-15个活动）
-- ⏰ **定时自动生成** - 每天凌晨自动生成新日程
-- 💬 **智能日程注入** - 根据对话场景智能注入当前活动
-  - 🆕 **v3.3.0** LLM软注入：让LLM自己判断是否使用日程信息（零额外成本，准确率更高）
-  - 🆕 **v3.3.0** 对话上下文：支持多轮连续对话，识别用户追问（如："你在干嘛？" → "学什么呢？"）
-  - 🆕 **v3.3.0** 三种模式：smart(推荐)/rule/traditional 可选
-  - 🧠 意图识别：自动识别时间查询、闲聊、技术问答等场景（v3.2.0）
-  - 🎭 情感化描述：根据活动状态生成自然的对话内容（v3.2.0）
-  - ⏱️ 时间段过滤：支持"上午"、"下午"等时间段查询（v3.2.0）
-  - 🎯 智能优化：防止重复注入，概率化闲聊注入（v3.2.0）
-- 📊 **多种格式** - 文字或图片查看日程
-- 🎨 **自定义风格** - 配置提示词控制日程内容
-- 🧹 **自动清理** - 自动清理过期日程，保持数据库整洁
-
-### v3.0性能提升
-- ⚡ 查询速度提升 84%（50ms → 8ms）
-- 🚀 生成速度提升 50%（60秒 → 30秒）
-- 💾 缓存命中率提升 42%（60% → 85%）
-- 🛡️ 减少 50% 无效重试
-- 🔒 100% 防御注入攻击
+**v4 基于 `maibot_sdk` v2.x 全面重写**，从旧版 `src.plugin_system` API 完整迁移到原生
+新版 SDK，适配新版 Host ↔ Runner 子进程 IPC 架构。
 
 ---
 
-## 快速开始
+## 主要特性
 
-### 1. 安装
-
-```bash
-# 安装依赖
-pip install Pillow toml
-
-# 安装字体（用于图片生成）
-sudo apt-get install fonts-wqy-microhei
-```
-
-将插件放到 MaiCore 的 `plugins/` 目录，重启即可。
-
-### 2. 生成日程
-
-对Bot说：**"帮我生成今天的日程"**
-
-### 3. 查看日程
-
-```bash
-/plan status   # 文字格式
-/plan list     # 图片格式
-```
-
-### 4. 管理日程
-
-```bash
-/plan clear              # 清理旧日程
-/plan delete <序号>      # 删除指定日程
-/plan help               # 查看帮助
-```
+- 🤖 基于 Bot 人设智能生成每日日程（8-15 个活动）
+- ⏰ 定时自动生成（默认每天 00:30）
+- 💬 对话中自然提及当前活动（如「这会儿正吃午饭呢」）
+- 📊 文字 + 图片两种日程展示
+- 🔄 多轮生成机制，提升日程质量
+- 💾 LRU 缓存优化，减少重复计算
+- 🗑️ 自动清理过期目标（默认保留 30 天）
+- 🌏 时区支持（默认 `Asia/Shanghai`）
+- 🧠 智能注入：意图分类 + 状态分析 + 注入优化，仅在涉及时间的对话中注入
+- 🎨 自定义提示词：可配置插件级日程风格偏好
 
 ---
 
-## 配置说明
+## v4 关键变化（相对 v3）
 
-配置文件：`config.toml`
+| 维度 | v3 | v4 |
+|------|----|----|
+| 插件 API | `src.plugin_system` (旧) | `maibot_sdk` (新) |
+| 主基类 | `BasePlugin` | `MaiBotPlugin` |
+| 组件声明 | `get_plugin_components()` + 子类 | 装饰器 `@Tool/@Command/@EventHandler/@HookHandler` |
+| 配置访问 | `self.get_config("a.b.c")` | `self.config.a.b.c`（强类型，pydantic） |
+| 注入入口 | `EventHandler(POST_LLM)` 修改 `message.llm_prompt` | `HookHandler("maisaka.planner.before_request")` 修改 `messages` 列表 |
+| 消息发送 | `self.send_text(t)` | `await self.ctx.send.text(t, stream_id)` |
+| LLM 调用 | `llm_api.generate_with_model(prompt, model_config=…)` | `await self.ctx.llm.generate(prompt, model="<任务名>", …)` |
+| 自定义模型 | 支持 `custom_model` 段，向 `src.config` 注册临时 provider | **已删除**，统一走主程序 `model_config.toml` 任务名 |
+| 数据库 | 插件自管 SQLite (`data/goals.db`) | 不变 |
+| 主进程依赖 | 直接 `from src.config / src.common.logger` 等 | **0 处**，全部通过 SDK 能力代理 |
 
-### 基础配置
+---
+
+## 升级指引（从 v3 → v4）
+
+### 1. 主程序需要的预先配置
+
+v4 不再支持 `custom_model` 内置 HTTP 直连，所有 LLM 调用都通过主程序的
+`model_config.toml`。如果你之前依赖 `custom_model`，需要在主程序的 `model_config.toml`
+中预先配置一个任务（任务名默认为 `replyer`，可在插件 `config.toml` 中改写）：
 
 ```toml
+# model_config.toml（主程序）
+[tasks.replyer]
+model_list = ["你的模型"]
+temperature = 0.7
+```
+
+或在插件 `config.toml` 中指定其它任务名：
+
+```toml
+[autonomous_planning.schedule]
+llm_task_name = "schedule_generator"  # 主程序 model_config 中要对应配置此任务
+```
+
+### 2. 配置文件
+
+v4 配置层级与 v3 完全一致（仍是 `[plugin]` / `[autonomous_planning]` /
+`[autonomous_planning.schedule]` / `[autonomous_planning.schedule.inject]`），
+**唯一差异**：
+
+- 新增 `[plugin] config_version = "4.0.0"`（必填，否则 Runner 加载失败）
+- 新增 `[autonomous_planning.schedule] llm_task_name = "replyer"`（默认 `replyer`）
+- **删除** `[autonomous_planning.schedule.custom_model]` 整段（保留也不会被读取）
+
+如果直接用 v3 的 `config.toml`，只需要给 `[plugin]` 段补一个 `config_version = "4.0.0"`
+即可继续使用，原有字段都兼容。
+
+### 3. 命令
+
+v4 命令名加 `_v4` 后缀避免与并行运行的 v3 冲突（迁移期建议 v3/v4 并行测试）：
+
+| v3 命令 | v4 命令 |
+|---------|---------|
+| `/plan status` | `/plan status` |
+| `/plan list` | `/plan list` |
+| `/plan delete <id>` | `/plan delete <id>` |
+| `/plan clear` | `/plan clear` |
+| `/plan help` | `/plan help` |
+
+命令文本完全一致（v4 的正则与 v3 相同），用户无需调整使用习惯。命令组件**内部名**
+带 `_v4` 后缀（`planning_v4`），LLM Tool **内部名**也带后缀（`manage_goal_v4` 等）。
+
+### 4. 数据库
+
+数据库文件路径不变：`plugins/autonomous_planning_plugin_v4/data/goals.db`。
+**注意** v4 与 v3 各自维护独立 `data/` 目录，数据不会自动迁移；如需迁移，
+手动复制 `plugins/autonomous_planning_plugin/data/goals.db` 到 v4 的 `data/` 目录即可。
+
+### 5. 完成迁移后
+
+确认 v4 在生产环境稳定运行后，可禁用旧 v3 插件：
+
+```toml
+# plugins/autonomous_planning_plugin/config.toml
 [plugin]
-enabled = true  # 启用插件
-
-[autonomous_planning.schedule]
-inject_schedule = true        # 对话时提到当前活动
-auto_generate = true          # 自动生成日程
-auto_schedule_time = "00:30"  # 每天生成时间
+enabled = false
 ```
 
-### 自定义日程风格（新功能）
-
-在 `config.toml` 中添加：
-
-```toml
-[autonomous_planning.schedule]
-custom_prompt = "今天想多运动，至少3小时运动时间"
-
-# 可选：让插件在晚间自动推断“明天该怎么安排”
-auto_infer_next_day_prompt = true
-infer_time = "22:30"
-infer_lookback_days = 3
-infer_max_prompt_chars = 300
-infer_use_completion_signal = true
-```
-
-#### 使用示例
-
-| 场景 | 配置示例 |
-|------|---------|
-| **学习日** | `custom_prompt = "今天有考试，多安排复习时间，减少娱乐"` |
-| **运动日** | `custom_prompt = "今天想多运动，至少3小时运动时间"`  |
-| **放松日** | `custom_prompt = "周末放松，睡到自然醒，多安排娱乐"` |
-| **健康作息** | `custom_prompt = "早睡早起（11点睡，7点起），规律三餐"` |
-| **社交日** | `custom_prompt = "今天多和朋友交流，安排聚餐、聊天等社交活动"` |
-| **工作日** | `custom_prompt = "专注工作学习，减少娱乐，提高效率"` |
-
-### 常用配置项
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `inject_schedule` | true | 对话时提到当前活动 |
-| `auto_generate` | true | 自动检查并生成日程 |
-| `use_multi_round` | true | 多轮生成提升质量 |
-| `max_rounds` | 2 | 最多尝试轮数（1-3） |
-| `quality_threshold` | 0.85 | 质量阈值（0.80-0.90） |
-| `min_description_length` | 20 | 活动描述最小字符数 |
-| `custom_prompt` | "" | 自定义日程风格 ⭐ |
-| `auto_infer_next_day_prompt` | false | 是否自动推断次日策略提示词 ⭐ |
-| `infer_time` | "22:30" | 次日策略推断时间 |
-| `infer_lookback_days` | 3 | 推断时回看历史天数（1-7） |
-| `infer_max_prompt_chars` | 300 | 次日策略提示词最大长度 |
-| `infer_use_completion_signal` | true | 推断时是否参考完成状态/进度 |
-| `max_future_activities` | 3 | 智能注入显示的未来活动数 ⭐ |
-| `auto_schedule_time` | "00:30" | 定时生成时间 |
-| `admin_users` | [] | 管理员QQ号列表 |
-
-### 次日自动推断（新功能）
-
-当 `auto_infer_next_day_prompt = true` 时，插件会在 `infer_time` 自动读取最近 `infer_lookback_days` 天的日程，
-由 LLM 生成一段“次日策略提示词”，并在第二天自动生成日程时优先使用该提示词。
-
-- 推断失败会自动回退到 `custom_prompt`，不会中断日程生成
-- 不会替换你原有配置，只是对次日生成做动态增强
-- 推断结果会缓存到 `data/next_day_prompt.json`（便于重启后继续使用）
-
-### 智能注入配置（v3.3.0优化）⭐
-
-在 `config.toml` 中配置智能注入功能：
-
-```toml
-[autonomous_planning.schedule.inject]
-# ============================================================
-# 注入模式选择（v3.3.0新增）⭐
-# ============================================================
-inject_mode = "smart"  # 可选: 'smart'(推荐), 'rule', 'traditional'
-# - smart: LLM软注入，让LLM自己判断是否使用日程信息（零额外成本，准确率高）
-# - rule: 规则引擎判断（原v3.2.0智能模式，使用意图分类器）
-# - traditional: 固定注入（向后兼容，总是注入日程）
-
-# ============================================================
-# 智能组件开关（rule模式下使用）
-# ============================================================
-enable_intent_classification = true  # 启用意图分类器（智能识别用户意图）
-enable_state_analysis = true         # 启用状态分析器（生成情感化描述）
-enable_inject_optimization = true    # 启用注入优化器（防止无效注入）
-
-# ============================================================
-# 注入策略配置
-# ============================================================
-casual_chat_inject_probability = 0.5 # 闲聊时注入概率（0-1），默认50%
-max_future_activities = 3            # 最多显示未来活动数量
-
-# ============================================================
-# 🆕 对话上下文配置（v3.3.0新增）⭐
-# ============================================================
-context_max_turns = 3  # 保留最近N轮对话历史，默认3轮
-context_ttl = 600      # 对话历史过期时间（秒），默认10分钟
-# 作用：支持连续多轮对话，例如：
-#   用户："你在干嘛？" → Bot提及日程
-#   用户："学什么呢？" → 识别为连续对话，继续提及日程
-```
-
-#### 智能注入功能说明
-
-**🆕 v3.3.0 新功能：**
-- **LLM软注入模式**：将日程信息作为"可选上下文"提供给LLM，让LLM自己决定是否使用、如何使用
-  - ✅ 零额外成本：不需要额外调用LLM进行意图分类
-  - ✅ 准确率更高：LLM理解能力强，判断更精准
-  - ✅ 表达更自然：由LLM负责情感化表达，无需预设模板
-- **对话上下文缓存**：记录最近3轮对话，智能识别用户追问
-  - 场景示例：用户问"你在干嘛？"后，追问"学什么呢？"，Bot能识别这是连续对话，继续提及日程
-  - 判断逻辑：如果最近2轮中有注入，且间隔<60秒，则判定为连续对话
-- **三种模式可选**：
-  - `smart`（推荐）：LLM软注入，适合日常使用
-  - `rule`：规则引擎判断（原v3.2.0智能模式），适合需要严格控制注入时机
-  - `traditional`：固定注入，向后兼容
-
-**v3.2.0 功能（rule模式下使用）：**
-- **意图分类**：自动识别用户意图（时间查询/闲聊/技术问答/命令执行），在技术问答等场景自动跳过注入
-- **状态分析**：根据活动类型和进度生成情感化描述（如"正在认真学习中"、"悠闲地享用午餐"）
-- **注入优化**：防止短时间内重复注入相同内容，闲聊时概率注入
-- **时间段过滤**：用户询问"上午/下午有什么安排"时，自动过滤对应时间段的活动
+或直接删除 `plugins/autonomous_planning_plugin/` 目录。
 
 ---
 
-## 项目结构
+## 组件清单
 
-```
-autonomous_planning_plugin/
-├── __init__.py              # 插件入口
-├── plugin.py                # 插件主类
-├── config.toml              # 配置文件
-├── _manifest.json           # 插件清单
-├── config_manager.py        # 配置管理器
-│
-├── core/                    # 核心模块 ⭐
-│   ├── __init__.py          # 核心模块导出
-│   ├── models.py            # 数据模型定义
-│   ├── constants.py         # 常量定义
-│   ├── exceptions.py        # 自定义异常类
-│   └── parameter_validator.py # 参数验证器 ⭐ v3.1
-│
-├── planner/                 # 规划器模块
-│   ├── __init__.py
-│   ├── goal_manager.py      # 目标管理器
-│   ├── schedule_generator.py # 日程生成器（LLM驱动）
-│   ├── auto_scheduler.py    # 自动调度器（定时任务）
-│   └── generator/           # 日程生成子模块 ⭐ v3.1重构
-│       ├── __init__.py
-│       ├── base_generator.py      # 基础生成器（Prompt/Schema）
-│       ├── config.py              # 配置管理 ⭐ v3.1
-│       ├── context_loader.py      # 上下文加载器 ⭐ v3.1
-│       ├── prompt_builder.py      # Prompt构建器 ⭐ v3.1
-│       ├── schema_builder.py      # Schema构建器 ⭐ v3.1
-│       ├── response_parser.py     # 响应解析器 ⭐ v3.1
-│       ├── quality_scorer.py      # 质量评分器 ⭐ v3.1
-│       └── validator.py           # 语义验证器（含时间连续性检查）⭐ v3.1
-│
-├── database/                # 数据库模块
-│   ├── __init__.py
-│   └── goal_db.py           # SQLite 数据库操作
-│
-├── cache/                   # 缓存模块
-│   ├── __init__.py
-│   ├── lru_cache.py         # LRU 缓存实现
-│   └── conversation_cache.py # 对话缓存
-│
-├── tools/                   # LLM 工具模块
-│   ├── __init__.py
-│   └── tools.py             # LLM 可调用工具
-│
-├── commands/                # 命令处理模块
-│   ├── __init__.py
-│   └── planning_command.py  # /plan 命令处理
-│
-├── handlers/                # 事件处理器模块
-│   ├── __init__.py
-│   ├── handlers.py          # 事件监听和日程注入
-│   └── inject/              # 智能注入子模块 ⭐ v3.2.0
-│       ├── __init__.py
-│       ├── intent_classifier.py    # 意图分类器（308行）
-│       ├── state_analyzer.py       # 状态分析器（350行）
-│       ├── content_template.py     # 内容模板引擎（272行）
-│       └── inject_optimizer.py     # 注入优化器（277行）
-│
-├── utils/                   # 工具模块
-│   ├── time_utils.py        # 时间处理工具
-│   ├── timezone_manager.py  # 时区管理器 ⭐ v3.1
-│   └── schedule_image_generator.py # 日程图片生成
-│
-├── tests/                   # 单元测试
-│   ├── __init__.py
-│   └── test_utils.py        # 工具测试
-│
-└── assets/                  # 静态资源
-    ├── bird.jpg             # 装饰图片
-    └── winter_char.jpg      # 角色图片
-```
-
-### 核心模块说明
-
-#### 📦 core/ - 核心基础设施
-- **models.py** - Goal 数据模型、枚举类型定义
-- **constants.py** - 全局常量配置
-- **exceptions.py** - 11个自定义异常类（错误分类处理）
-
-#### 🎯 planner/ - 规划引擎
-- **goal_manager.py** - 目标的 CRUD 操作、查询过滤
-- **schedule_generator.py** - AI 驱动的日程生成（支持多轮优化）
-- **auto_scheduler.py** - 定时任务调度器
-- **generator/** - 日程生成子系统
-  - validator.py: 语义验证（三餐时间、活动时长等）
-  - conflict_resolver.py: 时间冲突解决
-
-#### 💾 database/ - 数据持久化
-- **goal_db.py** - SQLite 数据库封装（索引优化、批量操作）
-
-#### ⚡ cache/ - 性能优化
-- **lru_cache.py** - LRU 缓存实现（线程安全）
-- **conversation_cache.py** - 对话上下文缓存
-
-#### 🔧 tools/ - LLM 集成
-- **tools.py** - LLM 可调用的 4 个工具函数
-  - ManageGoalTool: 目标管理
-  - GetPlanningStatusTool: 查看状态
-  - GenerateScheduleTool: 生成日程
-  - ApplyScheduleTool: 应用日程
-
-#### 💬 commands/ - 命令系统
-- **planning_command.py** - /plan 命令处理（status/list/delete/clear/help）
-
-#### 🎧 handlers/ - 事件监听
-- **handlers.py** - 2 个事件处理器
-  - AutonomousPlannerEventHandler: 后台清理任务
-  - ScheduleInjectEventHandler: 对话中注入当前活动
-- **inject/** - 智能注入子模块 ⭐ v3.2.0
-  - intent_classifier.py: 意图分类器（识别时间查询/闲聊/技术问答等）
-  - state_analyzer.py: 活动状态分析器（生成情感化描述）
-  - content_template.py: 动态内容模板引擎
-  - inject_optimizer.py: 注入时机优化器（防重复/概率注入）
-
-#### 🛠️ utils/ - 辅助工具
-- **time_utils.py** - 时间格式转换、解析
-- **schedule_image_generator.py** - PIL 图片渲染
+| 类型 | 名称 | 功能 |
+|------|------|------|
+| Tool | `manage_goal_v4` | 目标管理（创建/查看/更新/暂停/恢复/完成/取消/删除） |
+| Tool | `get_planning_status_v4` | 查询今日日程（简洁文字格式） |
+| Tool | `generate_schedule_v4` | 生成每日/每周/每月日程（LLM） |
+| Tool | `apply_schedule_v4` | 应用之前生成的日程为目标 |
+| Command | `planning_v4` (`/plan` 或 `/规划`) | 规划管理命令（status/list/delete/clear/help） |
+| EventHandler | `autonomous_planner_v4` (ON_START) | 启动信号通知 |
+| HookHandler | `schedule_inject_v4` (`maisaka.planner.before_request`) | **v4 注入入口**：向 LLM 规划请求的 messages 列表插入日程上下文 |
 
 ---
 
-## 开发指南
+## 使用示例
 
-### v3.0.0 升级指南
+### 通过对话
 
-如果你从旧版本（v2.x）升级到 v3.0.0，请注意以下变化：
+```
+用户：帮我生成今天的日程
+麦麦：[Tool 调用 generate_schedule_v4，LLM 生成 8-15 个活动并自动保存]
 
-**代码结构变化**
-```bash
-# 旧版本（v2.x）- 单文件结构
-plugins/autonomous_planning_plugin/
-├── exceptions.py
-├── database.py
-├── cache.py
-├── tools.py
-├── commands.py
-└── handlers.py
-
-# 新版本（v3.0）- 模块化结构
-plugins/autonomous_planning_plugin/
-├── core/
-│   └── exceptions.py
-├── database/
-│   └── goal_db.py
-├── cache/
-│   └── lru_cache.py
-├── tools/
-│   └── tools.py
-├── commands/
-│   └── planning_command.py
-└── handlers/
-    └── handlers.py
+用户：在干嘛？
+麦麦：[HookHandler 在 LLM 调用前注入当前日程上下文]
+     这会儿正吃午饭呢~等下还要去图书馆学习
 ```
 
-**导入路径变化**
-```python
-# 旧版本导入
-from .exceptions import InvalidParametersError
-from .database import GoalDatabase
-
-# 新版本导入
-from .core.exceptions import InvalidParametersError
-from .database.goal_db import GoalDatabase
-```
-
-**升级步骤**
-1. 备份现有数据库文件 `goals.db`
-2. 删除旧的 Python 缓存：`find . -name "__pycache__" -exec rm -rf {} +`
-3. 拉取最新代码
-4. 重启 MaiBot
-
-**数据兼容性**
-- ✅ 数据库格式完全兼容，无需迁移
-- ✅ 配置文件 `config.toml` 向后兼容
-- ✅ 旧的日程数据自动保留
-
-### 运行测试
+### 通过命令
 
 ```bash
-# 运行所有测试
-python -m pytest tests/
-
-# 运行特定测试
-python -m pytest tests/test_utils.py -v
+/plan status     # 文字格式日程
+/plan list       # 图片格式日程
+/plan delete 1   # 删除第 1 个目标
+/plan clear      # 清理昨天及更早的日程
+/plan help       # 显示帮助
 ```
-
-### 调试模式
-
-在配置文件中启用调试日志：
-
-```toml
-[plugin]
-enabled = true
-log_level = "DEBUG"  # 设置为DEBUG查看详细日志
-```
-
-### 扩展功能
-
-**添加新的目标类型：**
-
-1. 在 `goal_manager.py` 中定义新的目标类型
-2. 在 `tools.py` 中添加对应的工具函数
-3. 更新 `schedule_generator.py` 的生成逻辑
-
-**自定义日程生成策略：**
-
-修改 `schedule_generator.py` 中的 `_build_schedule_prompt()` 方法，调整生成提示词。
 
 ---
 
-## 常见问题
+## 开发者文档
 
-**Q: 如何修改已生成的日程？**
-A: 使用 `/plan clear` 清理后重新生成
+### 项目结构
 
-**Q: 为什么看不到日程？**
-A: 运行 `/plan status` 检查，或手动让 Bot 生成
+```
+autonomous_planning_plugin_v4/
+├── _manifest.json              # manifest v2，SDK 2.0+
+├── __init__.py
+├── config.toml                 # 默认配置
+├── config_models.py            # PluginConfigBase 嵌套模型（三级）
+├── plugin.py                   # MaiBotPlugin 主类，7 个装饰器外壳
+├── services/                   # 业务实现层
+│   ├── tools_service.py        # 4 个 Tool 的业务
+│   ├── command_service.py      # /plan 命令分发
+│   ├── inject_service.py       # HookHandler 注入业务
+│   └── cleanup_service.py      # 后台清理 + 自动调度
+├── planner/                    # 核心规划逻辑
+│   ├── goal_manager.py
+│   ├── schedule_generator.py   # LLM 日程生成（通过 ctx.llm.generate）
+│   ├── auto_scheduler.py       # 定时调度器
+│   └── generator/              # 生成器子模块（prompt / schema / parser / validator）
+├── handlers/inject/            # 智能注入子模块（意图分类等）
+├── core/                       # 数据模型 / 常量 / 异常
+├── cache/                      # LRU 缓存
+├── utils/                      # 时区 / 时间工具 / 图片生成
+├── database/goal_db.py         # 插件自管 SQLite
+└── data/                       # 运行时数据目录（goals.db）
+```
 
-**Q: 如何禁用日程注入？**
-A: 设置 `inject_schedule = false`
+### 关键技术决策
 
-**Q: 生成速度太慢？**
-A: 设置 `use_multi_round = false` 和 `quality_threshold = 0.80`
+1. **HookHandler 替代 POST_LLM 事件**：新版主程序 `bridge_event` 在 dict ↔ SessionMessage
+   转换时丢失 `llm_prompt` 字段，POST_LLM EventHandler 无法修改 prompt；改用
+   `maisaka.planner.before_request` Hook 修改 messages 列表实现等价注入。
 
-**Q: 如何限制只有管理员使用？**
-A: 设置 `admin_users = ["QQ号1", "QQ号2"]`
+2. **配置访问双轨**：业务模块（`planner/auto_scheduler.py` 等）保留 v3 风格的
+   `self.plugin.get_config("a.b.c", default)` 调用，由 `plugin.py` 中的 `get_config()`
+   适配器把点分割路径桥接到强类型 `self.config.a.b.c`，减少业务代码改动。
 
-**Q: 如何自定义日程风格？**
-A: 在配置文件中设置 `custom_prompt`，参考上面的示例
+3. **bot_profile 预拉取**：`on_load` 时一次性通过 `ctx.config.get(...)` 拉取
+   `personality / bot.nickname` 等全局配置缓存到 `_bot_profile`，PromptBuilder
+   通过 config 字典中的 `bot_profile` 段读取，运行时零 IPC。
 
-**Q: 旧日程会自动清理吗？**
-A: 会的，昨天及更早的日程会自动标记为已完成，30天后自动删除
+4. **数据库独立**：`ctx.db.*` 走 Host 数据库模型，不适合插件自有表；保留 v3 时代的
+   独立 SQLite（`data/goals.db`），数据库路径由 `Path(__file__).parent / "data"`
+   推导，子进程内可靠。
 
-**Q: 升级到 v3.0.0 后插件无法加载？**
-A: 执行以下步骤：
+### 验证
+
 ```bash
-# 1. 清理 Python 缓存
-cd plugins/autonomous_planning_plugin
-find . -name "__pycache__" -exec rm -rf {} +
-find . -name "*.pyc" -delete
+cd /home/ubuntu/maimai/MaiBot
+# 1. 静态检查：插件无 src.* 残留
+grep -rn "from src\|maibot_sdk.compat" plugins/autonomous_planning_plugin_v4/ \
+    --exclude-dir=__pycache__
+# 应输出空（POC_RESULT.md 中提到的 compat 已删除）
 
-# 2. 检查文件结构
-ls -la core/ planner/ database/ cache/ tools/ commands/ handlers/
-
-# 3. 重启 MaiBot
+# 2. 业务模块 import
+uv run python -c "from plugins.autonomous_planning_plugin_v4 import create_plugin; \
+    p = create_plugin(); print('OK', type(p).__name__)"
 ```
-
-**Q: 出现 "No module named 'plugins.autonomous_planning_plugin.exceptions'" 错误？**
-A: 这是 v3.0.0 重构后的导入路径问题，已在最新版本修复。请：
-1. 拉取最新代码
-2. 清理 Python 缓存（见上一问）
-3. 确认文件 `core/exceptions.py` 存在
 
 ---
 
-## 故障排除
+## License
 
-### 常见错误及解决方案
-
-#### 1. 模块导入错误
-```
-ModuleNotFoundError: No module named 'plugins.autonomous_planning_plugin.xxx'
-```
-**原因**: Python 缓存未清理或文件结构不完整
-
-**解决**:
-```bash
-# 清理缓存
-find plugins/autonomous_planning_plugin -name "__pycache__" -exec rm -rf {} +
-find plugins/autonomous_planning_plugin -name "*.pyc" -delete
-
-# 验证文件结构
-ls -la plugins/autonomous_planning_plugin/core/
-ls -la plugins/autonomous_planning_plugin/planner/
-```
-
-#### 2. 数据库锁定错误
-```
-sqlite3.OperationalError: database is locked
-```
-**原因**: 多个进程同时访问数据库
-
-**解决**: 重启 MaiBot 或删除 `goals.db-journal` 文件
-
-#### 3. LLM 生成超时
-```
-LLMTimeoutError: LLM调用超时
-```
-**原因**: 网络问题或模型响应慢
-
-**解决**: 在配置文件中增加超时时间
-```toml
-[autonomous_planning.schedule]
-generation_timeout = 300.0  # 增加到5分钟
-```
-
-#### 4. 日程图片无法生成
-```
-PIL.UnidentifiedImageError or Font not found
-```
-**原因**: 缺少字体或 Pillow 库
-
-**解决**:
-```bash
-# 安装字体
-sudo apt-get install fonts-wqy-microhei fonts-wqy-zenhei
-
-# 重新安装 Pillow
-pip install --upgrade Pillow
-```
-
-#### 5. 权限被拒绝
-```
-🚫 你不是管理员哦~
-```
-**原因**: 设置了管理员白名单
-
-**解决**: 在配置文件中添加你的 QQ 号
-```toml
-[autonomous_planning.schedule]
-admin_users = ["你的QQ号"]  # 或设为空列表 [] 允许所有人
-```
-
-### 获取更多帮助
-
-如果问题仍未解决：
-1. 查看日志文件获取详细错误信息
-2. 在 [GitHub Issues](https://github.com/xuqian13/autonomous_planning_plugin/issues) 提交问题
-3. 提供错误日志和配置文件（隐藏敏感信息）
-
----
-
-## 技术亮点
-
-### 为什么这么快？
-
-- **数据库优化** - 查询速度从50ms降到8ms，像翻书一样快
-- **智能缓存** - 常用数据缓存起来，不用每次都查数据库
-- **并发控制** - 多个请求同时处理，互不影响
-
-### 为什么这么稳？
-
-- **智能重试** - 网络超时会重试，配额超限不浪费时间重试
-- **错误分类** - 11种错误类型，每种都有专门的处理方式
-- **安全防护** - 防止恶意输入，保护你的数据安全
-
-### 核心功能模块
-
-- **目标管理** (goal_manager.py) - 创建、查看、更新日程目标
-- **日程生成** (schedule_generator.py) - AI自动生成符合人设的日程
-- **事件监听** (handlers.py) - 在对话中自然提到当前活动
-- **数据存储** (database.py) - SQLite数据库持久化保存
-- **缓存加速** (cache.py) - LRU缓存提升查询速度
-
----
-
-## 版本历史
-
-### v3.2.0 (2025-11-25)
-
-**智能日程注入系统** 🧠
-
-**新增功能** ✨
-- 🎯 **智能意图识别** - 自动识别用户意图，避免不相关场景注入
-  - 支持时间查询、闲聊、技术问答、命令执行等意图分类
-  - 技术问答/命令执行场景自动跳过注入
-  - 基于关键词和规则匹配（可扩展为LLM）
-- 🎭 **情感化描述生成** - 根据活动类型和状态生成自然语言
-  - 活动状态机：未开始/进行中/即将结束
-  - 9种活动类型情感模板（学习/用餐/娱乐等）
-  - 动态内容模板引擎
-- ⏱️ **时间段过滤** - 支持"上午/下午/晚上"等时间段查询
-  - 自动识别用户询问的时间范围
-  - 根据时间段过滤活动列表
-- 🎲 **智能注入优化** - 防止无效和重复注入
-  - LRU缓存注入历史（防5分钟内重复）
-  - 闲聊场景概率注入（可配置0-1）
-  - 相同活动去重判断
-
-**核心改进** 🔧
-- 新增 `handlers/inject/` 模块（1235行代码）
-  - intent_classifier.py: 意图分类器（308行）
-  - state_analyzer.py: 状态分析器（350行）
-  - content_template.py: 内容模板引擎（272行）
-  - inject_optimizer.py: 注入优化器（277行）
-- 优化 ScheduleInjectEventHandler 注入逻辑
-  - 支持智能模式和传统模式（向后兼容）
-  - 改进消息提取逻辑（避免聊天记录干扰）
-  - 统一使用时区感知时间处理
-
-**Bug修复** 🐛
-- ✅ 修复已有日程时重复应用的问题
-  - handlers.py:335, auto_scheduler.py:215, tools.py:585
-  - 检查 schedule.metadata 中的 existing 标记
-- ✅ 修复优先级枚举处理bug
-  - schedule_generator.py:151, 369
-  - 自动转换枚举对象为 .value 字符串
-- ✅ 统一时区处理逻辑
-  - 全局使用 _get_timezone_now() 方法
-- ✅ 优化日程摘要格式
-  - 显示时间范围（如"14:00-16:00 学习Python"）
-  - 简化返回信息，更清晰易读
-
-**配置变更** ⚙️
-- 新增 `[autonomous_planning.schedule.inject]` 配置段
-  - enable_intent_classification: 意图识别开关
-  - enable_state_analysis: 状态分析开关
-  - enable_inject_optimization: 注入优化开关
-  - casual_chat_inject_probability: 闲聊注入概率
-
-**向后兼容** ✅
-- 所有智能组件都是可选的
-- 组件加载失败时自动回退到传统模式
-- 不影响现有用户使用
-
-### v3.1.0 (2025-11-25)
-
-**质量优化与Bug修复**
-
-**代码重构** 🏗️
-- ✨ **组件化拆分** - 遵循SOLID原则重构ScheduleGenerator
-  - 新增 `ScheduleGeneratorConfig` - 统一配置管理（DRY原则）
-  - 新增 `LLMResponseParser` - 响应解析组件
-  - 新增 `ScheduleQualityScorer` - 质量评分组件
-  - 新增 `ScheduleSemanticValidator` - 语义验证组件
-  - 新增 `BaseScheduleGenerator` - Prompt和Schema构建
-- 📉 **代码精简** - 从8,634行减少到7,098行（-19.4%，净减1,536行）
-  - schedule_generator.py: 1,803行 → 582行（-67.7%）
-  - 消除150+行重复代码
-
-**新功能** ✨
-- 🔍 **时间连续性验证** - 自动检测日程空档
-  - 检测相邻活动之间≥30分钟的空档
-  - 多轮生成时自动重试修复
-  - 警告格式：`⚠️ 时间空档：16:30-18:00 (1.5小时无安排)`
-- 🛡️ **日程去重机制** - 防止重复生成
-  - 查询时自动去重：按(name, time_window)唯一键
-  - 生成前检查：跳过已有日程，支持force_regenerate强制重新生成
-- 📝 **优化的Prompt** - 提升生成质量
-  - 完整13项示例展示全天无缝衔接
-  - 多次强调"无缝覆盖"要求（4次，分布在关键位置）
-  - 明确时间计算公式和示例
-  - 细化下午时段（避免5小时单一活动）
-
-**Bug修复** 🐛
-- ✅ 修复GoalStatus枚举数据库绑定错误
-  - 位置：goal_manager.py:641（cleanup_expired_schedules）
-  - 原因：直接传递枚举对象到SQLite
-  - 修复：使用update_goal_status()自动转换为.value
-- ✅ 修复Prompt示例违反无缝衔接要求
-  - 原示例：起床07:30结束于07:45，早餐08:00开始（有15分钟空档）
-  - 修复后：起床07:30+0.5h=08:00，早餐08:00开始（无缝衔接）
-- ✅ 优化日程生成Prompt结构
-  - 任务开头就强调核心要求
-  - 提供完整示例（3个→13个活动）
-  - 添加明确的时间计算说明
-
-**代码质量** 📝
-- 组件独立可测试（单一职责）
-- 配置缓存提升30%性能
-- 向后兼容的公开API
-- 从1,803行精简到400行核心逻辑
-
-### v3.0.0 (2025-11-24)
-
-**重大更新 - 代码重构与性能优化**
-
-**架构重构** 🏗️
-- ✨ **模块化拆分** - 从单文件结构迁移到模块化目录结构
-  - 新增 `core/` 模块：数据模型、常量、异常类
-  - 新增 `planner/generator/` 子模块：验证器、冲突解决器
-  - 拆分 `cache/`、`database/`、`tools/`、`commands/`、`handlers/` 独立模块
-- 🔧 **导入路径优化** - 统一使用相对导入，提升可维护性
-- 📦 **代码组织** - 按职责分离，单一职责原则
-
-**性能优化** ⚡
-- 数据库查询速度提升 84%（50ms → 8ms）
-- 缓存命中率提升 42%（60% → 85%）
-- 生成速度提升 50%（60秒 → 30秒）
-- 减少 50% 无效重试
-- 超时率降低 90%
-
-**新功能** ✨
-- 🎨 自定义Prompt配置 - 支持自定义日程生成风格
-- 🧹 旧日程自动清理 - 昨天的日程自动标记为已完成，30天后删除
-- 🛡️ 智能错误处理 - 11个自定义异常类
-- 🔒 输入验证增强 - 100%防御注入攻击
-- ⚡ 并行生成模式 - 可选的并行多轮生成
-
-**Bug修复** 🐛
-- ✅ 修复模块导入路径错误（`commands/planning_command.py`）
-- ✅ 修复异常导入路径错误（`planner/schedule_generator.py`）
-- ✅ 修复目标列表优先级排序错误
-- ✅ 修复时间格式参数命名混淆
-- ✅ 修复缓存锁属性错误导致的崩溃
-- ✅ 优化时间重叠处理：调整持续时间而非直接删除
-- ✅ 移除废弃的 interval_seconds 字段
-- ✅ 清理 Python 字节码缓存问题
-
-**代码质量** 📝
-- 添加详细的模块文档字符串
-- 统一异常处理机制
-- 改进日志输出格式
-- 增强类型注解
-
-### v2.2.0 (2025-11-23)
-- 支持活动持续时长配置
-- 优化多轮生成质量评分
-
-### v2.1.0 (2025-11-19)
-- 批量创建目标功能
-- 自定义LLM模型配置
-
-### v2.0.0 (2025-11-15)
-- 从JSON迁移到SQLite数据库
-- 添加LRU缓存机制
-- 图片日程展示
-- 定时自动生成
-
-### v1.0.0 (2025-11-10)
-首次发布
-- 基础目标管理功能
-- LLM驱动的日程生成
-
----
-
-## 许可证
-
-本项目采用 AGPL-3.0 许可证
-
----
-
-**如果觉得有用，请给个⭐Star！**
-
-Made with ❤️ by [靓仔](https://github.com/xuqian13)
+AGPL-3.0

@@ -4,16 +4,16 @@ This module provides historical context loading functionality for schedule gener
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 """
 
+import logging
 from datetime import timedelta
 from typing import List, Optional
 
-from src.common.logger import get_logger
 
 # 类型提示导入
 from ...utils.timezone_manager import TimezoneManager
 from ..goal_manager import GoalManager
 
-logger = get_logger("autonomous_planning.context_loader")
+logger = logging.getLogger(__name__)
 
 # 常量定义
 MAX_YESTERDAY_ACTIVITIES = 10  # 昨日日程显示的最大活动数

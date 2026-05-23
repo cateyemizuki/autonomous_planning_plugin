@@ -29,18 +29,18 @@ Example:
     ... )
 """
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.common.logger import get_logger
 
 from ..database import GoalDatabase
 from ..utils.timezone_manager import TimezoneManager
 
-logger = get_logger("autonomous_planning.goal_manager")
+logger = logging.getLogger(__name__)
 
 
 class GoalStatus(Enum):
