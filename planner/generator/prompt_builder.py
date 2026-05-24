@@ -4,7 +4,6 @@ This module provides prompt building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 
 v4 改造：
-    - 删除 ``config_api.get_global_config`` 直连
     - 全局配置（personality / bot.nickname 等）由 ``config`` 字典中的 ``bot_profile`` 段提供
     - ``bot_profile`` 由 ``ToolsService`` 在构造 ScheduleGenerator 前从插件 ctx 拉取
 """
@@ -18,11 +17,9 @@ from ...utils.timezone_manager import TimezoneManager
 logger = logging.getLogger(__name__)
 
 
-# 全局配置默认值（与 v3 等价）
-_DEFAULT_PERSONALITY = "是一个女大学生"
-_DEFAULT_REPLY_STYLE = ""
-_DEFAULT_INTEREST = ""
-_DEFAULT_BOT_NAME = "麦麦"
+# bot_profile 缺失时显式报错暴露配置问题，不再用任何 fallback 默认值
+# （主程序正常情况下 bot.nickname / personality.personality 一定能拉到；
+#  拿不到说明 IPC 异常或主程序配置缺失，需要在日志里红色报警让用户立刻修）
 
 
 class PromptBuilder:
@@ -53,13 +50,26 @@ class PromptBuilder:
         """读取由插件层注入的 bot 配置（无 IO，纯字典访问）。
 
         Returns:
-            ``(personality, reply_style, interest, bot_name)`` 元组
+            ``(personality, reply_style, interest, bot_name)`` 元组；
+            personality / bot_name 缺失时返回空串并打 ERROR 日志，
+            调用方应据此调整 prompt 拼接（避免出现"你是 ，"这种悬挂表述）。
         """
         bot_profile: Dict[str, Any] = self.config.get("bot_profile", {}) or {}
-        personality = str(bot_profile.get("personality") or _DEFAULT_PERSONALITY)
-        reply_style = str(bot_profile.get("reply_style") or _DEFAULT_REPLY_STYLE)
-        interest = str(bot_profile.get("interest") or _DEFAULT_INTEREST)
-        bot_name = str(bot_profile.get("bot_name") or _DEFAULT_BOT_NAME)
+        personality = str(bot_profile.get("personality") or "").strip()
+        reply_style = str(bot_profile.get("reply_style") or "").strip()
+        interest = str(bot_profile.get("interest") or "").strip()
+        bot_name = str(bot_profile.get("bot_name") or "").strip()
+
+        if not personality:
+            logger.error(
+                "❌ bot_profile.personality 未配置或为空 —— 生成的日程将无法贴合角色人设。"
+                "请在主程序 bot 配置中填写 personality.personality 字段。"
+            )
+        if not bot_name:
+            logger.error(
+                "❌ bot_profile.bot_name 未配置或为空 —— prompt 中将不出现角色名。"
+                "请在主程序 bot 配置中填写 bot.nickname 字段。"
+            )
         return personality, reply_style, interest, bot_name
 
     def build_schedule_prompt(
@@ -67,7 +77,10 @@ class PromptBuilder:
         schedule_type: str,
         preferences: Dict[str, Any],
         schema: Optional[Dict] = None,
-        yesterday_context: Optional[str] = None
+        yesterday_context: Optional[str] = None,
+        pending_commitments: Optional[List[Dict[str, Any]]] = None,
+        history_context: str = "",
+        knowledge_context: str = "",
     ) -> str:
         """构建日程生成提示词（精简版）
 
@@ -76,6 +89,9 @@ class PromptBuilder:
             preferences: 用户偏好
             schema: JSON Schema（可选）
             yesterday_context: 昨日上下文（可选）
+            pending_commitments: 今日需要纳入的约定列表（可选）
+            history_context: 最近聊天背景（可选；跨群拼接）
+            knowledge_context: 相关记忆参考（可选）
 
         Returns:
             完整的提示词字符串
@@ -100,15 +116,71 @@ class PromptBuilder:
         weekday = weekday_names[today.weekday()]
         is_weekend = today.weekday() >= 5
 
-        # 昨日上下文
-        yesterday_text = yesterday_context or "昨天普通的一天"
+        # 最近几天日程上下文（向后兼容：变量名仍叫 yesterday_context，含义是"最近 N 天"摘要）
+        yesterday_text = yesterday_context or "最近几天没有具体记录"
+        has_real_yesterday = (
+            yesterday_context
+            and "记不太清" not in yesterday_text
+            and "普通的" not in yesterday_text
+            and "没有具体记录" not in yesterday_text
+        )
 
-        # 核心提示词（精简版）
-        prompt = f"""你是{bot_name}，{personality}
+        # 核心提示词（bot_name / personality 缺失时不出现悬挂逗号或孤立"你是"）
+        if bot_name and personality:
+            persona_line = f"你是{bot_name}，{personality}"
+        elif bot_name:
+            persona_line = f"你是{bot_name}"
+        elif personality:
+            persona_line = personality  # 没名字但有人设：直接讲人设
+        else:
+            persona_line = ""  # 全空：跳过 persona 行（已 logger.error）
+
+        # reply_style 单独一段塞进 prompt
+        style_block = f"\n\n【表达风格】\n{reply_style}" if reply_style else ""
+
+        prompt_header = persona_line + style_block if persona_line else style_block.lstrip()
+        prompt = f"""{prompt_header}
 
 今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
-昨天: {yesterday_text}
+
+【最近几天日程参考】
+{yesterday_text}
+""" if prompt_header else f"""今天是{date_str} {weekday}{"（周末）" if is_weekend else ""}
+
+【最近几天日程参考】
+{yesterday_text}
 """
+
+        # 跨群历史背景（动态上下文）
+        if history_context:
+            prompt += f"""
+【最近聊天背景】
+以下是 bot 近期在聊天中观察到的事，可作为日程灵感（不要直接复述）：
+{history_context}
+
+💡 若上面提到了**特殊事件**（节日、约会、考试、截止、心情转变等），优先把它反映到今日日程中。
+"""
+
+        # 知识库参考（动态上下文）
+        if knowledge_context:
+            prompt += f"""
+【相关记忆参考】
+{knowledge_context}
+"""
+
+        # 今日需要纳入的约定
+        if pending_commitments:
+            commit_lines: List[str] = ["", "【今天需要纳入的约定】"]
+            for item in pending_commitments:
+                t = (item or {}).get("time", "")
+                title = (item or {}).get("title", "")
+                notes = (item or {}).get("notes", "")
+                line = f"- {t} {title}".strip()
+                if notes:
+                    line += f"（{notes}）"
+                commit_lines.append(line)
+            commit_lines.append("要求：把上述约定安排到合适时间段（与已知作息冲突时优先约定），goal_type 用 social_maintenance 或对应类型。")
+            prompt += "\n".join(commit_lines) + "\n"
 
         # 添加自定义prompt（如果配置了）
         if custom_prompt:
@@ -129,11 +201,32 @@ class PromptBuilder:
    - 每个活动的结束时间 = 下一个活动的开始时间
    - 计算公式：结束时间 = time_slot + duration_hours
 
+【原则】（重要！）
+- 作息框架（睡眠 / 三餐 / 起床 / 睡前）每天稳定，是基础保留项 —— 不动这个框架
+- 真实的人 ≠ 日程机器：同一作息框架下，每天的"做什么"与"心情"应有微变化
+- 例：早餐时段不变，但今天可能粥配油条，明天面包黄油；上午时段不变，但今天审稿子，明天写专栏
+- ⚠️ 不要为了"特色"突破常识作息（凌晨跑步、跳过晚餐、午餐推到 16 点都不可以）
+- ⚠️ 不要为了"和昨天不同"而把作息打乱（睡觉时间、三餐时段必须正常）
+
 1. {min_activities}-{max_activities}个活动，完整覆盖全天（00:00-24:00，无缝衔接）
 {desc_requirement}
-3. 体现人设：{personality[:50]}...
-4. 兴趣相关：{interest if interest else "日常生活"}
-5. 表达风格：{reply_style[:30] if reply_style else "自然随意"}
+3. 严格遵守开头的角色人设：身份、习惯、所处世界观要贯穿全天（不要泛化成"普通女大学生"）
+4. 兴趣偏好：{interest if interest else "日常生活"}
+5. description 字段的语气贴合开头的表达风格（reply_style）；活动 name 保持简短中性
+6. **今日特色（在作息框架内做微变化）**：至少 2 个活动名/描述体现今天独有的细节
+   - ✅ 把"上午活动"具化成今天具体在做什么（例：审稿、回邮件、写专栏、整理藏书）
+   - ✅ 与【最近聊天背景】呼应（例：朋友提到的事 → 反映到 description 或 name 中）
+   - ✅ description 写出今天的小心情 / 小插曲（不夸张，像日记一笔带过）
+   - ❌ 不要每天叫"上午学习""下午学习""夜聊"这种通用名
+   - ❌ 不要为求新意突破作息（凌晨活动、跳过用餐、深夜跑步都不允许）
+   - ❌ "今日特色"≠ 改变作息时段，是同一时段填不同的具体内容{(
+    f'''
+7. **避免与最近几天重复**：今天的活动 name 至少 30% 不要与【最近几天日程参考】里的相同
+   - 防止"周一审稿 / 周二写专栏 / 周三又审稿"这种交替式循环
+   - 看到最近几天反复出现的活动，今天换个具体内容或换措辞
+   - ⚠️ 不是换作息时段：早餐还是早餐时段，但内容可以不同'''
+    if has_real_yesterday else ""
+)}
 """
 
         # 如果有自定义prompt，强调一下
@@ -179,6 +272,11 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 - 睡前准备 22:30 + 1.5h = 24:00 (00:00) ✅ 回到起点，完整覆盖全天
 
 ⚠️ duration_hours 是活动持续时长（小时），不是重复间隔！
+
+【跨天活动支持】
+- 允许活动结束时刻越过 24:00 表示延续到次日（例如 time_slot="23:00" + duration_hours=2.5 → 次日 01:30 结束）
+- 入睡时间在凌晨附近时，睡前/睡眠活动通常会跨过午夜，请直接用大于 24h 的累计时长表达，不要硬切成两条
+- 昨天已经跨到今天凌晨的活动**不要在今天日程里重复写**，今天从它结束后的新活动（起床/洗漱）开始
 
 【时间合理性要求 - 重要！】
 ⚠️ 必须同时满足以下两点：
@@ -229,7 +327,10 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
         preferences: Dict[str, Any],
         schema: Dict,
         previous_issues: List[str],
-        yesterday_context: Optional[str] = None
+        yesterday_context: Optional[str] = None,
+        pending_commitments: Optional[List[Dict[str, Any]]] = None,
+        history_context: str = "",
+        knowledge_context: str = "",
     ) -> str:
         """构建第二轮prompt（附带反馈）
 
@@ -239,12 +340,18 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             schema: JSON Schema
             previous_issues: 上一轮的问题列表
             yesterday_context: 昨日上下文（可选）
+            pending_commitments: 今日约定（可选）
+            history_context: 最近聊天背景（可选）
+            knowledge_context: 相关记忆参考（可选）
 
         Returns:
             改进后的提示词
         """
         base_prompt = self.build_schedule_prompt(
-            schedule_type, preferences, schema, yesterday_context
+            schedule_type, preferences, schema, yesterday_context,
+            pending_commitments=pending_commitments,
+            history_context=history_context,
+            knowledge_context=knowledge_context,
         )
 
         feedback = "\n\n⚠️ **上一次生成存在以下问题，请改进：**\n\n"

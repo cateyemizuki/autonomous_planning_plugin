@@ -37,6 +37,7 @@ import logging
 import uuid
 
 from ..database import GoalDatabase
+from ..utils.time_utils import strip_tz
 from ..utils.timezone_manager import TimezoneManager
 
 logger = logging.getLogger(__name__)
@@ -212,7 +213,7 @@ class Goal:
 
         # Check deadline
         tz_manager = TimezoneManager()
-        if self.deadline and tz_manager.get_now() > self.deadline:
+        if self.deadline and strip_tz(tz_manager.get_now()) > strip_tz(self.deadline):
             return False
 
         return True
@@ -254,7 +255,7 @@ class Goal:
 
         if self.deadline:
             tz_manager = TimezoneManager()
-            time_left = self.deadline - tz_manager.get_now()
+            time_left = strip_tz(self.deadline) - strip_tz(tz_manager.get_now())
             if time_left.total_seconds() > 0:
                 days = time_left.days
                 hours = time_left.seconds // 3600
@@ -446,16 +447,112 @@ class GoalManager:
         active_goals = self.get_active_goals()
         return [g for g in active_goals if g.should_execute_now()]
 
+    # ============================================================
+    # pending_commitments：未来约定（goal_type="pending_commitment"）
+    # ============================================================
+    #
+    # 复用 goals 表存储，用 goal_type 区分；parameters JSON 中含：
+    #   commitment_date: "YYYY-MM-DD"
+    #   time: "HH:MM" 或 ""
+    #   notes: 描述备注
+    #   reason: 角色裁判给出的接受理由
+    #   source: "user_request" / "auto" 等
+    # 消费时 status 改为 COMPLETED，不删除（保留审计）。
+
+    def add_pending_commitment(
+        self,
+        commitment_date: str,
+        title: str,
+        *,
+        time: str = "",
+        notes: str = "",
+        reason: str = "",
+        creator_id: str = "system",
+    ) -> Goal:
+        """添加一条未来约定。
+
+        Args:
+            commitment_date: 约定日期，``YYYY-MM-DD`` 格式。
+            title: 约定标题（对应 Goal.name）。
+            time: 可选的时间（HH:MM）。
+            notes: 可选的备注。
+            reason: 可选的角色裁判理由。
+            creator_id: 创建者 ID。
+
+        Returns:
+            新创建的 Goal 对象。
+        """
+        parameters = {
+            "commitment_date": commitment_date,
+            "time": time,
+            "notes": notes,
+            "reason": reason,
+            "source": "user_request",
+        }
+        return self.create_goal(
+            name=title,
+            description=notes or title,
+            goal_type="pending_commitment",
+            creator_id=creator_id,
+            chat_id="global",
+            priority="medium",
+            parameters=parameters,
+        )
+
+    def get_pending_commitments(
+        self,
+        commitment_date: Optional[str] = None,
+    ) -> List[Goal]:
+        """查询未来约定。
+
+        Args:
+            commitment_date: 指定日期；留空 = 今天。
+
+        Returns:
+            匹配的 pending_commitment 列表（仅返回 status=active 的）。
+        """
+        if commitment_date is None:
+            commitment_date = self.tz_manager.get_now().strftime("%Y-%m-%d")
+
+        candidates = self.get_all_goals(chat_id="global", status=GoalStatus.ACTIVE)
+        return [
+            g for g in candidates
+            if g.goal_type == "pending_commitment"
+            and (g.parameters or {}).get("commitment_date") == commitment_date
+        ]
+
+    def consume_pending_commitments(
+        self,
+        commitment_date: str,
+    ) -> List[Goal]:
+        """消费指定日期的全部未消费约定（标记为 COMPLETED）。
+
+        Args:
+            commitment_date: 目标日期。
+
+        Returns:
+            被消费的约定列表。
+        """
+        consumed = self.get_pending_commitments(commitment_date)
+        for goal in consumed:
+            self.db.update_goal(goal.goal_id, status=GoalStatus.COMPLETED.value)
+        if consumed:
+            logger.info(f"已消费 {len(consumed)} 条 {commitment_date} 的未来约定")
+        return consumed
+
     def get_schedule_goals(
         self,
         chat_id: str = "global",
-        date_str: Optional[str] = None
+        date_str: Optional[str] = None,
+        include_yesterday: bool = False,
     ) -> List[Goal]:
         """Get schedule goals (goals with time_window).
 
         Args:
             chat_id: Chat identifier (default: "global")
             date_str: Date string (YYYY-MM-DD, default: today)
+            include_yesterday: 同时返回昨日创建的 schedule goals（供 inject_service
+                识别跨夜活动）。
 
         Returns:
             List of schedule Goal objects
@@ -463,10 +560,21 @@ class GoalManager:
         if date_str is None:
             date_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
 
+        target_dates = {date_str}
+        if include_yesterday:
+            try:
+                base = datetime.strptime(date_str, "%Y-%m-%d")
+                target_dates.add((base - timedelta(days=1)).strftime("%Y-%m-%d"))
+            except (TypeError, ValueError):
+                pass
+
         goals = self.get_all_goals(chat_id=chat_id)
         schedule_goals = []
 
         for goal in goals:
+            # 跳过 pending_commitment 类型，避免污染日程列表
+            if goal.goal_type == "pending_commitment":
+                continue
             # Check for time_window in parameters or conditions
             has_time_window = False
             if goal.parameters and "time_window" in goal.parameters:
@@ -483,8 +591,8 @@ class GoalManager:
                     except Exception:
                         pass
 
-                # Only return goals for specified date
-                if goal_date == date_str:
+                # Only return goals for specified dates
+                if goal_date in target_dates:
                     schedule_goals.append(goal)
 
         # 去重：按 (name, time_window) 去重，防止重复日程显示

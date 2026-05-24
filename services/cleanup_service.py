@@ -81,6 +81,18 @@ class CleanupService:
         if cleaned_count > 0:
             logger.info(f"🧹 清理了 {cleaned_count} 个旧目标（{cleanup_days} 天前）")
 
+        # 3. 清理过期的 LLM 调用日志
+        cfg = self._plugin.config.schedule
+        if cfg.llm_log_enabled:
+            try:
+                from ..utils.llm_logger import cleanup_old_logs
+                log_dir = self._plugin._plugin_root / "data" / "llm_logs"
+                deleted = cleanup_old_logs(log_dir, cfg.llm_log_retention_days)
+                if deleted > 0:
+                    logger.info(f"🧹 清理了 {deleted} 个过期 LLM 日志")
+            except Exception as exc:
+                logger.debug(f"LLM 日志清理失败: {exc}")
+
     # ------------------------------------------------------------
     # 后台任务 2：自动调度循环（每日定时生成日程）
     # ------------------------------------------------------------
