@@ -33,19 +33,18 @@ Example:
     ... )
 """
 
-import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 import base64
 import io
+import logging
 import math
 import os
 import random
 import threading
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
-
 
 from .timezone_manager import TimezoneManager
 

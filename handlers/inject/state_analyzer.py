@@ -4,10 +4,10 @@
 根据活动类型和进度，动态生成自然的状态文本。
 """
 
-import logging
-import random
 from enum import Enum
 from typing import Optional, Tuple
+import logging
+import random
 
 
 logger = logging.getLogger(__name__)

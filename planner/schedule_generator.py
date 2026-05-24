@@ -14,12 +14,11 @@
 5. 保持向后兼容的公开API
 """
 
-import logging
-import asyncio
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional
-
+import asyncio
+import logging
 
 from ..core.exceptions import (
     LLMError,
@@ -30,7 +29,6 @@ from ..core.exceptions import (
 )
 from ..core.models import Schedule, ScheduleItem, ScheduleType
 from ..utils.timezone_manager import TimezoneManager
-from .goal_manager import GoalManager
 from .generator import (
     BaseScheduleGenerator,
     LLMResponseParser,
@@ -38,6 +36,7 @@ from .generator import (
     ScheduleQualityScorer,
     ScheduleSemanticValidator,
 )
+from .goal_manager import GoalManager
 
 logger = logging.getLogger(__name__)
 

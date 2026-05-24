@@ -12,17 +12,16 @@ ContentTemplateEngine / ConversationContextCache）从 v3 直接复用。
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-
 import asyncio
 import logging
 import re
 import time
 
 from ..cache.lru_cache import LRUCache
+from ..handlers.exception_handler import handle_exception, handle_exception_silent
 from ..planner.goal_manager import get_goal_manager
 from ..utils.time_utils import parse_time_window
 from ..utils.timezone_manager import TimezoneManager
-from ..handlers.exception_handler import handle_exception, handle_exception_silent
 
 if TYPE_CHECKING:
     from ..plugin import AutonomousPlanningPluginV4
@@ -59,16 +58,13 @@ class InjectService:
         self._plugin = plugin
         cfg = plugin.config.autonomous_planning.schedule
 
-        # 缓存
-        self._schedule_cache: LRUCache = LRUCache(max_size=cfg.cache_max_size)
-        self._schedule_cache_ttl: int = cfg.cache_ttl
-        self._cache_cleanup_interval: int = 600  # 10 分钟清理一次
-        self._last_cache_cleanup: float = 0.0
+        # 缓存：把 TTL 直接传给 LRUCache，由它统一管理过期，不再二次封装
+        self._schedule_cache: LRUCache = LRUCache(max_size=cfg.cache_max_size, ttl=cfg.cache_ttl)
 
         # 时区管理器
         self._tz_manager: TimezoneManager = TimezoneManager(cfg.timezone)
 
-        # 智能注入组件（v3 复用）
+        # 智能注入组件
         self._intent_classifier: Optional[Any] = None
         self._state_analyzer: Optional[Any] = None
         self._content_engine: Optional[Any] = None
@@ -83,7 +79,7 @@ class InjectService:
             "InjectService 初始化完成（mode=%s, cache_max=%d, cache_ttl=%d）",
             self._inject_mode,
             cfg.cache_max_size,
-            self._schedule_cache_ttl,
+            cfg.cache_ttl,
         )
 
     def _load_smart_components(self) -> None:
@@ -108,7 +104,7 @@ class InjectService:
             )
             self._inject_optimizer = (
                 InjectOptimizer(
-                    cache_ttl=self._schedule_cache_ttl,
+                    cache_ttl=cfg.cache_ttl,
                     casual_inject_probability=inj.casual_chat_inject_probability,
                 )
                 if inj.enable_inject_optimization
@@ -148,7 +144,7 @@ class InjectService:
         """启动后预热缓存（异步任务）。"""
         await asyncio.sleep(5)  # 等待系统初始化
         logger.debug("🔥 开始预热日程缓存...")
-        self._get_current_schedule("global")
+        await self._get_current_schedule("global")
         logger.debug("✅ 日程缓存预热完成")
 
     # ------------------------------------------------------------
@@ -199,7 +195,7 @@ class InjectService:
                 )
 
             # 获取当前日程
-            current_activity, current_description, all_future_activities, activity_type = self._get_current_schedule(chat_id)
+            current_activity, current_description, all_future_activities, activity_type = await self._get_current_schedule(chat_id)
 
             # 更新对话上下文：用当前活动重新判断
             if self._context_cache and context_continue_inject:
@@ -545,24 +541,16 @@ class InjectService:
     # 当前日程查询（带缓存，与 v3 等价）
     # ------------------------------------------------------------
 
-    def _cleanup_expired_cache(self, current_time: float) -> None:
-        """清理过期缓存项（线程安全）。"""
-        with self._schedule_cache._lock:
-            expired_keys: List[str] = []
-            for key, (_, cached_time) in list(self._schedule_cache.cache.items()):
-                if current_time - cached_time > self._schedule_cache_ttl:
-                    expired_keys.append(key)
-            for key in expired_keys:
-                self._schedule_cache.cache.pop(key, None)
-            if expired_keys:
-                logger.debug(f"清理了 {len(expired_keys)} 个过期缓存项")
-
     @handle_exception("获取当前日程信息失败: {e}", log_level="warning", default_return=(None, None, [], None))
-    def _get_current_schedule(
+    async def _get_current_schedule(
         self,
         chat_id: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]], Optional[str]]:
         """获取当前日程信息（带 15 分钟窗口缓存）。
+
+        TTL 由 LRUCache 自身管理（构造时已配置 ``cfg.cache_ttl``），不再
+        二次封装时间戳。缓存键按「chat_id + 日期 + 15 分钟窗口」分桶，
+        同一窗口内反复查询直接命中。
 
         Returns:
             ``(当前活动, 活动描述, 所有未来活动列表, 当前活动类型)``
@@ -570,22 +558,15 @@ class InjectService:
         now = self._tz_manager.get_now()
         current_hour = now.hour
         current_minute = now.minute
-        current_time = time.time()
 
         # 15 分钟窗口缓存键
         time_window = (current_hour * 60 + current_minute) // 15
         cache_key = f"{chat_id or 'global'}_{now.strftime('%Y%m%d')}_{time_window}"
 
-        # 定期清理过期缓存
-        if current_time - self._last_cache_cleanup > self._cache_cleanup_interval:
-            self._cleanup_expired_cache(current_time)
-            self._last_cache_cleanup = current_time
-
-        # 检查缓存
-        if cache_key in self._schedule_cache:
-            cached_result, cached_time = self._schedule_cache[cache_key]
-            if current_time - cached_time < self._schedule_cache_ttl:
-                return cached_result
+        # 命中缓存直接返回
+        cached_result = await self._schedule_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
 
         # 重新查询
         goal_manager = get_goal_manager()
@@ -595,7 +576,7 @@ class InjectService:
 
         if not goals:
             result = (None, None, [], None)
-            self._schedule_cache[cache_key] = (result, current_time)
+            await self._schedule_cache.set(cache_key, result)
             return result
 
         current_time_minutes = current_hour * 60 + current_minute
@@ -620,7 +601,7 @@ class InjectService:
 
         if not scheduled_goals:
             result = (None, None, [], None)
-            self._schedule_cache[cache_key] = (result, current_time)
+            await self._schedule_cache.set(cache_key, result)
             return result
 
         def _get_start_minutes(item: Tuple[Any, List[int], bool]) -> int:
@@ -676,5 +657,5 @@ class InjectService:
                 all_future_activities.append((time_str, goal.name))
 
         result = (current_activity, current_description, all_future_activities, current_activity_type)
-        self._schedule_cache[cache_key] = (result, current_time)
+        await self._schedule_cache.set(cache_key, result)
         return result

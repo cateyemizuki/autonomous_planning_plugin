@@ -12,11 +12,10 @@ Example:
     >>> items = parser.extract_schedule_items(data)
 """
 
-import logging
-import json
-import re
 from typing import Any, Dict, List, Optional
-
+import json
+import logging
+import re
 
 from ...core.exceptions import LLMInvalidResponseError
 

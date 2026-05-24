@@ -4,9 +4,9 @@
 遵循DRY原则,减少样板代码,提高可维护性。
 """
 
-import logging
-import functools
 from typing import Any, Callable, Optional, Tuple
+import functools
+import logging
 
 logger = logging.getLogger(__name__)
 

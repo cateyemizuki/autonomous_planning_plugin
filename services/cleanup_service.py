@@ -7,7 +7,6 @@
 """
 
 from typing import TYPE_CHECKING, Optional
-
 import asyncio
 import logging
 
@@ -89,8 +88,8 @@ class CleanupService:
     async def run_scheduler_loop(self) -> None:
         """启动并守护 ``ScheduleAutoScheduler``（每日定时自动生成日程）。
 
-        阶段 5 LLM 调用已切到 ``ctx.llm.generate``，本循环实际接入真实调度器。
-        守护语义：调度器内部自带定时循环，本方法仅负责启动 + 等待停止信号 + 优雅关闭。
+        调度器内部自带定时循环，本方法仅负责启动 + 等待停止信号 + 优雅关闭。
+        延迟 5 秒启动，确保插件其他组件就绪。
         """
         logger.info("📅 自动调度循环已启动")
         try:

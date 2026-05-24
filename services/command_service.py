@@ -7,7 +7,7 @@
 
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
-
+import asyncio
 import logging
 
 from ..planner.goal_manager import get_goal_manager
@@ -227,9 +227,11 @@ class CommandService:
         weekday = _WEEKDAY_NAMES[now.weekday()]
         title = f"今日日程 {today} {weekday}"
 
-        # 生成图片：新版优先发送 base64（不再用 file:// imageurl）
+        # 生成图片：PIL 是同步阻塞操作（渲染 + 字体加载可能耗时 100ms~1s），
+        # 必须丢给默认线程池，避免阻塞事件循环上的其它协程
         try:
-            _img_path, img_base64 = ScheduleImageGenerator.generate_schedule_image(
+            _img_path, img_base64 = await asyncio.to_thread(
+                ScheduleImageGenerator.generate_schedule_image,
                 title=title,
                 schedule_items=schedule_items,
             )

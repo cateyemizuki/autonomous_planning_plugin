@@ -4,8 +4,8 @@ This module provides JSON Schema building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 """
 
-import logging
 from typing import Any, Dict
+import logging
 
 
 logger = logging.getLogger(__name__)

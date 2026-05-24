@@ -4,11 +4,10 @@
 通过记录注入历史、检查时间间隔等方式，优化注入策略。
 """
 
+from typing import Dict, Optional, Tuple
 import logging
 import random
 import time
-from typing import Dict, Optional, Tuple
-
 
 from .intent_classifier import UserIntent
 

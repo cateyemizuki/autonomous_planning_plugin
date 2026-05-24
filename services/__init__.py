@@ -1,10 +1,9 @@
-"""自主规划插件 v4 - Service 层。
+"""自主规划插件 v4 - Service 层
 
-把旧版 BaseTool / BaseCommand / BaseEventHandler 的业务实现拆分到 service，
-plugin.py 中只保留装饰器外壳，调用对应 service 方法完成具体逻辑。
-
-阶段 1 阶段所有 service 仅给出最小占位实现，方法签名稳定，
-阶段 2 起填入实际业务（从 v3 代码迁移）。
+业务实现层，与组件装饰器外壳解耦：
+- plugin.py 的 ``@Tool / @Command / @EventHandler / @HookHandler`` 装饰器
+  只做 SDK 注册和参数转发
+- services/*.py 承载真实业务逻辑（数据访问 / API 调用 / 后台循环）
 """
 
 from .cleanup_service import CleanupService

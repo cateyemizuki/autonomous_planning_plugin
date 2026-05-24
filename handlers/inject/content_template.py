@@ -4,10 +4,9 @@
 提供多样化的表达模板，避免千篇一律的注入文本。
 """
 
+from typing import List, Optional, Tuple
 import logging
 import random
-from typing import List, Optional, Tuple
-
 
 from .intent_classifier import UserIntent
 from .state_analyzer import ActivityState, ActivityStateAnalyzer

@@ -3,8 +3,8 @@
 This module provides semantic validation for schedule items.
 """
 
-import logging
 from typing import Dict, List, Optional, Tuple
+import logging
 
 
 logger = logging.getLogger(__name__)

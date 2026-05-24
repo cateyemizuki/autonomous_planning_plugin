@@ -18,11 +18,10 @@ v4 已删除 ``custom_model`` 段（决策：强制走主程序 ``model_config.t
 """
 
 from typing import Any, Dict, List, Optional, Tuple
-
 import logging
 
-from ..goal_manager import GoalManager
 from ...utils.timezone_manager import TimezoneManager
+from ..goal_manager import GoalManager
 from .context_loader import ScheduleContextLoader
 from .prompt_builder import PromptBuilder
 from .schema_builder import SchemaBuilder

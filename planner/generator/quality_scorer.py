@@ -12,9 +12,8 @@ Example:
     >>> print(f"Quality: {score:.2f}")
 """
 
-import logging
 from typing import Any, Dict, List
-
+import logging
 
 from ...utils.time_utils import time_slot_to_minutes
 

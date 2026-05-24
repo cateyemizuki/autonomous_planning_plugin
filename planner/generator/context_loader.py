@@ -4,12 +4,10 @@ This module provides historical context loading functionality for schedule gener
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 """
 
-import logging
 from datetime import timedelta
 from typing import List, Optional
+import logging
 
-
-# 类型提示导入
 from ...utils.timezone_manager import TimezoneManager
 from ..goal_manager import GoalManager
 

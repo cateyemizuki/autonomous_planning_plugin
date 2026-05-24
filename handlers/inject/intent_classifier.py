@@ -4,10 +4,11 @@
 通过关键词匹配和权重评分，准确识别用户是否在询问当前状态、未来计划等。
 """
 
-import logging
-import re
 from enum import Enum
 from typing import Tuple, Optional
+import logging
+import re
+
 from dataclasses import dataclass
 
 

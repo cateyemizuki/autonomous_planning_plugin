@@ -12,13 +12,12 @@ Example:
     >>> await scheduler.start()  # Start background task
 """
 
-import logging
+from pathlib import Path
+from typing import Optional
 import asyncio
 import datetime
 import json
-from pathlib import Path
-from typing import Optional
-
+import logging
 
 from ..utils.timezone_manager import TimezoneManager
 from .generator import BaseScheduleGenerator
@@ -60,7 +59,7 @@ class ScheduleAutoScheduler:
         self.logger = logging.getLogger(__name__)
 
         # 初始化时区管理器
-        timezone_str = plugin.get_config("autonomous_planning.schedule.timezone", "Asia/Shanghai")
+        timezone_str = plugin.config.autonomous_planning.schedule.timezone
         self.tz_manager = TimezoneManager(timezone_str)
 
         # P1优化：指数退避参数
@@ -90,14 +89,14 @@ class ScheduleAutoScheduler:
             return
 
         # 检查是否启用定时生成
-        enabled = self.plugin.get_config("autonomous_planning.schedule.auto_schedule_enabled", False)
+        enabled = self.plugin.config.autonomous_planning.schedule.auto_schedule_enabled
         if not enabled:
             self.logger.info("日程定时生成功能未启用")
             return
 
         self.is_running = True
         self.task = asyncio.create_task(self._schedule_loop())
-        schedule_time = self.plugin.get_config("autonomous_planning.schedule.auto_schedule_time", "00:30")
+        schedule_time = self.plugin.config.autonomous_planning.schedule.auto_schedule_time
         self.logger.info(f"日程定时生成已启动 - 执行时间: {schedule_time}")
 
     async def stop(self):
@@ -222,8 +221,9 @@ class ScheduleAutoScheduler:
                 item = f"- {time_text} {goal.name} ({goal_type}/{priority})"
 
                 if include_completion:
+                    # Goal 上的 status 一定存在；progress 在 core.models 中类型为 int 默认 0
                     status = goal.status.value if hasattr(goal.status, "value") else str(goal.status)
-                    progress = int(getattr(goal, "progress", 0) or 0)
+                    progress = int(goal.progress) if hasattr(goal, "progress") else 0
                     item += f" 状态={status}, 进度={progress}%"
 
                 lines.append(item)
@@ -333,17 +333,17 @@ class ScheduleAutoScheduler:
         while self.is_running:
             try:
                 now = self.tz_manager.get_now()
-                schedule_time_str = self.plugin.get_config("autonomous_planning.schedule.auto_schedule_time", "00:30")
-                infer_enabled = bool(
-                    self.plugin.get_config("autonomous_planning.schedule.auto_infer_next_day_prompt", False)
-                )
-                infer_time_str = self.plugin.get_config("autonomous_planning.schedule.infer_time", "22:30")
+                schedule_cfg = self.plugin.config.autonomous_planning.schedule
+                schedule_time_str = schedule_cfg.auto_schedule_time
+                infer_enabled = schedule_cfg.auto_infer_next_day_prompt
+                infer_time_str = schedule_cfg.infer_time
                 today_str = now.strftime("%Y-%m-%d")
 
                 ran_any_task = False
 
                 if infer_enabled and self._is_time_due(now, infer_time_str, self._last_infer_date):
-                    schedule_config = self.plugin.get_config("autonomous_planning.schedule", {}) or {}
+                    # 强类型配置 dump 成 dict 传给业务函数（保留 v3 接口签名）
+                    schedule_config = schedule_cfg.model_dump()
                     await self._infer_next_day_prompt(schedule_config)
                     self._last_infer_date = today_str
                     ran_any_task = True
@@ -423,9 +423,9 @@ class ScheduleAutoScheduler:
                 self.logger.info(f"📅 今日已有 {today_schedule_count} 个日程，跳过自动生成")
                 return
 
-            # 生成日程
-            schedule_config = dict(self.plugin.get_config("autonomous_planning.schedule", {}) or {})
-            fallback_prompt = str(schedule_config.get("custom_prompt", "") or "")
+            # 生成日程：强类型配置 dump 成 dict 传给业务函数
+            schedule_config = self.plugin.config.autonomous_planning.schedule.model_dump()
+            fallback_prompt = str(schedule_config.get("custom_prompt") or "")
             effective_prompt = self._get_effective_custom_prompt(today, fallback_prompt)
             if effective_prompt != fallback_prompt:
                 schedule_config["custom_prompt"] = effective_prompt
@@ -442,7 +442,7 @@ class ScheduleAutoScheduler:
                 chat_id="global",
                 preferences={},
                 use_llm=True,
-                use_multi_round=self.plugin.get_config("autonomous_planning.schedule.use_multi_round", True),
+                use_multi_round=self.plugin.config.autonomous_planning.schedule.use_multi_round,
             )
 
             # 🔧 修复：如果日程已存在，跳过应用

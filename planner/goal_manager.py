@@ -29,13 +29,12 @@ Example:
     ... )
 """
 
-import logging
-import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+import logging
+import uuid
 
 from ..database import GoalDatabase
 from ..utils.timezone_manager import TimezoneManager
@@ -773,3 +772,18 @@ def get_goal_manager() -> GoalManager:
     if _goal_manager is None:
         _goal_manager = GoalManager()
     return _goal_manager
+
+
+def close_goal_manager() -> None:
+    """关闭并释放全局 GoalManager 单例所持有的数据库连接。
+
+    供插件 ``on_unload`` 调用，避免长时间运行后线程本地连接累积。
+    再次调用 ``get_goal_manager()`` 会重建实例。
+    """
+    global _goal_manager
+    if _goal_manager is not None:
+        try:
+            _goal_manager.db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"关闭目标数据库连接异常: {exc}")
+        _goal_manager = None

@@ -15,10 +15,10 @@
     ...     cache.mark_injected("chat_123")
 """
 
+from typing import Any, Dict, Optional
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
 
 
 logger = logging.getLogger(__name__)

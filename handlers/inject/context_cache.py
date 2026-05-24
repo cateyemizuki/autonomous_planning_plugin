@@ -4,11 +4,12 @@
 用于智能注入决策，判断是否需要在连续对话中继续注入日程信息。
 """
 
+from collections import deque
+from typing import Dict, Optional, Deque
 import logging
 import time
-from collections import deque
+
 from dataclasses import dataclass
-from typing import Dict, Optional, Deque
 
 
 logger = logging.getLogger(__name__)

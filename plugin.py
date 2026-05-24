@@ -1,18 +1,16 @@
-"""麦麦自主规划插件 v4 - 正式骨架（阶段 1 产物）
+"""麦麦自主规划插件 v4 - 主入口
 
-完整 7 个组件外壳已就位，业务逻辑下沉到 ``services/`` 各占位 service。
-后续阶段在 service 中填充 v3 迁移过来的业务代码即可，无需再动 plugin.py。
+完整 7 个组件外壳，业务逻辑下沉到 ``services/``。
 
 组件总览：
 - 4 个 ``@Tool``      ：manage_goal_v4 / get_planning_status_v4 / generate_schedule_v4 / apply_schedule_v4
 - 1 个 ``@Command``   ：planning_v4 (``/plan`` 或 ``/规划``)
 - 1 个 ``@EventHandler`` ：autonomous_planner_v4 (ON_START)
-- 1 个 ``@HookHandler``  ：schedule_inject_v4 (maisaka.planner.before_request) ⭐ v4 新注入入口
+- 1 个 ``@HookHandler``  ：schedule_inject_v4 (maisaka.planner.before_request) ⭐ 注入入口
 """
 
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Tuple
-
 import asyncio
 import logging
 
@@ -24,9 +22,6 @@ from .services import CleanupService, CommandService, InjectService, ToolsServic
 
 
 logger = logging.getLogger(__name__)
-
-# get_config 路径访问的哨兵值（区分 "字段不存在" 和 "字段值为 None"）
-_SENTINEL = object()
 
 
 class AutonomousPlanningPluginV4(MaiBotPlugin):
@@ -104,7 +99,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         return profile
 
     async def on_unload(self) -> None:
-        """插件卸载：通知所有循环停止 → cancel 后台任务 → 等待退出。"""
+        """插件卸载：通知所有循环停止 → cancel 后台任务 → 等待退出 → 关闭数据库。"""
         if self._cleanup_svc is not None:
             await self._cleanup_svc.stop()
 
@@ -120,6 +115,11 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
                 logger.debug("后台任务退出: %s", exc)
 
         self._bg_tasks.clear()
+
+        # 释放 GoalManager 持有的 SQLite 线程本地连接池
+        from .planner.goal_manager import close_goal_manager
+        close_goal_manager()
+
         logger.info("[v4] 自主规划插件 v4 已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -133,40 +133,6 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         del config_data
         logger.info("[v4] 配置热更新 scope=%s version=%s", scope, version)
         # services 持有 plugin 引用，配置通过 self.config.xxx 动态读取，无需特殊处理
-        # 阶段 4 起若有需要重置的状态（如重建缓存）再补充
-
-    # ============================================================
-    # 兼容辅助：v3 风格的 dotted key 配置访问
-    # ============================================================
-
-    def get_config(self, key: str, default: Any = None) -> Any:
-        """通过点分割路径访问强类型配置。
-
-        v3 时代 BasePlugin 提供 ``get_config(path, default)``，业务代码（特别是
-        ``planner/auto_scheduler.py``）大量使用。v4 强类型 ``self.config.xxx.yyy``
-        语义等价但语法不同；本方法做点分割路径 → 属性访问的桥接，减少业务代码改动。
-
-        Args:
-            key: 点分割路径，如 ``"autonomous_planning.schedule.auto_schedule_time"``
-            default: 路径不存在时的回退值
-
-        Returns:
-            配置值；路径无效时返回 ``default``
-        """
-        if not key:
-            return default
-        try:
-            obj: Any = self.config
-            for part in key.split("."):
-                if isinstance(obj, dict):
-                    obj = obj.get(part, _SENTINEL)
-                else:
-                    obj = getattr(obj, part, _SENTINEL)
-                if obj is _SENTINEL:
-                    return default
-            return obj
-        except Exception:
-            return default
 
     # ============================================================
     # Tool 组件（4 个，对应 v3 的 4 个 BaseTool 子类）

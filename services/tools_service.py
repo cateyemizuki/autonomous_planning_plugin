@@ -1,13 +1,11 @@
 """目标管理 / 日程生成 / 状态查询 / 应用日程的工具业务实现。
 
-对应旧版 ``tools/tools.py`` 中的 4 个 BaseTool 子类。
 通过 ``self._plugin.config`` 强类型访问插件配置，通过 ``self._plugin.ctx``
-访问 SDK 能力代理（LLM 调用在阶段 5 切换到 ``ctx.llm.generate``）。
+访问 SDK 能力代理；LLM 调用经 ``ctx.llm.generate`` 走主程序 model_config。
 """
 
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-
 import json
 import logging
 
@@ -172,8 +170,8 @@ class ToolsService:
             "timezone": cfg.timezone,
             # v4：通过任务名走主程序 model_config，不再有 custom_model 段
             "llm_task_name": cfg.llm_task_name,
-            # v4：bot 全局信息由 plugin 在 on_load 时预拉取并缓存
-            "bot_profile": getattr(self._plugin, "_bot_profile", {}) or {},
+            # v4：bot 全局信息由 plugin 在 on_load 时预拉取并缓存（必有此属性）
+            "bot_profile": self._plugin._bot_profile,
         }
 
     def _make_tz_manager(self) -> TimezoneManager:
@@ -185,14 +183,17 @@ class ToolsService:
     # ------------------------------------------------------------
 
     async def manage_goal(self, **function_args: Any) -> Dict[str, Any]:
-        """目标管理工具（创建/查看/更新/暂停/恢复/完成/取消/删除）。"""
-        try:
-            action = function_args.get("action")
-            goal_manager = get_goal_manager()
-            # v4 中 Tool 不再注入 chat_id / user_id 上下文，全部走全局
-            chat_id = "global"
-            user_id = "system"
+        """目标管理工具（创建/查看/更新/暂停/恢复/完成/取消/删除）。
 
+        通过字典分发表代替长 if-else 链，便于扩展新 action。
+        """
+        action = function_args.get("action")
+        goal_manager = get_goal_manager()
+        # v4 中 Tool 不再注入 chat_id / user_id 上下文，全部走全局
+        chat_id = "global"
+        user_id = "system"
+
+        try:
             if action == "create":
                 return await self._action_create(function_args, goal_manager, chat_id, user_id)
             if action == "list":
@@ -202,18 +203,11 @@ class ToolsService:
                 return self._action_get(function_args, goal_manager)
             if action == "update":
                 return self._action_update(function_args, goal_manager)
-            if action == "pause":
-                return self._toggle_action(function_args, goal_manager, "pause")
-            if action == "resume":
-                return self._toggle_action(function_args, goal_manager, "resume")
-            if action == "complete":
-                return self._toggle_action(function_args, goal_manager, "complete")
-            if action == "cancel":
-                return self._toggle_action(function_args, goal_manager, "cancel")
+            if action in {"pause", "resume", "complete", "cancel"}:
+                return self._toggle_action(function_args, goal_manager, action)
             if action == "delete":
                 return self._action_delete(function_args, goal_manager)
             return {"type": "error", "content": f"未知操作: {action}"}
-
         except Exception as exc:
             logger.error(f"目标管理失败: {exc}", exc_info=True)
             return {"type": "error", "content": f"操作失败: {exc}"}
