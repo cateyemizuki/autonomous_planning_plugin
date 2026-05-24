@@ -13,7 +13,7 @@
 
 脚本顶部已强制 stdout/stderr 为 utf-8，不需要再设 ``PYTHONIOENCODING`` 环境变量。
 
-覆盖范围（14 项）：
+覆盖范围（15 项）：
     1.  插件包导入（验证 cache 模块未缺失）
     2.  组件注册（4 Tool + 1 Command + 1 EventHandler + 2 HookHandler + 1 API = 9-10 个）
     3.  UI Section 渲染（4 个顶层 section 全部可见、字段带 label/hint/order）
@@ -28,6 +28,7 @@
     12. get_current_activity_snapshot 返回结构（API 对外契约）
     13. replyer 注入 6 种场景（正常 / 重试 / 冷却 / 关闭 / 白名单 / 无活动）
     14. 多天日程对比（load_recent_schedule_summary 3 天回看）
+    15. ScheduleAutoScheduler 构造 + start/stop（强类型 plugin.config 访问）
 
 任何一项失败会抛 AssertionError + 退出码 1；全过输出 ALL SMOKE TESTS PASSED 退出码 0。
 """
@@ -431,6 +432,24 @@ def test_recent_schedule_summary():
     assert "审稿" in s_yest
 
 
+@step("15. ScheduleAutoScheduler 构造 + start/stop（强类型 config 访问）")
+def test_auto_scheduler():
+    sched_mod = imp("planner.auto_scheduler")
+    inst = fresh_plugin()
+
+    async def run():
+        s = sched_mod.ScheduleAutoScheduler(inst)
+        assert s.tz_manager.timezone_str == inst.config.schedule.timezone
+        # 强制启用以走完 start 分支（验证 plugin.config.schedule.xxx 全部可访问）
+        inst.config.schedule.auto_schedule_enabled = True
+        await s.start()
+        assert s.is_running is True
+        await s.stop()
+        assert s.is_running is False
+
+    asyncio.run(run())
+
+
 def main() -> int:
     print(f"\n{'=' * 60}")
     print("自主规划插件 v4 完整冒烟测试")
@@ -450,6 +469,7 @@ def main() -> int:
     test_api_snapshot()
     test_replyer_inject()
     test_recent_schedule_summary()
+    test_auto_scheduler()
 
     print(f"\n{'=' * 60}")
     print(f"通过: {len(_PASS)} / 失败: {len(_FAIL)}")

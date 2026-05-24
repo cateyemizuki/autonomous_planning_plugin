@@ -59,7 +59,7 @@ class ScheduleAutoScheduler:
         self.logger = logging.getLogger(__name__)
 
         # 初始化时区管理器
-        timezone_str = plugin.get_config("schedule.timezone", "Asia/Shanghai")
+        timezone_str = plugin.config.schedule.timezone
         self.tz_manager = TimezoneManager(timezone_str)
 
         # P1优化：指数退避参数
@@ -89,14 +89,14 @@ class ScheduleAutoScheduler:
             return
 
         # 检查是否启用定时生成
-        enabled = self.plugin.get_config("schedule.auto_schedule_enabled", False)
+        enabled = self.plugin.config.schedule.auto_schedule_enabled
         if not enabled:
             self.logger.info("日程定时生成功能未启用")
             return
 
         self.is_running = True
         self.task = asyncio.create_task(self._schedule_loop())
-        schedule_time = self.plugin.get_config("schedule.auto_schedule_time", "00:30")
+        schedule_time = self.plugin.config.schedule.auto_schedule_time
         self.logger.info(f"日程定时生成已启动 - 执行时间: {schedule_time}")
 
     async def stop(self):
@@ -333,17 +333,17 @@ class ScheduleAutoScheduler:
         while self.is_running:
             try:
                 now = self.tz_manager.get_now()
-                schedule_time_str = self.plugin.get_config("schedule.auto_schedule_time", "00:30")
+                schedule_time_str = self.plugin.config.schedule.auto_schedule_time
                 infer_enabled = bool(
-                    self.plugin.get_config("schedule.auto_infer_next_day_prompt", False)
+                    self.plugin.config.schedule.auto_infer_next_day_prompt
                 )
-                infer_time_str = self.plugin.get_config("schedule.infer_time", "22:30")
+                infer_time_str = self.plugin.config.schedule.infer_time
                 today_str = now.strftime("%Y-%m-%d")
 
                 ran_any_task = False
 
                 if infer_enabled and self._is_time_due(now, infer_time_str, self._last_infer_date):
-                    schedule_config = self.plugin.get_config("schedule", {}) or {}
+                    schedule_config = self.plugin.config.schedule.model_dump()
                     await self._infer_next_day_prompt(schedule_config)
                     self._last_infer_date = today_str
                     ran_any_task = True
@@ -424,7 +424,7 @@ class ScheduleAutoScheduler:
                 return
 
             # 生成日程
-            schedule_config = dict(self.plugin.get_config("schedule", {}) or {})
+            schedule_config = self.plugin.config.schedule.model_dump()
             fallback_prompt = str(schedule_config.get("custom_prompt", "") or "")
             effective_prompt = self._get_effective_custom_prompt(today, fallback_prompt)
             if effective_prompt != fallback_prompt:
@@ -442,7 +442,7 @@ class ScheduleAutoScheduler:
                 chat_id="global",
                 preferences={},
                 use_llm=True,
-                use_multi_round=self.plugin.get_config("schedule.use_multi_round", True),
+                use_multi_round=self.plugin.config.schedule.use_multi_round,
             )
 
             # 🔧 修复：如果日程已存在，跳过应用
