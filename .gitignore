@@ -13,6 +13,12 @@ data/
 # 只忽略其中的字节码，不要整目录忽略
 cache/__pycache__/
 
+# 本机专属：不进仓库
+config.toml
+config_back/
+changelogs/
+POC_RESULT.md
+
 # 环境与编辑器
 .env
 .venv/

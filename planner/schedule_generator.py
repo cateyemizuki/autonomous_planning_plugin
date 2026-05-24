@@ -28,6 +28,7 @@ from ..core.exceptions import (
     ScheduleGenerationError,
 )
 from ..core.models import Schedule, ScheduleItem, ScheduleType
+from ..utils.llm_logger import log_llm_call
 from ..utils.timezone_manager import TimezoneManager
 from .generator import (
     BaseScheduleGenerator,
@@ -178,9 +179,48 @@ class ScheduleGenerator:
 
         preferences = preferences or {}
 
-        # 加载昨日日程作为上下文
+        # 加载最近 N 天日程作为上下文（防止交替式重复）
+        recent_days = int(self.config._raw_config.get("recent_schedule_days", 3))
         self.base_generator.yesterday_schedule_summary = \
-            self.base_generator.load_yesterday_schedule_summary()
+            self.base_generator.context_loader.load_recent_schedule_summary(days=recent_days)
+
+        # 加载今日 pending_commitments 作为上下文
+        today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+        pending = self.goal_manager.get_pending_commitments(today_str)
+        self.base_generator.pending_commitments = [
+            {
+                "time": (p.parameters or {}).get("time", ""),
+                "title": p.name,
+                "notes": (p.parameters or {}).get("notes", ""),
+            }
+            for p in pending
+        ] or None
+        if pending:
+            logger.info(f"📌 今日有 {len(pending)} 条未来约定将被纳入日程生成")
+
+        # 加载跨群历史 + 知识库（D 阶段；失败静默不阻塞生成）
+        raw_cfg = self.config._raw_config if hasattr(self.config, "_raw_config") else {}
+        allowed = raw_cfg.get("allowed_streams", []) or []
+        history_limit = int(raw_cfg.get("history_message_limit", 0) or 0)
+        knowledge_limit = int(raw_cfg.get("knowledge_search_limit", 0) or 0)
+        try:
+            self.base_generator.history_context = (
+                await self.base_generator.context_loader.load_recent_history_across_streams(
+                    self._plugin, allowed, history_limit,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"跨群历史加载失败: {exc}")
+            self.base_generator.history_context = ""
+        try:
+            self.base_generator.knowledge_context = (
+                await self.base_generator.context_loader.load_relevant_knowledge(
+                    self._plugin, query_hint=today_str, limit=knowledge_limit,
+                )
+            )
+        except Exception as exc:
+            logger.debug(f"知识库检索失败: {exc}")
+            self.base_generator.knowledge_context = ""
 
         # 生成日程项
         if use_multi_round:
@@ -364,8 +404,9 @@ class ScheduleGenerator:
                     else:
                         end_minutes = start_minutes + 60  # 默认1小时
 
-                    # 避免跨午夜
-                    if end_minutes > 24 * 60:
+                    # 跨天活动支持：开关开启时保留 end_minutes > 1440（数据层的跨夜分支会处理）
+                    cross_day_enabled = bool(self.config._raw_config.get("cross_day_activity", True))
+                    if not cross_day_enabled and end_minutes > 24 * 60:
                         end_minutes = 24 * 60
 
                     parameters["time_window"] = [start_minutes, end_minutes]
@@ -393,6 +434,17 @@ class ScheduleGenerator:
             created_goals = self.goal_manager.create_goals_batch(goals_data)
             created_goal_ids = [g.goal_id for g in created_goals]
             logger.info(f"✅ 批量创建了 {len(created_goal_ids)} 个目标")
+
+            # 消费今日 pending_commitments（成功 apply 后才标记）
+            if schedule.schedule_type == ScheduleType.DAILY:
+                today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+                try:
+                    consumed = self.goal_manager.consume_pending_commitments(today_str)
+                    if consumed:
+                        logger.info(f"📌 已消费 {len(consumed)} 条未来约定")
+                except Exception as exc:
+                    logger.warning(f"消费未来约定失败: {exc}", exc_info=True)
+
             return created_goal_ids
         else:
             logger.warning("没有有效的日程项可以应用")
@@ -423,6 +475,59 @@ class ScheduleGenerator:
                 lines.append(item.name)
 
         return "\n".join(lines)
+
+    async def regenerate_today_schedule(
+        self,
+        user_id: str,
+        chat_id: str,
+        *,
+        extra_prompt: str = "",
+        auto_apply: bool = True,
+    ) -> Schedule:
+        """重生成今日日程：先删除今天已有 schedule_goals，再走标准生成 + apply。
+
+        Args:
+            user_id: 用户 ID。
+            chat_id: 聊天 ID（保持与 generate_daily_schedule 一致）。
+            extra_prompt: 临时追加到 custom_prompt 的描述（如角色裁判通过的请求）。
+            auto_apply: 是否自动 apply 到 goals 表；False 时仅返回 Schedule。
+
+        Returns:
+            新生成的 Schedule 对象。
+        """
+        today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+        existing = self.goal_manager.get_schedule_goals(chat_id=chat_id, date_str=today_str)
+        for goal in existing:
+            try:
+                self.goal_manager.delete_goal(goal.goal_id)
+            except Exception as exc:
+                logger.warning(f"删除旧日程失败: {goal.goal_id} - {exc}")
+        if existing:
+            logger.info(f"🧹 已清理 {len(existing)} 个今日旧日程，开始重新生成")
+
+        # 临时叠加 extra_prompt 到 custom_prompt
+        original_custom = self.config._raw_config.get("custom_prompt", "")
+        if extra_prompt:
+            merged = (original_custom + "\n\n" + extra_prompt).strip() if original_custom else extra_prompt
+            self.config._raw_config["custom_prompt"] = merged
+            self.base_generator.config["custom_prompt"] = merged
+            self.base_generator.prompt_builder.config["custom_prompt"] = merged
+
+        try:
+            schedule = await self.generate_daily_schedule(
+                user_id=user_id,
+                chat_id=chat_id,
+                use_llm=True,
+                force_regenerate=True,
+            )
+            if auto_apply:
+                await self.apply_schedule(schedule=schedule, user_id=user_id, chat_id=chat_id)
+            return schedule
+        finally:
+            # 还原 custom_prompt
+            self.config._raw_config["custom_prompt"] = original_custom
+            self.base_generator.config["custom_prompt"] = original_custom
+            self.base_generator.prompt_builder.config["custom_prompt"] = original_custom
 
     # ========================================================================
     # 内部方法（生成逻辑）
@@ -557,6 +662,9 @@ class ScheduleGenerator:
         success = bool(llm_result.get("success", False))
         response = str(llm_result.get("response", ""))
 
+        # 归档 LLM 调用（受配置开关控制；失败静默）
+        self._archive_llm_call("schedule_generation", prompt, response, task_name, success)
+
         if not success:
             # 智能识别错误类型
             error_msg = str(response).lower()
@@ -576,6 +684,30 @@ class ScheduleGenerator:
         items = self.response_parser.parse_schedule_response(response)
 
         return items
+
+    def _archive_llm_call(
+        self,
+        call_type: str,
+        prompt: str,
+        response: str,
+        model: str,
+        success: bool,
+    ) -> None:
+        """把一次 LLM 调用归档到 ``data/llm_logs/``。
+
+        受配置 ``llm_log_enabled`` 控制；失败时不影响主流程。
+        """
+        raw = self.config._raw_config if hasattr(self.config, "_raw_config") else {}
+        if not raw.get("llm_log_enabled", True):
+            return
+        log_dir = raw.get("llm_log_dir")
+        if not log_dir:
+            # plugin 未注入路径时跳过（测试场景）
+            if self._plugin is None or not hasattr(self._plugin, "_plugin_root"):
+                return
+            log_dir = self._plugin._plugin_root / "data" / "llm_logs"
+        from pathlib import Path
+        log_llm_call(call_type, prompt, response, model, success, Path(log_dir))
 
     def _dict_to_schedule_items(self, items_dict: List[Dict]) -> List[ScheduleItem]:
         """将字典列表转换为ScheduleItem对象列表"""

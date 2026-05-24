@@ -12,7 +12,8 @@ import logging
 
 from ..planner.goal_manager import get_goal_manager
 from ..utils.schedule_image_generator import ScheduleImageGenerator
-from ..utils.time_utils import format_minutes_to_time, get_time_window_from_goal
+from ..utils.stream_filter import is_stream_allowed
+from ..utils.time_utils import format_minutes_to_time, get_time_window_from_goal, strip_tz
 from ..utils.timezone_manager import TimezoneManager
 
 if TYPE_CHECKING:
@@ -57,10 +58,10 @@ class CommandService:
 
     @property
     def _enable_detailed_description(self) -> bool:
-        return self._plugin.config.autonomous_planning.schedule.enable_detailed_description
+        return self._plugin.config.schedule.enable_detailed_description
 
     def _make_tz_manager(self) -> TimezoneManager:
-        return TimezoneManager(self._plugin.config.autonomous_planning.schedule.timezone)
+        return TimezoneManager(self._plugin.config.schedule.timezone)
 
     # ------------------------------------------------------------
     # 命令分发入口
@@ -98,6 +99,12 @@ class CommandService:
             await self._send(stream_id, "🚫 你不是管理员哦~只有管理员才能查看和管理日程呢")
             return True, "没有权限", True
 
+        # 白名单过滤（留空 = 全部允许）
+        allowed_streams = self._plugin.config.schedule.allowed_streams
+        if not is_stream_allowed(stream_id, allowed_streams):
+            await self._send(stream_id, "💤 当前会话未启用日程功能")
+            return True, "会话未启用", True
+
         if len(parts) == 1:
             await self._show_help(stream_id)
             return True, "显示帮助", True
@@ -132,7 +139,7 @@ class CommandService:
         Returns:
             是否有权限
         """
-        admin_users = self._plugin.config.autonomous_planning.schedule.admin_users
+        admin_users = self._plugin.config.schedule.admin_users
         # 留空时所有人都有权限
         if not admin_users:
             return True
@@ -328,7 +335,9 @@ class CommandService:
                     goal_datetime = g.created_at.replace(hour=0, minute=0, second=0, microsecond=0)
 
                 cutoff_datetime = cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                if goal_datetime < cutoff_datetime:
+
+                # 防 tz-aware/naive 混比报错（历史数据库可能是 tz-naive，v4.1 后是 tz-aware）
+                if strip_tz(goal_datetime) < strip_tz(cutoff_datetime):
                     to_delete.append(g)
             except Exception as exc:
                 logger.warning(f"解析目标创建时间失败: {g.created_at} - {exc}")
@@ -354,7 +363,7 @@ class CommandService:
 
     async def _show_help(self, stream_id: str) -> None:
         """显示帮助。"""
-        help_text = """🤖 麦麦自主规划系统
+        help_text = """🤖 日程规划系统
 
 📋 命令列表:
 /plan status - 查看今日日程（详细文字格式，含描述）

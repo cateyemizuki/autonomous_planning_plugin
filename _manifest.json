@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.0.0",
+  "version": "4.1.0",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4 全面基于 maibot_sdk 2.x 重写，支持新版 Host ↔ Runner 子进程架构，注入入口迁移到 HookHandler(maisaka.planner.before_request)。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.1 新增群白名单、跨群上下文增强、未来约定模型、LLM 日志归档、角色裁判式更新、跨天活动。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"
@@ -26,7 +26,10 @@
     "config.get",
     "config.get_plugin",
     "llm.generate",
-    "message.get_recent"
+    "message.get_recent",
+    "message.get_by_time_in_chat",
+    "chat.get_all_streams",
+    "knowledge.search"
   ],
   "i18n": {
     "default_locale": "zh-CN",

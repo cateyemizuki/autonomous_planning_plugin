@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # 默认模型任务名（需在主程序 model_config.toml 中预先配置）
 DEFAULT_LLM_TASK_NAME = "replyer"
-DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TEMPERATURE = 0.85  # v4.1：从 0.7 提到 0.85，让日程描述更有变化（schema 校验兜底防跑偏）
 
 
 class BaseScheduleGenerator:
@@ -52,6 +52,10 @@ class BaseScheduleGenerator:
         """
         self.goal_manager = goal_manager
         self.yesterday_schedule_summary: Optional[str] = None  # 昨日日程摘要（用于上下文）
+        # 动态上下文（由 ScheduleGenerator 在生成前异步注入）
+        self.pending_commitments: Optional[List[Dict[str, Any]]] = None
+        self.history_context: str = ""
+        self.knowledge_context: str = ""
         self.config: Dict[str, Any] = config or {}  # 保存配置
 
         # 初始化时区管理器
@@ -127,6 +131,9 @@ class BaseScheduleGenerator:
             preferences,
             schema,
             self.yesterday_schedule_summary,
+            pending_commitments=self.pending_commitments,
+            history_context=self.history_context,
+            knowledge_context=self.knowledge_context,
         )
 
     def build_retry_prompt(
@@ -153,4 +160,7 @@ class BaseScheduleGenerator:
             schema,
             previous_issues,
             self.yesterday_schedule_summary,
+            pending_commitments=self.pending_commitments,
+            history_context=self.history_context,
+            knowledge_context=self.knowledge_context,
         )

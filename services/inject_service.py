@@ -16,11 +16,13 @@ import asyncio
 import logging
 import re
 import time
+from datetime import timedelta
 
 from ..cache.lru_cache import LRUCache
-from ..handlers.exception_handler import handle_exception, handle_exception_silent
+from ..handlers.inject import UserIntent
 from ..planner.goal_manager import get_goal_manager
-from ..utils.time_utils import parse_time_window
+from ..utils.stream_filter import is_stream_allowed
+from ..utils.time_utils import parse_time_window, strip_tz
 from ..utils.timezone_manager import TimezoneManager
 
 if TYPE_CHECKING:
@@ -56,7 +58,7 @@ class InjectService:
             plugin: 当前插件实例
         """
         self._plugin = plugin
-        cfg = plugin.config.autonomous_planning.schedule
+        cfg = plugin.config.schedule
 
         # 缓存：把 TTL 直接传给 LRUCache，由它统一管理过期，不再二次封装
         self._schedule_cache: LRUCache = LRUCache(max_size=cfg.cache_max_size, ttl=cfg.cache_ttl)
@@ -71,7 +73,7 @@ class InjectService:
         self._inject_optimizer: Optional[Any] = None
         self._context_cache: Optional[Any] = None
         self._activity_state_cls: Optional[Any] = None
-        self._inject_mode: str = cfg.inject.inject_mode
+        self._inject_mode: str = self._plugin.config.inject.inject_mode
 
         self._load_smart_components()
 
@@ -84,8 +86,7 @@ class InjectService:
 
     def _load_smart_components(self) -> None:
         """加载智能注入子模块，加载失败则降级为 traditional 模式。"""
-        cfg = self._plugin.config.autonomous_planning.schedule
-        inj = cfg.inject
+        inj = self._plugin.config.inject
 
         try:
             from ..handlers.inject import (
@@ -151,6 +152,114 @@ class InjectService:
     # Hook 主入口
     # ------------------------------------------------------------
 
+    # ------------------------------------------------------------
+    # Hook 主入口（planner / replyer 两个）
+    # ------------------------------------------------------------
+
+    async def inject_into_replyer_extra_prompt(
+        self,
+        session_id: str = "",
+        attempt: int = 1,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """``maisaka.replyer.before_request`` Hook 入口。
+
+        在 replyer 向 LLM 发起回复请求前，把当前活动作为 ``extra_prompt``
+        注入。主程序会把 ``extra_prompt`` 拼接到 ``reference_info``，让
+        回复模型自然贴合当前状态语气。
+
+        活人感策略：
+        - 重试请求（``attempt > 1``）直接跳过，避免重复加压力
+        - 与 planner 注入共用 InjectOptimizer 冷却（同会话 + 同活动短时间内不重复）
+        - 文本明确写"不要主动提及"，让 LLM 自行判断要不要带出来
+        - 白名单 / cross_day_activity 等开关全部复用 planner 注入分支
+
+        Args:
+            session_id: 当前会话 ID。
+            attempt: 当前回复尝试序号（从 1 开始）；> 1 表示重试。
+            **kwargs: 其它 hook 参数（task_name / reference_info / ...），未使用。
+
+        Returns:
+            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs": {"extra_prompt": "..."}}``。
+        """
+        del kwargs
+
+        cfg = self._plugin.config.schedule
+        if not self._plugin.config.plugin.enabled or not cfg.inject_into_replyer:
+            return {"action": "continue"}
+
+        # 重试不重复注入
+        if attempt and int(attempt) > 1:
+            return {"action": "continue"}
+
+        # 白名单过滤（与 planner 一致）
+        if not is_stream_allowed(session_id, cfg.allowed_streams):
+            return {"action": "continue"}
+
+        try:
+            chat_id = session_id or "global"
+            user_id = session_id or "unknown"
+
+            current_activity, current_description, future_activities, _activity_type = (
+                self._get_current_schedule(chat_id)
+            )
+            if not current_activity:
+                return {"action": "continue"}
+
+            # 复用 InjectOptimizer 冷却（与 planner 共享）
+            if self._inject_optimizer is not None and self._intent_classifier is not None:
+                # replyer 阶段我们没有"用户消息"可以分类意图；用一个中性意图过冷却即可
+                neutral_intent = UserIntent.CASUAL_CHAT
+                should_inject, skip_reason = self._inject_optimizer.should_inject(
+                    user_id, neutral_intent, current_activity, confidence=0.5,
+                )
+                if not should_inject:
+                    logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
+                    return {"action": "continue"}
+
+            extra_prompt = self._build_replyer_extra_prompt(
+                current_activity=current_activity,
+                description=current_description or "",
+                future_activities=future_activities,
+            )
+
+            if self._inject_optimizer is not None and self._intent_classifier is not None:
+                self._inject_optimizer.record_injection(
+                    user_id, current_activity, extra_prompt, UserIntent.CASUAL_CHAT,
+                )
+
+            logger.info(f"✅ replyer 注入: {current_activity}")
+            return {
+                "action": "continue",
+                "modified_kwargs": {"extra_prompt": extra_prompt},
+            }
+
+        except Exception as exc:
+            logger.error(f"replyer 注入失败: {exc}", exc_info=True)
+            return {"action": "continue"}
+
+    @staticmethod
+    def _build_replyer_extra_prompt(
+        current_activity: str,
+        description: str,
+        future_activities: List[Tuple[str, str]],
+    ) -> str:
+        """构建 replyer 用的轻量级 extra_prompt（突出活人感）。"""
+        lines: List[str] = ["【角色当前状态】"]
+        if description:
+            lines.append(f"你现在正在 {current_activity}（{description}）。")
+        else:
+            lines.append(f"你现在正在 {current_activity}。")
+        if future_activities:
+            time_str, name = future_activities[0]
+            lines.append(f"再过一会儿 {time_str} 要 {name}。")
+        lines.extend([
+            "",
+            "⚠️ 这是你此刻的真实状态，**不要主动提及**。",
+            "仅当用户明确询问 / 对话强相关时，才自然地用一两句话带过，不要刻意转移话题。",
+        ])
+        return "\n".join(lines)
+
     async def inject_into_planner_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -175,8 +284,13 @@ class InjectService:
         if not messages or not isinstance(messages, list):
             return {"action": "continue"}
 
-        cfg = self._plugin.config.autonomous_planning.schedule
+        cfg = self._plugin.config.schedule
         if not self._plugin.config.plugin.enabled or not cfg.inject_schedule:
+            return {"action": "continue"}
+
+        # 白名单过滤（留空 = 全部允许，向后兼容）
+        if not is_stream_allowed(session_id, cfg.allowed_streams):
+            logger.debug(f"会话 {session_id} 不在白名单，跳过注入")
             return {"action": "continue"}
 
         try:
@@ -431,7 +545,7 @@ class InjectService:
         if not self._content_engine:
             return None, False, detected_intent
 
-        enable_detailed_description = self._plugin.config.autonomous_planning.schedule.enable_detailed_description
+        enable_detailed_description = self._plugin.config.schedule.enable_detailed_description
         desc_to_inject = current_description if enable_detailed_description else None
         inject_content = self._content_engine.build_inject_content(
             intent=intent,
@@ -454,7 +568,7 @@ class InjectService:
         future_activities: List[Tuple[str, str]],
     ) -> Tuple[Optional[str], bool, Optional[str]]:
         """传统模式：固定模板注入。"""
-        enable_detailed_description = self._plugin.config.autonomous_planning.schedule.enable_detailed_description
+        enable_detailed_description = self._plugin.config.schedule.enable_detailed_description
         inject_content = f"【当前状态】\n这会儿正{current_activity}"
         if enable_detailed_description and current_description:
             inject_content += f"（{current_description}）"
@@ -501,7 +615,7 @@ class InjectService:
         ])
         is_command = user_message.startswith("/") or user_message.startswith("sudo") if user_message else False
 
-        cfg = self._plugin.config.autonomous_planning.schedule
+        cfg = self._plugin.config.schedule
         enable_detailed_description = cfg.enable_detailed_description
         max_show = cfg.max_future_activities
 
@@ -538,6 +652,89 @@ class InjectService:
         return "\n".join(prompt_parts)
 
     # ------------------------------------------------------------
+    # 对外公开：当前活动快照（供 @API 转发，跨插件可调）
+    # ------------------------------------------------------------
+
+    def get_current_activity_snapshot(self, chat_id: str = "global") -> Dict[str, Any]:
+        """返回当前时间段最新日程活动的结构化快照。
+
+        与日程注入用的内部查询走同一条缓存路径，结果与日志中
+        "✅ Smart 注入: <活动名>" 一致。
+
+        Args:
+            chat_id: 业务范围，留空默认 ``global``。
+
+        Returns:
+            dict::
+
+                {
+                    "has_activity": bool,
+                    "activity": None | {
+                        "name": str,
+                        "description": str,
+                        "goal_type": str,
+                        "time_window": "HH:MM-HH:MM" | None,
+                    },
+                    "next_activities": [{"time": "HH:MM", "name": str}, ...],
+                    "as_of": ISO8601 字符串,
+                    "timezone": str,
+                }
+        """
+        current_activity, current_description, future_activities, activity_type = (
+            self._get_current_schedule(chat_id or "global")
+        )
+
+        now = self._tz_manager.get_now()
+        activity_payload: Optional[Dict[str, Any]] = None
+        if current_activity:
+            activity_payload = {
+                "name": current_activity,
+                "description": current_description or "",
+                "goal_type": activity_type or "",
+                "time_window": self._lookup_time_window(current_activity, chat_id or "global"),
+            }
+
+        return {
+            "has_activity": current_activity is not None,
+            "activity": activity_payload,
+            "next_activities": [{"time": t, "name": n} for t, n in future_activities],
+            "as_of": now.isoformat(timespec="seconds"),
+            "timezone": self._tz_manager.timezone_str,
+        }
+
+    def _lookup_time_window(self, activity_name: str, chat_id: str) -> Optional[str]:
+        """根据活动名反查时间窗口字符串（HH:MM-HH:MM）。"""
+        try:
+            from ..planner.goal_manager import get_goal_manager
+            from ..utils.time_utils import parse_time_window
+
+            goal_manager = get_goal_manager()
+            goals = goal_manager.get_active_goals(chat_id="global")
+            if not goals and chat_id and chat_id != "global":
+                goals = goal_manager.get_active_goals(chat_id=chat_id)
+
+            for goal in goals:
+                if goal.name != activity_name:
+                    continue
+                tw = None
+                if goal.parameters and "time_window" in goal.parameters:
+                    tw = goal.parameters.get("time_window")
+                elif goal.conditions:
+                    tw = goal.conditions.get("time_window")
+                if not tw:
+                    continue
+                start_minutes, end_minutes = parse_time_window(tw)
+                if start_minutes is None or end_minutes is None:
+                    continue
+                start_str = f"{start_minutes // 60:02d}:{start_minutes % 60:02d}"
+                end_minutes_norm = end_minutes if end_minutes < 1440 else end_minutes - 1440
+                end_str = f"{end_minutes_norm // 60:02d}:{end_minutes_norm % 60:02d}"
+                return f"{start_str}-{end_str}"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("反查时间窗口失败: %s", exc)
+        return None
+
+    # ------------------------------------------------------------
     # 当前日程查询（带缓存，与 v3 等价）
     # ------------------------------------------------------------
 
@@ -570,6 +767,9 @@ class InjectService:
 
         # 重新查询
         goal_manager = get_goal_manager()
+        cross_day_enabled = bool(
+            self._plugin.config.schedule.cross_day_activity
+        )
         goals = goal_manager.get_active_goals(chat_id="global")
         if not goals and chat_id and chat_id != "global":
             goals = goal_manager.get_active_goals(chat_id=chat_id)
@@ -581,9 +781,13 @@ class InjectService:
 
         current_time_minutes = current_hour * 60 + current_minute
         today_date = now.strftime("%Y-%m-%d")
+        yesterday_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        scheduled_goals: List[Tuple[Any, List[int], bool]] = []
+        scheduled_goals: List[Tuple[Any, List[int], bool, bool]] = []
         for goal in goals:
+            # 跳过 pending_commitment（不是日程活动）
+            if goal.goal_type == "pending_commitment":
+                continue
             tw: Optional[List[int]] = None
             if goal.parameters and "time_window" in goal.parameters:
                 tw = goal.parameters.get("time_window")
@@ -592,20 +796,27 @@ class InjectService:
 
             if tw:
                 is_today = False
+                is_yesterday = False
                 if goal.created_at:
                     if isinstance(goal.created_at, str):
                         is_today = goal.created_at.startswith(today_date)
+                        is_yesterday = goal.created_at.startswith(yesterday_date)
                     else:
-                        is_today = goal.created_at.strftime("%Y-%m-%d") == today_date
-                scheduled_goals.append((goal, tw, is_today))
+                        goal_date_str = goal.created_at.strftime("%Y-%m-%d")
+                        is_today = goal_date_str == today_date
+                        is_yesterday = goal_date_str == yesterday_date
+
+                # 跨夜活动开关关闭时只看今天；开启时也接受昨天创建的跨夜活动
+                if is_today or (cross_day_enabled and is_yesterday):
+                    scheduled_goals.append((goal, tw, is_today, is_yesterday))
 
         if not scheduled_goals:
             result = (None, None, [], None)
             await self._schedule_cache.set(cache_key, result)
             return result
 
-        def _get_start_minutes(item: Tuple[Any, List[int], bool]) -> int:
-            _, tw, _ = item
+        def _get_start_minutes(item: Tuple[Any, List[int], bool, bool]) -> int:
+            _, tw, _, _ = item
             if not tw or len(tw) < 2:
                 return 0
             start_val = tw[0]
@@ -614,38 +825,52 @@ class InjectService:
 
         scheduled_goals.sort(key=_get_start_minutes)
 
-        # 查找当前活动（仅今天创建的）
+        # 查找当前活动：
+        #   今天创建的：直接判 current_time_minutes 是否落在 time_window 内（含跨夜）
+        #   昨天创建的：只有 time_window 跨夜（end_minutes > 1440）才可能延续到今天凌晨
         current_activity: Optional[str] = None
         current_description: Optional[str] = None
         current_activity_type: Optional[str] = None
         current_goal_created_at: Any = None
 
-        for goal, tw, is_today in scheduled_goals:
+        for goal, tw, is_today, is_yesterday in scheduled_goals:
             start_minutes, end_minutes = parse_time_window(tw)
             if start_minutes is None:
                 continue
 
-            # 处理跨夜窗口
-            if end_minutes > 1440:
-                is_in_window = (start_minutes <= current_time_minutes < 1440) or (
-                    0 <= current_time_minutes < (end_minutes - 1440)
-                )
-            else:
-                is_in_window = start_minutes <= current_time_minutes < end_minutes
+            is_cross_day = end_minutes > 1440
 
-            if is_in_window and is_today:
-                # 多个今天的任务时，选创建时间最新
+            if is_today:
+                if is_cross_day:
+                    is_in_window = (start_minutes <= current_time_minutes < 1440) or (
+                        0 <= current_time_minutes < (end_minutes - 1440)
+                    )
+                else:
+                    is_in_window = start_minutes <= current_time_minutes < end_minutes
+            elif is_yesterday and is_cross_day:
+                # 昨日的跨夜活动今天凌晨延续部分
+                is_in_window = 0 <= current_time_minutes < (end_minutes - 1440)
+            else:
+                continue
+
+            if is_in_window:
+                # 多个匹配时，选创建时间最新（防 tz-aware/naive 混比报错）
                 if current_activity is None or (
-                    goal.created_at and goal.created_at > current_goal_created_at
+                    goal.created_at and (
+                        current_goal_created_at is None
+                        or strip_tz(goal.created_at) > strip_tz(current_goal_created_at)
+                    )
                 ):
                     current_activity = goal.name
                     current_description = goal.description
                     current_activity_type = goal.goal_type
                     current_goal_created_at = goal.created_at
 
-        # 收集所有未来活动
+        # 收集所有未来活动（仅今天创建的活动）
         all_future_activities: List[Tuple[str, str]] = []
-        for goal, tw, _is_today in scheduled_goals:
+        for goal, tw, is_today, _is_yesterday in scheduled_goals:
+            if not is_today:
+                continue
             start_val = tw[0] if len(tw) > 0 else 0
             end_val = tw[1] if len(tw) > 1 else start_val + 60
             start_minutes = start_val if end_val > 24 else start_val * 60

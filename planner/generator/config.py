@@ -82,9 +82,6 @@ class ScheduleGeneratorConfig:
         self.cache_ttl = config_dict.get('cache_ttl', 300)
         self.cache_max_size = config_dict.get('cache_max_size', 100)
 
-        # === 自定义模型配置 ===
-        self.custom_model = config_dict.get('custom_model', {})
-
         # === v4 新增：LLM 任务名 + bot 全局配置（由 plugin 注入） ===
         self.llm_task_name = str(config_dict.get('llm_task_name', 'replyer')).strip() or 'replyer'
         self.bot_profile = dict(config_dict.get('bot_profile', {}) or {})
@@ -200,7 +197,6 @@ class ScheduleGeneratorConfig:
             'custom_prompt': self.custom_prompt,
             'cache_ttl': self.cache_ttl,
             'cache_max_size': self.cache_max_size,
-            'custom_model': self.custom_model,
             # v4 新增：LLM 任务名 + bot 全局配置 + 时区
             'llm_task_name': self.llm_task_name,
             'bot_profile': self.bot_profile,

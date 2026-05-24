@@ -9,12 +9,13 @@
 - 1 个 ``@HookHandler``  ：schedule_inject_v4 (maisaka.planner.before_request) ⭐ 注入入口
 """
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Tuple
 import asyncio
 import logging
 
-from maibot_sdk import Command, EventHandler, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import API, Command, EventHandler, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .config_models import AutonomousPlanningV4Config
@@ -22,6 +23,62 @@ from .services import CleanupService, CommandService, InjectService, ToolsServic
 
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# v4.0 → v4.1 配置迁移：把 [autonomous_planning.schedule.*] 搬到顶层 [schedule.*]
+# ============================================================
+
+_SCHEDULE_SUBKEY = "schedule"
+_INJECT_SUBKEY = "inject"
+
+
+def _migrate_v40_to_v41(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """把旧 ``[autonomous_planning.schedule.xxx]`` 字段搬到顶层 ``[schedule.xxx]``。
+
+    SDK 只展开顶层 PluginConfigBase 子段为 UI section，旧版的三级嵌套结构
+    会让 schedule / inject 段在 WebUI 中不可见。本迁移把它们提到顶层，
+    并保留 ``[autonomous_planning]`` 段下的清理参数原位。
+
+    Args:
+        raw: 用户提供的原始配置字典。
+
+    Returns:
+        (新配置字典, 是否产生了迁移)。
+    """
+    if not isinstance(raw, dict):
+        return raw, False
+
+    ap = raw.get("autonomous_planning")
+    if not isinstance(ap, dict):
+        return raw, False
+
+    legacy_schedule = ap.get(_SCHEDULE_SUBKEY)
+    if not isinstance(legacy_schedule, dict):
+        return raw, False
+
+    cfg = dict(raw)
+    new_ap = dict(ap)
+    new_ap.pop(_SCHEDULE_SUBKEY, None)
+    cfg["autonomous_planning"] = new_ap
+
+    # 把 schedule.inject 拆出来作为顶层 [inject]
+    legacy_schedule = dict(legacy_schedule)
+    legacy_inject = legacy_schedule.pop(_INJECT_SUBKEY, None)
+
+    # 顶层 [schedule] 合并（保留用户在新位置自定义的字段）
+    top_schedule = dict(cfg.get(_SCHEDULE_SUBKEY) or {})
+    for k, v in legacy_schedule.items():
+        top_schedule.setdefault(k, v)
+    cfg[_SCHEDULE_SUBKEY] = top_schedule
+
+    if isinstance(legacy_inject, dict):
+        top_inject = dict(cfg.get(_INJECT_SUBKEY) or {})
+        for k, v in legacy_inject.items():
+            top_inject.setdefault(k, v)
+        cfg[_INJECT_SUBKEY] = top_inject
+
+    return cfg, True
 
 
 class AutonomousPlanningPluginV4(MaiBotPlugin):
@@ -40,6 +97,27 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self._bg_tasks: List[asyncio.Task] = []
         # v4 新增：bot 全局配置缓存（on_load 时一次性拉取）
         self._bot_profile: Dict[str, str] = {}
+
+    # ============================================================
+    # 配置迁移 Hook（SDK 在校验前调用）
+    # ============================================================
+
+    def normalize_plugin_config(
+        self,
+        config_data: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """v4.0 → v4.1 配置迁移 + 委托 SDK 默认归一化。
+
+        SDK 会在 config_data 与默认配置之间 merge，且 extra="ignore" 会丢弃未声明字段。
+        所以这里必须**在 super 之前**把旧 ``[autonomous_planning.schedule.*]`` 搬到顶层。
+        """
+        raw = dict(config_data) if isinstance(config_data, Mapping) else {}
+        migrated, did_migrate = _migrate_v40_to_v41(raw) if raw else (raw, False)
+        if did_migrate:
+            logger.info("检测到 v4.0 旧配置，已迁移 [autonomous_planning.schedule.*] 到顶层 [schedule.*] / [inject.*]")
+
+        normalized, default_changed = super().normalize_plugin_config(migrated)
+        return normalized, did_migrate or default_changed
 
     # ============================================================
     # 生命周期
@@ -140,7 +218,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
 
     @Tool(
         "manage_goal_v4",
-        description="管理麦麦的长期目标，支持创建、查看、更新、暂停、恢复、完成、取消、删除目标",
+        description="管理长期目标，支持创建、查看、更新、暂停、恢复、完成、取消、删除目标",
         parameters=[
             ToolParameterInfo(
                 name="action",
@@ -264,13 +342,31 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             return {"type": "error", "content": "插件未启用"}
         return await self._tools_svc.apply_schedule(**kwargs)
 
+    @Tool(
+        "update_schedule_v4",
+        description="根据自然语言请求维护日程：角色裁判决定接受/未来约定/拒绝；接受时调整今日日程，未来约定写入候选清单",
+        parameters=[
+            ToolParameterInfo(
+                name="description",
+                param_type=ToolParamType.STRING,
+                description="日程变更的自然语言描述（如\"下午两点一起学习\"、\"周末打游戏\"）",
+                required=True,
+            ),
+        ],
+    )
+    async def handle_update_schedule(self, **kwargs: Any) -> Dict[str, Any]:
+        """角色裁判式日程更新工具入口。"""
+        if self._tools_svc is None:
+            return {"type": "error", "content": "插件未启用"}
+        return await self._tools_svc.update_schedule(**kwargs)
+
     # ============================================================
     # Command 组件
     # ============================================================
 
     @Command(
         "planning_v4",
-        description="麦麦自主规划系统管理命令（支持 /plan 与 /规划）",
+        description="日程规划系统管理命令（支持 /plan 与 /规划）",
         pattern=r"(?P<planning_cmd>^/(plan|规划).*$)",
     )
     async def handle_planning_command(
@@ -319,6 +415,51 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         return True, True, None, None, None
 
     # ============================================================
+    # API 组件（对外暴露，可被其他插件通过 ctx.api.call 调用）
+    # ============================================================
+
+    @API(
+        "get_current_activity",
+        description="返回当前时间段最新的日程活动快照（含描述、时间窗口、即将到来活动）",
+        version="1",
+        public=True,
+    )
+    async def api_get_current_activity(
+        self,
+        chat_id: str = "global",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """对外 API：当前时间段最新的日程活动快照。
+
+        其他插件调用方式::
+
+            snapshot = await self.ctx.api.call(
+                "xuqian13.autonomous-planning-plugin-v4.get_current_activity",
+                chat_id="global",
+            )
+            if snapshot["has_activity"]:
+                print(snapshot["activity"]["name"])  # 例如 "睡前刷手机"
+
+        Args:
+            chat_id: 可选的会话 ID 过滤；默认 ``global``（与日程注入一致）。
+            **kwargs: 预留扩展，当前未使用。
+
+        Returns:
+            dict: 见 ``InjectService.get_current_activity_snapshot`` 的返回结构。
+        """
+        del kwargs
+        if self._inject_svc is None:
+            return {
+                "has_activity": False,
+                "activity": None,
+                "next_activities": [],
+                "as_of": "",
+                "timezone": "",
+                "error": "plugin_not_initialized",
+            }
+        return self._inject_svc.get_current_activity_snapshot(chat_id or "global")
+
+    # ============================================================
     # HookHandler 组件（v4 注入入口，替代 v3 的 POST_LLM）
     # ============================================================
 
@@ -336,11 +477,33 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """日程注入 Hook 入口，转发给 InjectService。"""
-        if self._inject_svc is None or not self.config.autonomous_planning.schedule.inject_schedule:
+        if self._inject_svc is None or not self.config.schedule.inject_schedule:
             return {"action": "continue"}
         return await self._inject_svc.inject_into_planner_messages(
             messages=messages or [],
             session_id=session_id,
+            **kwargs,
+        )
+
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        name="schedule_inject_replyer_v4",
+        description="在 Maisaka replyer 调 LLM 前把当前活动注入到 extra_prompt（突出活人感，不要主动提及）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def handle_inject_replyer(
+        self,
+        session_id: str = "",
+        attempt: int = 1,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """replyer 注入 Hook 入口，转发给 InjectService。"""
+        if self._inject_svc is None or not self.config.schedule.inject_into_replyer:
+            return {"action": "continue"}
+        return await self._inject_svc.inject_into_replyer_extra_prompt(
+            session_id=session_id,
+            attempt=attempt,
             **kwargs,
         )
 

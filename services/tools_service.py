@@ -12,6 +12,7 @@ import logging
 from ..core.exceptions import InvalidParametersError, InvalidTimeWindowError
 from ..core.parameter_validator import ParameterValidator
 from ..planner.goal_manager import GoalPriority, GoalStatus, get_goal_manager
+from ..planner.role_judge import judge_schedule_request
 from ..planner.schedule_generator import Schedule, ScheduleGenerator, ScheduleItem, ScheduleType
 from ..utils.timezone_manager import TimezoneManager
 
@@ -155,7 +156,7 @@ class ToolsService:
 
     def _build_schedule_config(self) -> Dict[str, Any]:
         """从插件强类型配置构建供 ScheduleGenerator 使用的 dict 配置。"""
-        cfg = self._plugin.config.autonomous_planning.schedule
+        cfg = self._plugin.config.schedule
         return {
             "use_multi_round": cfg.use_multi_round,
             "max_rounds": cfg.max_rounds,
@@ -168,15 +169,14 @@ class ToolsService:
             "max_tokens": cfg.max_tokens,
             "custom_prompt": cfg.custom_prompt,
             "timezone": cfg.timezone,
-            # v4：通过任务名走主程序 model_config，不再有 custom_model 段
             "llm_task_name": cfg.llm_task_name,
-            # v4：bot 全局信息由 plugin 在 on_load 时预拉取并缓存（必有此属性）
-            "bot_profile": self._plugin._bot_profile,
+            "recent_schedule_days": cfg.recent_schedule_days,
+            "bot_profile": getattr(self._plugin, "_bot_profile", {}) or {},
         }
 
     def _make_tz_manager(self) -> TimezoneManager:
         """根据配置创建 TimezoneManager。"""
-        return TimezoneManager(self._plugin.config.autonomous_planning.schedule.timezone)
+        return TimezoneManager(self._plugin.config.schedule.timezone)
 
     # ------------------------------------------------------------
     # Tool 1：manage_goal
@@ -288,7 +288,7 @@ class ToolsService:
 
 {goal.get_summary()}
 
-麦麦会自动执行这个目标~"""
+我会自动执行这个目标~"""
 
         return {"type": "goal_created", "id": goal.goal_id, "content": content}
 
@@ -392,7 +392,7 @@ class ToolsService:
             goal_manager = get_goal_manager()
             detailed = bool(function_args.get("detailed", False))
 
-            enable_detailed_description = self._plugin.config.autonomous_planning.schedule.enable_detailed_description
+            enable_detailed_description = self._plugin.config.schedule.enable_detailed_description
 
             # 统一获取今日日程目标（含日期过滤）
             schedule_goals = goal_manager.get_schedule_goals(chat_id="global")
@@ -545,6 +545,134 @@ class ToolsService:
             return {"type": "error", "content": f"生成日程失败: {exc}"}
 
     # ------------------------------------------------------------
+    # Tool 5：update_schedule（角色裁判式更新）
+    # ------------------------------------------------------------
+
+    async def update_schedule(self, **function_args: Any) -> Dict[str, Any]:
+        """根据自然语言请求更新麦麦日程：角色裁判 → today/future/reject。
+
+        ``role_judge_enabled=False`` 时降级为直接 ``add_pending_commitment``（无 LLM）。
+        """
+        try:
+            description = str(function_args.get("description", "") or "").strip()
+            if not description:
+                return {"type": "error", "content": "请提供日程变更描述"}
+
+            cfg = self._plugin.config.schedule
+            goal_manager = get_goal_manager()
+            tz_manager = self._make_tz_manager()
+            today = tz_manager.get_now()
+            today_str = today.strftime("%Y-%m-%d")
+            weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][today.weekday()]
+
+            # 角色裁判关闭：直接当作未来约定记录
+            if not cfg.role_judge_enabled:
+                goal_manager.add_pending_commitment(
+                    commitment_date=today_str,
+                    title=description[:40],
+                    notes=description,
+                )
+                return {
+                    "type": "schedule_updated",
+                    "content": "📌 已记录到日程候选清单（裁判模式关闭，下次生成日程时纳入）",
+                }
+
+            # 准备当前活动摘要 + 人设
+            current_activities = []
+            for goal in goal_manager.get_schedule_goals(chat_id="global"):
+                tw = (goal.parameters or {}).get("time_window") or (goal.conditions or {}).get("time_window")
+                time_label = ""
+                if tw and len(tw) >= 2:
+                    h, m = divmod(int(tw[0]), 60)
+                    time_label = f"{h:02d}:{m:02d}"
+                current_activities.append({"time": time_label, "name": goal.name})
+            persona = str(getattr(self._plugin, "_bot_profile", {}).get("personality", "")) or ""
+
+            log_dir = self._plugin._plugin_root / "data" / "llm_logs"
+            parsed = await judge_schedule_request(
+                self._plugin,
+                description=description,
+                current_activities=current_activities,
+                persona=persona,
+                today_str=today_str,
+                weekday=weekday,
+                model=cfg.llm_task_name,
+                temperature=cfg.role_judge_temperature,
+                max_tokens=cfg.max_tokens,
+                log_dir=log_dir,
+                log_enabled=cfg.llm_log_enabled,
+            )
+
+            if parsed is None:
+                return {"type": "schedule_unchanged", "content": "🤔 没听清你的请求，日程保持不变"}
+
+            decision = parsed["decision"]
+            reason = str(parsed.get("reason") or "").strip()
+
+            if decision == "reject":
+                msg = "😶‍🌫️ 我没接受这个请求，日程保持不变"
+                if reason:
+                    msg += f"\n理由：{reason}"
+                return {"type": "schedule_unchanged", "content": msg}
+
+            if decision == "future":
+                target_date = str(parsed.get("date") or today_str)
+                if target_date <= today_str:
+                    return {
+                        "type": "schedule_unchanged",
+                        "content": f"⚠️ 未来约定日期 {target_date} 无效，日程不变",
+                    }
+                goal_manager.add_pending_commitment(
+                    commitment_date=target_date,
+                    title=str(parsed.get("title") or description[:40]),
+                    time=str(parsed.get("time") or ""),
+                    notes=str(parsed.get("notes") or ""),
+                    reason=reason,
+                )
+                return {
+                    "type": "schedule_committed",
+                    "content": (
+                        f"📅 已记录 {target_date} 的约定：{parsed.get('title')}\n"
+                        f"{('备注：' + parsed.get('notes')) if parsed.get('notes') else ''}\n"
+                        f"{('理由：' + reason) if reason else ''}"
+                    ).strip(),
+                }
+
+            # decision == "today"：重生成今日日程
+            extra_parts = [
+                f"今天临时纳入：{parsed.get('title') or description[:40]}",
+            ]
+            if parsed.get("time"):
+                extra_parts.append(f"建议时间：{parsed['time']}")
+            if parsed.get("notes"):
+                extra_parts.append(f"备注：{parsed['notes']}")
+            if reason:
+                extra_parts.append(f"角色理由：{reason}")
+            extra_prompt = "\n".join(extra_parts)
+
+            schedule_config = self._build_schedule_config()
+            schedule_generator = ScheduleGenerator(
+                goal_manager, config=schedule_config, plugin=self._plugin,
+            )
+            schedule = await schedule_generator.regenerate_today_schedule(
+                user_id="system",
+                chat_id="global",
+                extra_prompt=extra_prompt,
+                auto_apply=True,
+            )
+            return {
+                "type": "schedule_regenerated",
+                "content": (
+                    f"✅ 已根据请求调整今日日程，共 {len(schedule.items)} 个活动\n"
+                    f"{('理由：' + reason) if reason else ''}"
+                ).strip(),
+            }
+
+        except Exception as exc:
+            logger.error(f"update_schedule 失败: {exc}", exc_info=True)
+            return {"type": "error", "content": f"更新日程失败: {exc}"}
+
+    # ------------------------------------------------------------
     # Tool 4：apply_schedule
     # ------------------------------------------------------------
 
@@ -602,7 +730,7 @@ class ToolsService:
 创建了 {len(created_ids)} 个全局目标（所有聊天共享）
 日程名称: {schedule.name}
 
-这些目标已经激活，麦麦会自动执行它们~
+这些目标已经激活，我会自动执行它们~
 
 使用 /plan status 查看所有目标"""
 
