@@ -5,10 +5,13 @@ __pycache__/
 *.so
 .Python
 
-# 运行时数据与缓存
+# 运行时数据与日志
 data/
-cache/
 *.log
+
+# cache/ 是 Python 源码目录（lru_cache.py / conversation_cache.py），
+# 只忽略其中的字节码，不要整目录忽略
+cache/__pycache__/
 
 # 环境与编辑器
 .env
