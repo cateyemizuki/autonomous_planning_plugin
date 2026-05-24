@@ -317,7 +317,7 @@ def test_api_snapshot():
     )
     inj_mod = imp("services.inject_service")
     svc = inj_mod.InjectService(mock_plugin())
-    snap = svc.get_current_activity_snapshot("global")
+    snap = asyncio.run(svc.get_current_activity_snapshot("global"))
     assert snap["has_activity"] is True
     assert snap["activity"]["name"] == "晚餐"
     assert snap["activity"]["goal_type"] == "meal"

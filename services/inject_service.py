@@ -19,6 +19,7 @@ import time
 from datetime import timedelta
 
 from ..cache.lru_cache import LRUCache
+from ..handlers.exception_handler import handle_exception, handle_exception_silent
 from ..handlers.inject import UserIntent
 from ..planner.goal_manager import get_goal_manager
 from ..utils.stream_filter import is_stream_allowed
@@ -87,6 +88,7 @@ class InjectService:
     def _load_smart_components(self) -> None:
         """加载智能注入子模块，加载失败则降级为 traditional 模式。"""
         inj = self._plugin.config.inject
+        cfg = self._plugin.config.schedule
 
         try:
             from ..handlers.inject import (
@@ -201,7 +203,7 @@ class InjectService:
             user_id = session_id or "unknown"
 
             current_activity, current_description, future_activities, _activity_type = (
-                self._get_current_schedule(chat_id)
+                await self._get_current_schedule(chat_id)
             )
             if not current_activity:
                 return {"action": "continue"}
@@ -655,7 +657,7 @@ class InjectService:
     # 对外公开：当前活动快照（供 @API 转发，跨插件可调）
     # ------------------------------------------------------------
 
-    def get_current_activity_snapshot(self, chat_id: str = "global") -> Dict[str, Any]:
+    async def get_current_activity_snapshot(self, chat_id: str = "global") -> Dict[str, Any]:
         """返回当前时间段最新日程活动的结构化快照。
 
         与日程注入用的内部查询走同一条缓存路径，结果与日志中
@@ -681,7 +683,7 @@ class InjectService:
                 }
         """
         current_activity, current_description, future_activities, activity_type = (
-            self._get_current_schedule(chat_id or "global")
+            await self._get_current_schedule(chat_id or "global")
         )
 
         now = self._tz_manager.get_now()

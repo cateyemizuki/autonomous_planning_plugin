@@ -457,7 +457,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
                 "timezone": "",
                 "error": "plugin_not_initialized",
             }
-        return self._inject_svc.get_current_activity_snapshot(chat_id or "global")
+        return await self._inject_svc.get_current_activity_snapshot(chat_id or "global")
 
     # ============================================================
     # HookHandler 组件（v4 注入入口，替代 v3 的 POST_LLM）
