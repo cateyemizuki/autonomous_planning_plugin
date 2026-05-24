@@ -11,7 +11,7 @@ import logging
 
 from ..core.exceptions import InvalidParametersError, InvalidTimeWindowError
 from ..core.parameter_validator import ParameterValidator
-from ..planner.goal_manager import GoalPriority, GoalStatus, get_goal_manager
+from ..planner.goal_manager import Goal, GoalManager, GoalPriority, GoalStatus, get_goal_manager
 from ..planner.role_judge import judge_schedule_request
 from ..planner.schedule_generator import Schedule, ScheduleGenerator, ScheduleItem, ScheduleType
 from ..utils.timezone_manager import TimezoneManager
