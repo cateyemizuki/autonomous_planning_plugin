@@ -480,7 +480,17 @@ class ScheduleGenerator:
                     logger.debug(f"✅ 质量达标，结束生成")
                     break
 
+            except (LLMQuotaExceededError, LLMRateLimitError) as e:
+                # 致命 LLM 错误（配额耗尽 / 速率限制）不应通过多轮重试解决，
+                # 立即向上抛出，让调用方感知并停止后续浪费配额的尝试。
+                logger.error(f"第{round_num}轮遇到致命 LLM 错误，停止多轮生成: {e}")
+                raise
+            except LLMTimeoutError as e:
+                # 超时是网络抖动型错误，可重试
+                logger.warning(f"第{round_num}轮 LLM 超时，将重试: {e}")
+                continue
             except Exception as e:
+                # 业务可重试错误（响应解析失败 / Schema 校验失败等）
                 logger.warning(f"第{round_num}轮生成失败: {e}")
                 continue
 

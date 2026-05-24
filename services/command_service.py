@@ -1,11 +1,10 @@
 """``/plan`` 命令的业务实现。
 
-对应旧版 ``commands/planning_command.py`` 的 BaseCommand 子类。
-新版用 ``self._plugin.ctx.send.text(...)`` / ``ctx.send.image(...)`` 发送消息，
+通过 ``self._plugin.ctx.send.text(...) / ctx.send.image(...)`` 发送消息，
 通过 host 注入的 ``user_id`` / ``stream_id`` 解析上下文，无须再访问 ``self.message``。
 """
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 import asyncio
 import logging
@@ -321,12 +320,8 @@ class CommandService:
                 continue
 
             try:
-                if isinstance(g.created_at, str):
-                    goal_date_str = g.created_at.split("T")[0]
-                    goal_datetime = datetime.strptime(goal_date_str, "%Y-%m-%d")
-                else:
-                    goal_datetime = g.created_at.replace(hour=0, minute=0, second=0, microsecond=0)
-
+                # Goal.from_dict 保证 created_at 已是 tz-aware datetime
+                goal_datetime = g.created_at.replace(hour=0, minute=0, second=0, microsecond=0)
                 cutoff_datetime = cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0)
                 if goal_datetime < cutoff_datetime:
                     to_delete.append(g)

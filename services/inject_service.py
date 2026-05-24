@@ -261,13 +261,16 @@ class InjectService:
 
     @staticmethod
     def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
-        """从 PromptMessage 列表里提取最新一条 user 消息的文本内容。
+        """从 PromptMessage 列表里提取最新一条 **含文本** 的 user 消息。
+
+        如果最新一条 user 消息只含图片（纯 image part），向上继续找前一条 user
+        消息，直至找到含文本的或耗尽。
 
         Args:
             messages: 序列化后的 PromptMessage dict 列表
 
         Returns:
-            最后一条 user 消息的文本（多片段时取第一个文本片段；找不到时返回空串）
+            最近一条含文本的 user 消息内容（找不到时返回空串）
         """
         for msg in reversed(messages):
             if not isinstance(msg, dict):
@@ -276,17 +279,21 @@ class InjectService:
                 continue
             content = msg.get("content")
             if isinstance(content, str):
-                return content
+                if content.strip():
+                    return content
+                continue  # 空文本 → 找上一条 user
             if isinstance(content, list):
                 for part in content:
-                    if isinstance(part, str):
+                    if isinstance(part, str) and part.strip():
                         return part
                     if isinstance(part, dict) and "text" in part:
-                        return str(part["text"])
-                    if isinstance(part, (list, tuple)) and len(part) >= 2:
-                        # (format, base64) 元组形式跳过
-                        continue
-            return ""
+                        text = str(part["text"]).strip()
+                        if text:
+                            return text
+                    # 图片 / 元组形式跳过本 part
+                # 当前 user 消息无文本 part → 继续找前一条 user
+                continue
+            # content 是其他类型 → 继续找
         return ""
 
     @staticmethod
@@ -550,11 +557,13 @@ class InjectService:
         self,
         chat_id: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]], Optional[str]]:
-        """获取当前日程信息（带 15 分钟窗口缓存）。
+        """获取当前日程信息（带缓存）。
 
-        TTL 由 LRUCache 自身管理（构造时已配置 ``cfg.cache_ttl``），不再
-        二次封装时间戳。缓存键按「chat_id + 日期 + 15 分钟窗口」分桶，
-        同一窗口内反复查询直接命中。
+        缓存策略：
+            - 缓存键按 ``chat_id + 日期 + 15 分钟时间窗口`` 分桶，
+              同一时间窗口内反复查询命中同一 key
+            - TTL 由 ``LRUCache`` 自管，统一使用 ``cfg.cache_ttl``（默认 300 秒）
+            - 实际生效缓存有效期 = ``min(15 分钟窗口跳动间隔, cache_ttl)``
 
         Returns:
             ``(当前活动, 活动描述, 所有未来活动列表, 当前活动类型)``
