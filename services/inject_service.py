@@ -1,14 +1,10 @@
-"""日程注入业务实现。
-
-对应旧版 ``handlers/handlers.py:ScheduleInjectEventHandler``，但**注入入口已从
-POST_LLM 事件改为 HookHandler("maisaka.planner.before_request")**（详见
-POC_RESULT.md）。
+"""日程注入业务实现（HookHandler 入口：``maisaka.planner.before_request``）。
 
 业务子模块（IntentClassifier / ActivityStateAnalyzer / InjectOptimizer /
-ContentTemplateEngine / ConversationContextCache）从 v3 直接复用。
+ContentTemplateEngine / ConversationContextCache）实现于 ``handlers/inject/``。
 
-核心改造：v3 修改 ``message.llm_prompt: str``（追加文本），v4 改为操作
-``messages: list[PromptMessage]``（在第一个 system 消息后插入新的 system 消息）。
+向 LLM 请求注入：在 ``messages: list[PromptMessage]`` 的第一条 system 消息
+之后插入一条新的 system 消息，承载当前日程信息。
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -24,6 +20,14 @@ from ..utils.time_utils import parse_time_window
 from ..utils.timezone_manager import TimezoneManager
 
 if TYPE_CHECKING:
+    from ..handlers.inject import (
+        ActivityState,
+        ActivityStateAnalyzer,
+        ContentTemplateEngine,
+        ConversationContextCache,
+        InjectOptimizer,
+        IntentClassifier,
+    )
     from ..plugin import AutonomousPlanningPluginV4
 
 logger = logging.getLogger(__name__)
@@ -64,13 +68,13 @@ class InjectService:
         # 时区管理器
         self._tz_manager: TimezoneManager = TimezoneManager(cfg.timezone)
 
-        # 智能注入组件
-        self._intent_classifier: Optional[Any] = None
-        self._state_analyzer: Optional[Any] = None
-        self._content_engine: Optional[Any] = None
-        self._inject_optimizer: Optional[Any] = None
-        self._context_cache: Optional[Any] = None
-        self._activity_state_cls: Optional[Any] = None
+        # 智能注入组件（运行时动态加载，失败则降级到 traditional 模式）
+        self._intent_classifier: Optional["IntentClassifier"] = None
+        self._state_analyzer: Optional["ActivityStateAnalyzer"] = None
+        self._content_engine: Optional["ContentTemplateEngine"] = None
+        self._inject_optimizer: Optional["InjectOptimizer"] = None
+        self._context_cache: Optional["ConversationContextCache"] = None
+        self._activity_state_cls: Optional[type] = None
         self._inject_mode: str = cfg.inject.inject_mode
 
         self._load_smart_components()

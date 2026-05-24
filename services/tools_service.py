@@ -5,13 +5,13 @@
 """
 
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import json
 import logging
 
 from ..core.exceptions import InvalidParametersError, InvalidTimeWindowError
 from ..core.parameter_validator import ParameterValidator
-from ..planner.goal_manager import GoalPriority, GoalStatus, get_goal_manager
+from ..planner.goal_manager import Goal, GoalManager, GoalPriority, GoalStatus, get_goal_manager
 from ..planner.schedule_generator import Schedule, ScheduleGenerator, ScheduleItem, ScheduleType
 from ..utils.timezone_manager import TimezoneManager
 
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _parse_json_parameters(raw_params: Any) -> Dict[str, Any]:
+def _parse_json_parameters(raw_params: Union[str, Dict[str, Any], None]) -> Dict[str, Any]:
     """解析 JSON 参数（字符串或字典）。
 
     Args:
@@ -215,7 +215,7 @@ class ToolsService:
     async def _action_create(
         self,
         function_args: Dict[str, Any],
-        goal_manager: Any,
+        goal_manager: GoalManager,
         chat_id: str,
         user_id: str,
     ) -> Dict[str, Any]:
@@ -292,7 +292,7 @@ class ToolsService:
 
         return {"type": "goal_created", "id": goal.goal_id, "content": content}
 
-    def _action_get(self, function_args: Dict[str, Any], goal_manager: Any) -> Dict[str, Any]:
+    def _action_get(self, function_args: Dict[str, Any], goal_manager: GoalManager) -> Dict[str, Any]:
         """处理 get action。"""
         goal_id = function_args.get("goal_id")
         if not goal_id:
@@ -304,7 +304,7 @@ class ToolsService:
 
         return {"type": "goal_info", "content": goal.get_summary()}
 
-    def _action_update(self, function_args: Dict[str, Any], goal_manager: Any) -> Dict[str, Any]:
+    def _action_update(self, function_args: Dict[str, Any], goal_manager: GoalManager) -> Dict[str, Any]:
         """处理 update action。"""
         goal_id = function_args.get("goal_id")
         if not goal_id:
@@ -341,7 +341,7 @@ class ToolsService:
     def _toggle_action(
         self,
         function_args: Dict[str, Any],
-        goal_manager: Any,
+        goal_manager: GoalManager,
         action: str,
     ) -> Dict[str, Any]:
         """统一处理 pause / resume / complete / cancel 这 4 个状态切换 action。"""
@@ -367,7 +367,7 @@ class ToolsService:
 
         return {"type": label[0] if success else "error", "content": label[1] if success else label[2]}
 
-    def _action_delete(self, function_args: Dict[str, Any], goal_manager: Any) -> Dict[str, Any]:
+    def _action_delete(self, function_args: Dict[str, Any], goal_manager: GoalManager) -> Dict[str, Any]:
         """处理 delete action。"""
         goal_id = function_args.get("goal_id")
         if not goal_id:
@@ -405,7 +405,7 @@ class ToolsService:
             current_minutes = now.hour * 60 + now.minute
 
             # 提取时间窗口并排序
-            schedule_with_time: List[Tuple[Any, List[int]]] = []
+            schedule_with_time: List[Tuple[Goal, List[int]]] = []
             for goal in schedule_goals:
                 time_window: Optional[List[int]] = None
                 if goal.parameters and "time_window" in goal.parameters:
@@ -419,9 +419,9 @@ class ToolsService:
             schedule_with_time.sort(key=lambda x: x[1][0])
 
             # 分类：正在进行 / 即将到来 / 已完成
-            ongoing: List[Tuple[Any, List[int]]] = []
-            upcoming: List[Tuple[Any, List[int]]] = []
-            completed: List[Tuple[Any, List[int]]] = []
+            ongoing: List[Tuple[Goal, List[int]]] = []
+            upcoming: List[Tuple[Goal, List[int]]] = []
+            completed: List[Tuple[Goal, List[int]]] = []
             for goal, tw in schedule_with_time:
                 start_min, end_min = tw
                 if start_min <= current_minutes <= end_min:

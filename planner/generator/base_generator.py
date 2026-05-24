@@ -1,16 +1,10 @@
 """Base Generator Module.
 
-重构说明：
-v4 已删除 ``custom_model`` 段（决策：强制走主程序 ``model_config.toml`` 任务名）
-并删除 ``src.config.api_ada_configs`` 临时注册 hack。``get_model_config`` 现在
-仅返回主程序中 ``model_config`` 预先配置的任务名字符串（默认 ``replyer``）。
-
-职责（重构后）：
+职责：
     - 模型任务名解析（供 ScheduleGenerator 在调 ``ctx.llm.generate`` 时使用）
-    - 组件协调（PromptBuilder、SchemaBuilder、ContextLoader）
-    - 向后兼容的 API
+    - 组件协调（PromptBuilder / SchemaBuilder / ScheduleContextLoader / TimezoneManager）
 
-已移除职责（迁移到专门组件）：
+子组件细化职责：
     - Prompt 构建 → PromptBuilder
     - Schema 构建 → SchemaBuilder
     - 上下文加载 → ScheduleContextLoader
@@ -35,12 +29,10 @@ DEFAULT_TEMPERATURE = 0.7
 
 
 class BaseScheduleGenerator:
-    """基础日程生成器 - 提供配置和工具方法（重构版）
+    """基础日程生成器：模型任务名 + 组件协调。
 
-    职责（重构后）：
-        - 模型任务名管理
-        - 组件协调（PromptBuilder、SchemaBuilder、ContextLoader）
-        - 向后兼容的 API
+    各子组件通过依赖注入装配，``ScheduleGenerator`` 继承此类获得 Prompt / Schema /
+    Context 构建能力。
     """
 
     def __init__(self, goal_manager: GoalManager, config: Optional[Dict[str, Any]] = None) -> None:
@@ -51,14 +43,14 @@ class BaseScheduleGenerator:
             config: 配置字典（可选）
         """
         self.goal_manager = goal_manager
-        self.yesterday_schedule_summary: Optional[str] = None  # 昨日日程摘要（用于上下文）
-        self.config: Dict[str, Any] = config or {}  # 保存配置
+        self.yesterday_schedule_summary: Optional[str] = None  # 昨日日程摘要（供 prompt 引用）
+        self.config: Dict[str, Any] = config or {}
 
         # 初始化时区管理器
         timezone_str = self.config.get("timezone", "Asia/Shanghai")
         self.tz_manager = TimezoneManager(timezone_str)
 
-        # 初始化组件（依赖注入）
+        # 初始化子组件（依赖注入）
         self.prompt_builder = PromptBuilder(self.config, self.tz_manager)
         self.schema_builder = SchemaBuilder(self.config)
         self.context_loader = ScheduleContextLoader(goal_manager, self.tz_manager)
@@ -70,13 +62,12 @@ class BaseScheduleGenerator:
     def get_model_config(self) -> Tuple[str, int, float]:
         """获取 LLM 调用参数。
 
-        v4 简化版本：返回主程序 ``model_config.toml`` 中预先配置的任务名字符串，
-        由 ScheduleGenerator 在调用 ``ctx.llm.generate(model=task_name, ...)`` 时使用。
+        返回主程序 ``model_config.toml`` 中预先配置的任务名字符串，由
+        ScheduleGenerator 在调用 ``ctx.llm.generate(model=task_name, ...)`` 时使用。
 
         Returns:
             ``(task_name, max_tokens, temperature)`` 三元组
         """
-        # v4 不再支持插件内 custom_model，统一走主程序 model_config 任务名
         task_name = str(self.config.get("llm_task_name", DEFAULT_LLM_TASK_NAME)).strip() or DEFAULT_LLM_TASK_NAME
         max_tokens = int(self.config.get("max_tokens", 8192))
         temperature = float(self.config.get("temperature", DEFAULT_TEMPERATURE))
@@ -85,7 +76,7 @@ class BaseScheduleGenerator:
         return task_name, max_tokens, temperature
 
     # ========================================================================
-    # 向后兼容的委托方法（调用新组件）
+    # 委托方法（薄包装，子组件承担实际逻辑）
     # ========================================================================
 
     def build_json_schema(self) -> dict:
@@ -103,7 +94,7 @@ class BaseScheduleGenerator:
             昨日日程摘要字符串
         """
         summary = self.context_loader.load_yesterday_schedule_summary()
-        self.yesterday_schedule_summary = summary  # 保存到实例变量（向后兼容）
+        self.yesterday_schedule_summary = summary  # 缓存到实例
         return summary
 
     def build_schedule_prompt(
