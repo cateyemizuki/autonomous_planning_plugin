@@ -43,6 +43,47 @@ from ..utils.timezone_manager import TimezoneManager
 logger = logging.getLogger(__name__)
 
 
+# 支持的日期格式（按优先级尝试）：
+#   "2026-05-26" / "2026/05/26" / "20260526" / "2026-05-26T10:30:00" / "2026-05-26 10:30:00"
+_COMMITMENT_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_commitment_date(raw: str, today: datetime) -> str:
+    """把任意输入归一化为 ``YYYY-MM-DD``。
+
+    解析失败时记 warning 并回退为 ``today``，保证调用方拿到的总是合法日期字符串
+    （而不是写库存歧义格式，导致 get/consume 漏匹配）。
+
+    Args:
+        raw: 调用方传入的日期字符串（可能是 ISO / 含时间 / 斜杠分隔等）。
+        today: 解析失败时的兜底日期（仅取日期部分）。
+
+    Returns:
+        ``YYYY-MM-DD`` 格式的字符串。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return today.strftime("%Y-%m-%d")
+    # 已经是规范格式，直接返回
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # ISO 8601 含 tz 后缀（``2026-05-26T10:30:00+08:00``）
+    try:
+        return datetime.fromisoformat(text).strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # 其它备选格式
+    for fmt in _COMMITMENT_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    logger.warning(f"commitment_date 无法解析: {raw!r}，回退为今天 {today.strftime('%Y-%m-%d')}")
+    return today.strftime("%Y-%m-%d")
+
+
 class GoalStatus(Enum):
     """Goal status enumeration."""
     ACTIVE = "active"
@@ -482,8 +523,11 @@ class GoalManager:
         Returns:
             新创建的 Goal 对象。
         """
+        # 防御性规范化：调用方传入的格式可能不统一（"2026/05/26"、ISO datetime、
+        # 仅含时间分量等），与 get/consume 保持同一比较口径
+        normalized_date = _normalize_commitment_date(commitment_date, self.tz_manager.get_now())
         parameters = {
-            "commitment_date": commitment_date,
+            "commitment_date": normalized_date,
             "time": time,
             "notes": notes,
             "reason": reason,
@@ -513,6 +557,9 @@ class GoalManager:
         """
         if commitment_date is None:
             commitment_date = self.tz_manager.get_now().strftime("%Y-%m-%d")
+        else:
+            # 输入也走规范化，避免和写入时格式不一致漏匹配
+            commitment_date = _normalize_commitment_date(commitment_date, self.tz_manager.get_now())
 
         candidates = self.get_all_goals(chat_id="global", status=GoalStatus.ACTIVE)
         return [

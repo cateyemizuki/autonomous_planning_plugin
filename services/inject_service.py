@@ -713,6 +713,7 @@ class InjectService:
             "next_activities": [{"time": t, "name": n} for t, n in future_activities],
             "as_of": now.isoformat(timespec="seconds"),
             "timezone": self._tz_manager.timezone_str,
+            "error": None,  # 成功路径显式给 None，让调用方能统一用 result.get("error") 判断
         }
 
     def _lookup_time_window(self, activity_name: str, chat_id: str) -> Optional[str]:

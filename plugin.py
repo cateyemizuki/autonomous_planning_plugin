@@ -66,17 +66,39 @@ def _migrate_v40_to_v41(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     legacy_schedule = dict(legacy_schedule)
     legacy_inject = legacy_schedule.pop(_INJECT_SUBKEY, None)
 
-    # 顶层 [schedule] 合并（保留用户在新位置自定义的字段）
+    # 顶层 [schedule] 合并（保留用户在新位置自定义的字段，冲突时优先新位置）
     top_schedule = dict(cfg.get(_SCHEDULE_SUBKEY) or {})
+    schedule_conflicts: List[str] = []
     for k, v in legacy_schedule.items():
-        top_schedule.setdefault(k, v)
+        if k in top_schedule and top_schedule[k] != v:
+            schedule_conflicts.append(k)
+        else:
+            top_schedule.setdefault(k, v)
     cfg[_SCHEDULE_SUBKEY] = top_schedule
 
+    inject_conflicts: List[str] = []
     if isinstance(legacy_inject, dict):
         top_inject = dict(cfg.get(_INJECT_SUBKEY) or {})
         for k, v in legacy_inject.items():
-            top_inject.setdefault(k, v)
+            if k in top_inject and top_inject[k] != v:
+                inject_conflicts.append(k)
+            else:
+                top_inject.setdefault(k, v)
         cfg[_INJECT_SUBKEY] = top_inject
+
+    # 当新旧位置同字段值不一致时，明确告诉用户保留了新位置值（避免静默丢失旧设置）
+    if schedule_conflicts:
+        logger.warning(
+            "v4.0→4.1 配置迁移：schedule 段下列字段在新旧位置都存在但值不同，"
+            "已保留新位置 [schedule.X] 的值，旧位置 [autonomous_planning.schedule.X] 被丢弃：%s",
+            schedule_conflicts,
+        )
+    if inject_conflicts:
+        logger.warning(
+            "v4.0→4.1 配置迁移：inject 段下列字段在新旧位置都存在但值不同，"
+            "已保留新位置 [inject.X] 的值，旧位置 [autonomous_planning.schedule.inject.X] 被丢弃：%s",
+            inject_conflicts,
+        )
 
     return cfg, True
 
