@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.3.0",
+  "version": "4.3.1",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.3 活人感增强：重激活活动状态分析 + 时段能量基线 + 主动碎碎念。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.3.1 hotfix: 移除主程序未提供的 maisaka.replyer.before_request hook 依赖，让 v4.1+ 注入功能能真正生效。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"

@@ -12,7 +12,6 @@ v4.2 改造点：
     - 按 intent 路由模板复杂度：QUERY_CURRENT ~70 token / QUERY_FUTURE ~90 token /
       CASUAL_CHAT ~25 token，相比 v4.1 smart 平均省 50% 注入 token
     - 当前活动剩余 0~15 分钟时附"约还剩 X 分钟"时间衰减提示
-    - replyer 注入文本从 ~100 token 缩到 ~30 token（planner 已提供完整上下文）
 
 v4.3 活人感增强：
     - 重激活 ``ActivityStateAnalyzer``：按活动进度（刚开始/进行中/快结束）+
@@ -22,6 +21,11 @@ v4.3 活人感增强：
     - ``InjectOptimizer.should_proactive_inject`` 主动碎碎念：闲聊场景概率性触发，
       让 bot 在用户没问的时候也会自然带出一句当前在做什么（每会话每天 ≤3 次，
       间隔 ≥30 分钟，概率 0.15）
+
+v4.3.1 hotfix：
+    - 删除 ``inject_into_replyer_extra_prompt`` / ``_build_replyer_extra_prompt`` 与
+      对应 HookHandler，因主程序 ``maisaka.replyer.before_request`` hook 不存在，
+      v4.1 PR #7 假定该 hook 存在导致整个 v4 插件从 v4.1 起无法加载
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -174,149 +178,14 @@ class InjectService:
         logger.debug("✅ 日程缓存预热完成")
 
     # ------------------------------------------------------------
-    # Hook 主入口
+    # Hook 主入口（planner 唯一注入点）
     # ------------------------------------------------------------
-
-    # ------------------------------------------------------------
-    # Hook 主入口（planner / replyer 两个）
-    # ------------------------------------------------------------
-
-    async def inject_into_replyer_extra_prompt(
-        self,
-        session_id: str = "",
-        attempt: int = 1,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """``maisaka.replyer.before_request`` Hook 入口。
-
-        在 replyer 向 LLM 发起回复请求前，把当前活动作为 ``extra_prompt``
-        注入。主程序会把 ``extra_prompt`` 拼接到 ``reference_info``，让
-        回复模型自然贴合当前状态语气。
-
-        活人感策略：
-        - 重试请求（``attempt > 1``）直接跳过，避免重复加压力
-        - 与 planner 注入共用 InjectOptimizer 冷却（同会话 + 同活动短时间内不重复）
-        - 文本明确写"不要主动提及"，让 LLM 自行判断要不要带出来
-        - 白名单 / cross_day_activity 等开关全部复用 planner 注入分支
-
-        Args:
-            session_id: 当前会话 ID。
-            attempt: 当前回复尝试序号（从 1 开始）；> 1 表示重试。
-            **kwargs: 其它 hook 参数（task_name / reference_info / ...），未使用。
-
-        Returns:
-            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs": {"extra_prompt": "..."}}``。
-        """
-        del kwargs
-
-        cfg = self._plugin.config.schedule
-        if not self._plugin.config.plugin.enabled or not cfg.inject_into_replyer:
-            return {"action": "continue"}
-
-        # 重试不重复注入
-        if attempt and int(attempt) > 1:
-            return {"action": "continue"}
-
-        # 白名单过滤（与 planner 一致）
-        if not is_stream_allowed(session_id, cfg.allowed_streams):
-            return {"action": "continue"}
-
-        try:
-            chat_id = session_id or "global"
-            user_id = session_id or "unknown"
-
-            current_activity, current_description, future_activities, activity_type = (
-                await self._get_current_schedule(chat_id)
-            )
-            if not current_activity:
-                return {"action": "continue"}
-
-            # 复用 InjectOptimizer 冷却（与 planner 共享）
-            if self._inject_optimizer is not None and self._intent_classifier is not None:
-                # replyer 阶段我们没有"用户消息"可以分类意图；用一个中性意图过冷却即可
-                neutral_intent = UserIntent.CASUAL_CHAT
-                should_inject, skip_reason = self._inject_optimizer.should_inject(
-                    user_id, neutral_intent, current_activity, confidence=0.5,
-                )
-                if not should_inject:
-                    logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
-                    return {"action": "continue"}
-
-            # v4.3：一次查询拿到 剩余分钟 + 状态情绪短语
-            remaining_minutes, state_hint = self._compute_activity_aux(current_activity, activity_type)
-            extra_prompt = self._build_replyer_extra_prompt(
-                current_activity=current_activity,
-                description=current_description or "",
-                future_activities=future_activities,
-                remaining_minutes=remaining_minutes,
-                state_hint=state_hint,
-            )
-
-            if self._inject_optimizer is not None and self._intent_classifier is not None:
-                self._inject_optimizer.record_injection(
-                    user_id, current_activity, extra_prompt, UserIntent.CASUAL_CHAT,
-                )
-
-            logger.info(f"✅ replyer 注入: {current_activity}")
-            return {
-                "action": "continue",
-                "modified_kwargs": {"extra_prompt": extra_prompt},
-            }
-
-        except Exception as exc:
-            logger.error(f"replyer 注入失败: {exc}", exc_info=True)
-            return {"action": "continue"}
-
-    def _build_replyer_extra_prompt(
-        self,
-        current_activity: str,
-        description: str,
-        future_activities: List[Tuple[str, str]],
-        remaining_minutes: Optional[int],
-        state_hint: Optional[str],
-    ) -> str:
-        """构建 replyer 极简 extra_prompt（v4.2: 30 token 内；v4.3: 加状态/能量）。
-
-        v4.2 改造点：
-            - planner 已注入完整上下文（system 消息），replyer 只需要锚定当前状态
-            - 文本从 80~100 token 缩到 ~30 token，省 50% 调用成本
-            - 仍保留"不要主动提及"指令，避免 LLM 强行转话题
-
-        v4.3 改造点：
-            - 接入 ``ActivityStateAnalyzer`` 情绪短语（"学了一会儿了，还算专注"）
-            - 接入 ``energy_model`` 时段能量描述（"精神满满"/"困了"/...）
-
-        Args:
-            current_activity: 当前活动名。
-            description: 活动描述；启用时附在括号中。
-            future_activities: 后续活动；只取最近 1 条做锚定。
-            remaining_minutes: 当前活动剩余分钟；仅 0~15 分钟时附加。
-            state_hint: ``ActivityStateAnalyzer`` 给的情绪短语；``None`` 时不附加。
-        """
-        cfg = self._plugin.config.schedule
-        enable_detailed = cfg.enable_detailed_description
-
-        remaining_hint = ""
-        if remaining_minutes is not None and 0 < remaining_minutes <= 15:
-            remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
-
-        if enable_detailed and description:
-            state_line = f"你现在正在 {current_activity}（{description}）{remaining_hint}。"
-        else:
-            state_line = f"你现在正在 {current_activity}{remaining_hint}。"
-
-        # v4.3：拼接情绪短语 + 能量描述
-        if state_hint:
-            state_line += f" {state_hint}。"
-        now = self._tz_manager.get_now()
-        energy_desc = describe_energy(get_energy_level(now.hour))
-
-        lines: List[str] = ["【角色当前状态】", state_line, f"精神：{energy_desc}。"]
-        if future_activities:
-            time_str, name = future_activities[0]
-            lines.append(f"接下来 {time_str} 要 {name}。")
-        lines.append("⚠️ 不要主动提及；仅在用户问到 / 强相关时自然带过。")
-        return "\n".join(lines)
+    # v4.3.1 hotfix：删除 ``inject_into_replyer_extra_prompt`` 与
+    # ``_build_replyer_extra_prompt``。
+    # 主程序 ``src/maisaka/chat_loop_service.py`` 没有注册
+    # ``maisaka.replyer.before_request`` hook，v4.1 PR #7 假定该 hook 存在导致
+    # 整个 v4 插件从 v4.1 起一直无法加载。
+    # 现在 replyer 阶段的语气贴合靠 planner 注入的 system 消息驱动，已足够。
 
     async def inject_into_planner_messages(
         self,

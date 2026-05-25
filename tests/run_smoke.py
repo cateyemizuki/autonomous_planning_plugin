@@ -135,7 +135,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.3.0", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.3.1", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -143,7 +143,7 @@ def test_pkg_import():
     assert c["b"] == 2 and c["c"] == 3
 
 
-@step("02. 组件注册（10 个：5 Tool + 1 Command + 1 EventHandler + 2 HookHandler + 1 API）")
+@step("02. 组件注册（9 个：5 Tool + 1 Command + 1 EventHandler + 1 HookHandler + 1 API）")
 def test_components():
     inst = fresh_plugin()
     comps = inst.get_components()
@@ -158,11 +158,10 @@ def test_components():
         ("COMMAND", "planning_v4"),
         ("EVENT_HANDLER", "autonomous_planner_v4"),
         ("HOOK_HANDLER", "schedule_inject_v4"),
-        ("HOOK_HANDLER", "schedule_inject_replyer_v4"),
     }
     missing = required - set(names)
     assert not missing, f"缺少组件: {missing}"
-    assert len(comps) == 10, f"组件总数 {len(comps)} != 10"
+    assert len(comps) == 9, f"组件总数 {len(comps)} != 9"
 
 
 @step("03. UI Section 渲染（4 个顶层 section + 字段 UI 元数据完整）")
@@ -216,7 +215,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.3.0"
+    assert inst.config.plugin.config_version == "4.3.1"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -331,58 +330,9 @@ def test_api_snapshot():
     assert snap["as_of"]
 
 
-@step("13. replyer 注入 6 场景")
-def test_replyer_inject():
-    gm_mod = imp("planner.goal_manager")
-    gm = gm_mod.GoalManager(data_dir=str(Path(tempfile.mkdtemp())))
-    gm_mod._goal_manager = gm
-    now_min = datetime.now().hour * 60 + datetime.now().minute
-    gm.create_goal(
-        name="晚餐", goal_type="meal", description="木桶饭",
-        creator_id="system", chat_id="global", priority="high",
-        parameters={"time_window": [max(0, now_min - 15), min(1440, now_min + 30)]},
-    )
-    inj_mod = imp("services.inject_service")
-
-    async def run():
-        plugin = mock_plugin()
-        svc = inj_mod.InjectService(plugin)
-
-        # 1) 正常注入
-        r1 = await svc.inject_into_replyer_extra_prompt(session_id="s1", attempt=1)
-        assert r1.get("modified_kwargs", {}).get("extra_prompt"), "正常场景应注入"
-        assert "晚餐" in r1["modified_kwargs"]["extra_prompt"]
-        assert "不要主动提及" in r1["modified_kwargs"]["extra_prompt"]
-
-        # 2) attempt=2 重试跳过
-        r2 = await svc.inject_into_replyer_extra_prompt(session_id="s1", attempt=2)
-        assert "modified_kwargs" not in r2
-
-        # 3) 冷却命中（再次 attempt=1）
-        r3 = await svc.inject_into_replyer_extra_prompt(session_id="s1", attempt=1)
-        # 冷却命中或注入都可，不崩溃即可
-        assert "action" in r3
-
-        # 4) 关闭开关
-        plugin.config.schedule.inject_into_replyer = False
-        r4 = await svc.inject_into_replyer_extra_prompt(session_id="s_new", attempt=1)
-        assert "modified_kwargs" not in r4
-
-        # 5) 白名单过滤
-        plugin.config.schedule.inject_into_replyer = True
-        plugin.config.schedule.allowed_streams = ["session:only-me"]
-        r5 = await svc.inject_into_replyer_extra_prompt(session_id="s_outsider", attempt=1)
-        assert "modified_kwargs" not in r5
-
-        # 6) 无活动
-        plugin.config.schedule.allowed_streams = []
-        for g in gm.get_all_goals(chat_id="global"):
-            gm.delete_goal(g.goal_id)
-        svc._schedule_cache.clear()
-        r6 = await svc.inject_into_replyer_extra_prompt(session_id="s_empty", attempt=1)
-        assert "modified_kwargs" not in r6
-
-    asyncio.run(run())
+# step 13（v4.1~v4.3 的 replyer 注入 6 场景）已删除 —— v4.3.1 hotfix
+# 移除了 ``inject_into_replyer_extra_prompt`` 与对应 HookHandler，
+# 主程序 ``maisaka.replyer.before_request`` hook 不存在，replyer 路径已废弃。
 
 
 # ============================================================
@@ -584,13 +534,8 @@ def test_v43_inject_enhancements():
     )
     assert "完全忽略" in txt_n, "未命中碎碎念应走默认提示"
 
-    # 校验：replyer extra_prompt 也包含 "精神：" + state_hint
-    async def run_replyer():
-        r = await svc.inject_into_replyer_extra_prompt(session_id="s_v43", attempt=1)
-        extra = r.get("modified_kwargs", {}).get("extra_prompt", "")
-        assert "精神：" in extra, "replyer 应注入能量描述"
-        assert "写专栏" in extra
-    asyncio.run(run_replyer())
+    # v4.3.1 hotfix：删除了 inject_into_replyer_extra_prompt，
+    # 不再覆盖 replyer extra_prompt 注入断言（主程序无对应 hook）。
 
 
 def main() -> int:
@@ -610,7 +555,6 @@ def main() -> int:
     test_prompt_builder()
     test_role_judge()
     test_api_snapshot()
-    test_replyer_inject()
     test_recent_schedule_summary()
     test_auto_scheduler()
     test_energy_model()

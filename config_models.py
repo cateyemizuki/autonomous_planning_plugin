@@ -50,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.3.0",
+        default="4.3.1",
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -119,11 +119,13 @@ class ScheduleConfig(PluginConfigBase):
         },
     )
     inject_into_replyer: bool = Field(
-        default=True,
-        description="在 replyer 调 LLM 前把当前活动作为 extra_prompt 注入；让回复语气贴合当前状态。与 planner 注入共享冷却，不会两阶段连刷。",
+        default=False,
+        description="（v4.3.1 起 deprecated）主程序未注册 ``maisaka.replyer.before_request`` "
+                    "hook，replyer 注入路径不可用；此字段保留仅为向后兼容，运行时已忽略。",
         json_schema_extra={
-            "label": "注入到 replyer",
-            "hint": "回复阶段注入；让模型知道当前活动",
+            "label": "注入到 replyer（已弃用）",
+            "hint": "v4.3.1 起此选项已无效（主程序无对应 hook），将在下个大版本删除",
+            "disabled": True,
             "order": 2,
         },
     )

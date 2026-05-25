@@ -542,27 +542,12 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             **kwargs,
         )
 
-    @HookHandler(
-        "maisaka.replyer.before_request",
-        name="schedule_inject_replyer_v4",
-        description="在 Maisaka replyer 调 LLM 前把当前活动注入到 extra_prompt（突出活人感，不要主动提及）",
-        mode=HookMode.BLOCKING,
-        order=HookOrder.NORMAL,
-    )
-    async def handle_inject_replyer(
-        self,
-        session_id: str = "",
-        attempt: int = 1,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """replyer 注入 Hook 入口，转发给 InjectService。"""
-        if self._inject_svc is None or not self.config.schedule.inject_into_replyer:
-            return {"action": "continue"}
-        return await self._inject_svc.inject_into_replyer_extra_prompt(
-            session_id=session_id,
-            attempt=attempt,
-            **kwargs,
-        )
+    # v4.3.1 hotfix：删除 ``schedule_inject_replyer_v4`` HookHandler。
+    # 原因：主程序 ``src/maisaka/chat_loop_service.py`` 仅注册了 3 个 maisaka hook
+    # （planner.before_request / planner.after_response / replyer.after_response），
+    # 没有 ``maisaka.replyer.before_request``。v4.1 PR #7 假定该 hook 存在导致
+    # 注册失败 → 整个 v4 插件从 v4.1 起就一直无法加载。
+    # 如果未来主程序补上 replyer.before_request hook，可以从 git history 恢复本段。
 
 
 def create_plugin() -> AutonomousPlanningPluginV4:
