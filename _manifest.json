@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.3.2",
+  "version": "4.4.0",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.3.2 hotfix: 修复主程序时间戳消息污染意图分类导致所有问题被误判为 query_current 的 bug。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.4 主动行为：活动切换时让 bot 主动开口（trigger_proactive）+ 按 goal_type 动态调节聊天频率（frequency.set_adjust）+ 恢复 replyer 注入。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"

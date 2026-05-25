@@ -19,7 +19,7 @@ from maibot_sdk import API, Command, EventHandler, HookHandler, MaiBotPlugin, Pl
 from maibot_sdk.types import EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .config_models import AutonomousPlanningV4Config
-from .services import CleanupService, CommandService, InjectService, ToolsService
+from .services import CleanupService, CommandService, InjectService, ProactiveService, ToolsService
 
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self._cmd_svc: CommandService | None = None
         self._inject_svc: InjectService | None = None
         self._cleanup_svc: CleanupService | None = None
+        self._proactive_svc: ProactiveService | None = None
         self._bg_tasks: List[asyncio.Task] = []
         # v4 新增：bot 全局配置缓存（on_load 时一次性拉取）
         self._bot_profile: Dict[str, str] = {}
@@ -200,11 +201,13 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self._cmd_svc = CommandService(self)
         self._inject_svc = InjectService(self)
         self._cleanup_svc = CleanupService(self)
+        self._proactive_svc = ProactiveService(self)
 
-        # 启动后台任务（清理循环 + 自动调度循环 + 注入缓存预热）
+        # 启动后台任务（清理循环 + 自动调度循环 + 注入缓存预热 + v4.4 主动行为循环）
         self._bg_tasks.append(asyncio.create_task(self._cleanup_svc.run_cleanup_loop()))
         self._bg_tasks.append(asyncio.create_task(self._cleanup_svc.run_scheduler_loop()))
         self._bg_tasks.append(asyncio.create_task(self._inject_svc.preheat_cache()))
+        self._bg_tasks.append(asyncio.create_task(self._proactive_svc.run_loop()))
 
         logger.info("[v4] 自主规划插件 v4 已加载，data_dir=%s", data_dir)
 
@@ -237,6 +240,8 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         """插件卸载：通知所有循环停止 → cancel 后台任务 → 等待退出 → 关闭数据库。"""
         if self._cleanup_svc is not None:
             await self._cleanup_svc.stop()
+        if self._proactive_svc is not None:
+            await self._proactive_svc.stop()
 
         for task in self._bg_tasks:
             if not task.done():
@@ -542,12 +547,30 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             **kwargs,
         )
 
-    # v4.3.1 hotfix：删除 ``schedule_inject_replyer_v4`` HookHandler。
-    # 原因：主程序 ``src/maisaka/chat_loop_service.py`` 仅注册了 3 个 maisaka hook
-    # （planner.before_request / planner.after_response / replyer.after_response），
-    # 没有 ``maisaka.replyer.before_request``。v4.1 PR #7 假定该 hook 存在导致
-    # 注册失败 → 整个 v4 插件从 v4.1 起就一直无法加载。
-    # 如果未来主程序补上 replyer.before_request hook，可以从 git history 恢复本段。
+    # v4.4.0 恢复：v4.3.1 误删此 HookHandler，但主程序 5/21 已通过 commit 478256f2
+    # （feat: 支持回复器 Hook 指定模型）补上 ``maisaka.replyer.before_request`` hook。
+    # 现在该 hook 实际可用，恢复 replyer 阶段注入。
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        name="schedule_inject_replyer_v4",
+        description="在 Maisaka replyer 调 LLM 前把当前活动注入到 extra_prompt（突出活人感，不要主动提及）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def handle_inject_replyer(
+        self,
+        session_id: str = "",
+        attempt: int = 1,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """replyer 注入 Hook 入口，转发给 InjectService。"""
+        if self._inject_svc is None or not self.config.schedule.inject_into_replyer:
+            return {"action": "continue"}
+        return await self._inject_svc.inject_into_replyer_extra_prompt(
+            session_id=session_id,
+            attempt=attempt,
+            **kwargs,
+        )
 
 
 def create_plugin() -> AutonomousPlanningPluginV4:

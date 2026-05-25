@@ -50,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.3.2",
+        default="4.4.0",
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -119,13 +119,13 @@ class ScheduleConfig(PluginConfigBase):
         },
     )
     inject_into_replyer: bool = Field(
-        default=False,
-        description="（v4.3.1 起 deprecated）主程序未注册 ``maisaka.replyer.before_request`` "
-                    "hook，replyer 注入路径不可用；此字段保留仅为向后兼容，运行时已忽略。",
+        default=True,
+        description="在 replyer 调 LLM 前把当前活动作为 extra_prompt 注入；让回复语气贴合当前状态。"
+                    "与 planner 注入共享冷却，不会两阶段连刷。"
+                    "v4.4 起恢复（v4.3.1 误删，主程序已补上 maisaka.replyer.before_request hook）。",
         json_schema_extra={
-            "label": "注入到 replyer（已弃用）",
-            "hint": "v4.3.1 起此选项已无效（主程序无对应 hook），将在下个大版本删除",
-            "disabled": True,
+            "label": "注入到 replyer",
+            "hint": "回复阶段注入；让回复语气贴合当前活动状态",
             "order": 2,
         },
     )
@@ -477,6 +477,45 @@ class ScheduleConfig(PluginConfigBase):
             "item_type": "string",
             "placeholder": '[] 或 ["qq:group:123456"]',
             "order": 91,
+        },
+    )
+
+    # ── 92-99 主动行为（v4.4 新增） ─────────────────────────────
+
+    proactive_streams: List[str] = Field(
+        default_factory=list,
+        description="允许触发『主动发起对话 / 频率调控』的聊天流白名单（v4.4 新增）。"
+                    "默认空 = 完全禁用，避免误打扰；必须显式列出 stream_id "
+                    "（与 allowed_streams 同格式）才生效。仅在确认主动行为是想要的时再启用。",
+        json_schema_extra={
+            "label": "主动行为白名单",
+            "hint": "v4.4；留空=禁用；显式列群才会主动发起/频率调控",
+            "item_type": "string",
+            "placeholder": '[] 或 ["session:abc123"]',
+            "order": 92,
+        },
+    )
+    enable_proactive_trigger: bool = Field(
+        default=True,
+        description="在活动切换瞬间（前 5 分钟）让 bot 主动开口（v4.4 新增）。"
+                    "通过 ctx.maisaka.trigger_proactive 触发；每天每群每个活动只触发一次。"
+                    "需要 proactive_streams 白名单显式列出才生效。",
+        json_schema_extra={
+            "label": "活动切换主动发起",
+            "hint": "v4.4；活动开始 5 分钟内让 bot 主动开口（每群每活动每天 1 次）",
+            "order": 93,
+        },
+    )
+    enable_frequency_modulation: bool = Field(
+        default=True,
+        description="按当前活动类型动态调节聊天频率（v4.4 新增）。"
+                    "通过 ctx.frequency.set_adjust 推给 heartflow：学习/工作时频率 30%，"
+                    "休息/娱乐时 130%~150%；让 bot 在该忙的时候少说话、该闲的时候多说话。"
+                    "需要 proactive_streams 白名单显式列出才生效。",
+        json_schema_extra={
+            "label": "活动频率调控",
+            "hint": "v4.4；学习/工作时降频；休息/娱乐时升频",
+            "order": 94,
         },
     )
 

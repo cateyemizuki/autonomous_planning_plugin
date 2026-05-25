@@ -9,11 +9,13 @@
 from .cleanup_service import CleanupService
 from .command_service import CommandService
 from .inject_service import InjectService
+from .proactive_service import ProactiveService
 from .tools_service import ToolsService
 
 __all__ = [
     "CleanupService",
     "CommandService",
     "InjectService",
+    "ProactiveService",
     "ToolsService",
 ]
