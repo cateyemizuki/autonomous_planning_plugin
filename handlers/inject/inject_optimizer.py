@@ -23,8 +23,15 @@ class InjectOptimizer:
     3. 根据意图类型智能决策
     4. 管理注入历史缓存
 
+    **scope 维度说明**（v4.2 起明确）：
+        - ``user_id`` 参数实际由 InjectService 传入的 ``session_id``（即聊天流 ID），
+          意味着群聊内所有成员共享一份冷却历史 —— 群里 A 触发注入后，B 紧接着说话
+          会被冷却挡掉，避免群里多人各注一遍
+        - 私聊场景下 ``session_id`` 一般唯一对应单个用户，等价于按用户维度冷却
+        - 不要把 ``user_id`` 理解为发送者 QQ，否则群聊语义会出错
+
     Attributes:
-        inject_history: 用户注入历史缓存
+        inject_history: 按 scope（session_id）分桶的注入历史缓存
         cache_ttl: 缓存过期时间（秒）
         casual_inject_probability: 闲聊时注入概率
     """

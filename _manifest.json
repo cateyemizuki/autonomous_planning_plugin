@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.1.0",
+  "version": "4.2.0",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.1 新增群白名单、跨群上下文增强、未来约定模型、LLM 日志归档、角色裁判式更新、跨天活动。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.2 注入管道重构：统一 smart/rule 双模式，按意图路由模板，平均省 50% 注入 token；replyer 注入文本极简化；新增剩余时间衰减提示。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"

@@ -50,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.1.0",
+        default="4.2.0",
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -509,10 +509,11 @@ class InjectConfig(PluginConfigBase):
 
     inject_mode: Literal["smart", "rule"] = Field(
         default="smart",
-        description="注入模式。smart=LLM 软注入（推荐）；rule=规则引擎（按意图决定，需启用智能注入子模块）。",
+        description="（v4.2 起 deprecated）旧 smart/rule 双模式合并为统一管道；此字段保留仅为向后兼容，运行时已忽略。",
         json_schema_extra={
-            "label": "注入模式",
-            "hint": "smart=LLM 软注入（推荐） / rule=规则引擎",
+            "label": "注入模式（已弃用）",
+            "hint": "v4.2 起合并为统一管道，此选项已无效，将在下个大版本删除",
+            "disabled": True,
             "order": 1,
         },
     )

@@ -20,9 +20,9 @@
 启动 MaiBot，日志里会冒出来：
 
 ```
-插件 xuqian13.autonomous-planning-plugin-v4 v4.1.0 加载成功
+插件 xuqian13.autonomous-planning-plugin-v4 v4.2.0 加载成功
 [v4] bot_profile 已预拉取: {'personality': '...', 'reply_style': '...', 'bot_name': '...'}
-✅ 智能注入组件已加载 (mode=smart, intent=True, state=True, ...)
+✅ 智能注入组件已加载 (intent=True, optimizer=True, context=3/600s)
 🧹 麦麦目标清理循环已启动
 📅 自动调度循环已启动
 日程定时生成已启动 - 执行时间: 00:30

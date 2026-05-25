@@ -5,6 +5,14 @@ ContentTemplateEngine / ConversationContextCache）实现于 ``handlers/inject/`
 
 向 LLM 请求注入：在 ``messages: list[PromptMessage]`` 的第一条 system 消息
 之后插入一条新的 system 消息，承载当前日程信息。
+
+v4.2 改造点：
+    - 删除 smart/rule 双模式，合并为单管道（IntentClassifier → InjectOptimizer →
+      _render_unified_prompt）。``inject_mode`` 配置字段保留仅为向后兼容
+    - 按 intent 路由模板复杂度：QUERY_CURRENT ~70 token / QUERY_FUTURE ~90 token /
+      CASUAL_CHAT ~25 token，相比 v4.1 smart 平均省 50% 注入 token
+    - 当前活动剩余 0~15 分钟时附"约还剩 X 分钟"时间衰减提示
+    - replyer 注入文本从 ~100 token 缩到 ~30 token（planner 已提供完整上下文）
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -78,23 +86,21 @@ class InjectService:
         self._inject_optimizer: Optional[Any] = None
         self._context_cache: Optional[Any] = None
         self._activity_state_cls: Optional[Any] = None
-        self._inject_mode: str = self._plugin.config.inject.inject_mode
 
         self._load_smart_components()
 
         logger.debug(
-            "InjectService 初始化完成（mode=%s, cache_max=%d, cache_ttl=%d）",
-            self._inject_mode,
+            "InjectService 初始化完成（cache_max=%d, cache_ttl=%d）",
             cfg.cache_max_size,
             cfg.cache_ttl,
         )
 
     def _load_smart_components(self) -> None:
-        """加载智能注入子模块（IntentClassifier 等）。
+        """加载智能注入子模块（IntentClassifier / InjectOptimizer / ContextCache）。
 
-        组件加载成功 → rule / smart 模式都可用；
-        组件加载失败 → 强制降级为 smart 模式（smart 模式只依赖 LLM 软注入，
-        不需要任何智能子模块）。
+        v4.2 起统一管道：smart/rule 双模式合并为单管道，模板路由直接在
+        ``_render_unified_prompt`` 内完成，不再走 ``ContentTemplateEngine``。
+        ``inject_mode`` 配置字段保留仅为向后兼容，运行时已忽略。
         """
         inj = self._plugin.config.inject
         cfg = self._plugin.config.schedule
@@ -111,6 +117,7 @@ class InjectService:
 
             self._intent_classifier = IntentClassifier() if inj.enable_intent_classification else None
             self._state_analyzer = ActivityStateAnalyzer() if inj.enable_state_analysis else None
+            # v4.2: 保留 content_engine 加载（向后兼容），但 _build_inject_text 已不再调用
             self._content_engine = (
                 ContentTemplateEngine(self._state_analyzer) if inj.enable_state_analysis else None
             )
@@ -129,17 +136,14 @@ class InjectService:
             self._activity_state_cls = ActivityState
 
             logger.debug(
-                "✅ 智能注入组件已加载 (mode=%s, intent=%s, state=%s, optimizer=%s, context=%d/%ds)",
-                self._inject_mode,
+                "✅ 智能注入组件已加载 (intent=%s, optimizer=%s, context=%d/%ds)",
                 inj.enable_intent_classification,
-                inj.enable_state_analysis,
                 inj.enable_inject_optimization,
                 inj.context_max_turns,
                 inj.context_ttl,
             )
         except ImportError as exc:
-            logger.warning(f"智能注入组件加载失败，降级为 smart 模式（LLM 软注入）: {exc}")
-            self._inject_mode = "smart"
+            logger.warning(f"智能注入组件加载失败，退化为兜底管道（仅 tech/command 过滤）: {exc}")
             self._intent_classifier = None
             self._state_analyzer = None
             self._content_engine = None
@@ -232,6 +236,7 @@ class InjectService:
                 current_activity=current_activity,
                 description=current_description or "",
                 future_activities=future_activities,
+                remaining_minutes=self._compute_remaining_minutes(current_activity),
             )
 
             if self._inject_optimizer is not None and self._intent_classifier is not None:
@@ -249,26 +254,43 @@ class InjectService:
             logger.error(f"replyer 注入失败: {exc}", exc_info=True)
             return {"action": "continue"}
 
-    @staticmethod
     def _build_replyer_extra_prompt(
+        self,
         current_activity: str,
         description: str,
         future_activities: List[Tuple[str, str]],
+        remaining_minutes: Optional[int],
     ) -> str:
-        """构建 replyer 用的轻量级 extra_prompt（突出活人感）。"""
-        lines: List[str] = ["【角色当前状态】"]
-        if description:
-            lines.append(f"你现在正在 {current_activity}（{description}）。")
+        """构建 replyer 极简 extra_prompt（v4.2：30 token 内 + 时间衰减提示）。
+
+        v4.2 改造点：
+            - planner 已注入完整上下文（system 消息），replyer 只需要锚定当前状态
+            - 文本从 80~100 token 缩到 ~30 token，省 50% 调用成本
+            - 仍保留"不要主动提及"指令，避免 LLM 强行转话题
+
+        Args:
+            current_activity: 当前活动名。
+            description: 活动描述；启用时附在括号中。
+            future_activities: 后续活动；只取最近 1 条做锚定。
+            remaining_minutes: 当前活动剩余分钟；仅 0~15 分钟时附加。
+        """
+        cfg = self._plugin.config.schedule
+        enable_detailed = cfg.enable_detailed_description
+
+        remaining_hint = ""
+        if remaining_minutes is not None and 0 < remaining_minutes <= 15:
+            remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
+
+        if enable_detailed and description:
+            state_line = f"你现在正在 {current_activity}（{description}）{remaining_hint}。"
         else:
-            lines.append(f"你现在正在 {current_activity}。")
+            state_line = f"你现在正在 {current_activity}{remaining_hint}。"
+
+        lines: List[str] = ["【角色当前状态】", state_line]
         if future_activities:
             time_str, name = future_activities[0]
-            lines.append(f"再过一会儿 {time_str} 要 {name}。")
-        lines.extend([
-            "",
-            "⚠️ 这是你此刻的真实状态，**不要主动提及**。",
-            "仅当用户明确询问 / 对话强相关时，才自然地用一两句话带过，不要刻意转移话题。",
-        ])
+            lines.append(f"接下来 {time_str} 要 {name}。")
+        lines.append("⚠️ 不要主动提及；仅在用户问到 / 强相关时自然带过。")
         return "\n".join(lines)
 
     async def inject_into_planner_messages(
@@ -452,7 +474,7 @@ class InjectService:
         return new_messages
 
     # ------------------------------------------------------------
-    # 注入文本构建（三种模式）
+    # 注入文本构建（v4.2 统一管道：IntentClassifier + InjectOptimizer + TemplateRouter）
     # ------------------------------------------------------------
 
     def _build_inject_text(
@@ -466,185 +488,190 @@ class InjectService:
         context_reason: Optional[str],
         user_id: str,
     ) -> Tuple[Optional[str], bool, Optional[str]]:
-        """根据 inject_mode 构造注入文本。
+        """v4.2 统一注入管道：分类 → 决策 → 模板路由。
+
+        相比 v4.1 的双模式（smart/rule）：
+        - 关键词只在 IntentClassifier 维护一处
+        - InjectOptimizer 的冷却/低置信度/重复抑制对所有场景生效（smart 模式以前无冷却）
+        - 按 intent 选模板复杂度，闲聊场景从 ~150 token 降到 ~30 token
+
+        Args:
+            user_id: 实际是会话/聊天流维度的 scope ID（``session_id``），群聊内全员
+                共享冷却历史，避免群里多人各注一遍。
 
         Returns:
-            (inject_content, injected, detected_intent) 三元组
+            (inject_content, injected, detected_intent) 三元组。``inject_content``
+            为 ``None`` 时表示决策跳过；``detected_intent`` 用于上下文缓存追踪。
         """
-        # rule 模式需要智能组件，组件缺失时降级到 smart
-        if self._inject_mode == "rule" and self._intent_classifier and self._inject_optimizer:
-            return self._build_rule_text(
-                user_message=user_message,
-                current_activity=current_activity,
-                current_description=current_description,
-                future_activities=future_activities,
-                context_continue_inject=context_continue_inject,
-                context_reason=context_reason,
-                user_id=user_id,
-            )
-        # 默认走 smart 模式（LLM 软注入）
-        return self._build_smart_text(
-            user_message=user_message,
-            current_activity=current_activity,
-            current_description=current_description,
-            future_activities=future_activities,
-            activity_type=activity_type,
-            context_continue_inject=context_continue_inject,
-            context_reason=context_reason,
-        )
+        del activity_type  # 当前未使用，保留参数兼容未来扩展
 
-    def _build_smart_text(
-        self,
-        user_message: str,
-        current_activity: str,
-        current_description: Optional[str],
-        future_activities: List[Tuple[str, str]],
-        activity_type: Optional[str],
-        context_continue_inject: bool,
-        context_reason: Optional[str],
-    ) -> Tuple[Optional[str], bool, Optional[str]]:
-        """LLM 软注入模式（推荐）：把日程作为可选上下文，由 LLM 自行判断使用。"""
-        # 轻量级预判：技术问答 / 命令场景直接跳过
-        msg_lower = user_message.lower() if user_message else ""
-        is_command = user_message.startswith("/") or user_message.startswith("sudo") if user_message else False
-        is_tech = any(kw in msg_lower for kw in ["怎么", "如何", "报错", "错误", "bug", "代码", "配置"])
+        # 1. 意图分类（关键词唯一在 IntentClassifier 维护）
+        intent: UserIntent
+        confidence: float
+        if self._intent_classifier is not None:
+            intent, confidence = self._intent_classifier.classify(user_message)
+        else:
+            # 没装意图分类器时退化为闲聊兜底（让冷却+模板路由依然能跑）
+            intent, confidence = UserIntent.CASUAL_CHAT, 0.5
 
-        if is_command or is_tech:
-            logger.debug("Smart 模式：检测到技术/命令场景，跳过注入")
-            return None, False, "tech_or_command"
-
-        if context_continue_inject:
-            logger.info(f"📖 对话上下文触发注入: {context_reason}")
-
-        inject_content = self._build_smart_inject_prompt(
-            current_activity=current_activity,
-            description=current_description or "",
-            future_activities=future_activities,
-            user_message=user_message,
-            activity_type=activity_type,
-        )
-        logger.info(f"✅ Smart 注入: {current_activity}")
-        return inject_content, True, None
-
-    def _build_rule_text(
-        self,
-        user_message: str,
-        current_activity: str,
-        current_description: Optional[str],
-        future_activities: List[Tuple[str, str]],
-        context_continue_inject: bool,
-        context_reason: Optional[str],
-        user_id: str,
-    ) -> Tuple[Optional[str], bool, Optional[str]]:
-        """规则引擎模式：意图分类 + InjectOptimizer 判断 + ContentTemplateEngine 生成。"""
-        if self._intent_classifier is None or self._inject_optimizer is None:
-            return None, False, None
-
-        intent, confidence = self._intent_classifier.classify(user_message)
         detected_intent = intent.value
 
+        # 2. 决策（InjectOptimizer 没装时只跳过 tech/command 兜底）
         if context_continue_inject:
             logger.info(f"📖 对话上下文触发注入: {context_reason}")
             should_inject = True
             skip_reason: Optional[str] = None
-        else:
+        elif self._inject_optimizer is not None:
             should_inject, skip_reason = self._inject_optimizer.should_inject(
                 user_id, intent, current_activity, confidence,
             )
+        else:
+            # 优化器缺失时硬过滤 tech/command，其余允许
+            if intent in (UserIntent.TECH_QUESTION, UserIntent.COMMAND_EXECUTION):
+                should_inject, skip_reason = False, f"{intent.value}场景，跳过注入"
+            else:
+                should_inject, skip_reason = True, None
 
         if not should_inject:
-            logger.debug(f"Rule 模式：InjectOptimizer 决定跳过注入: {skip_reason}")
+            logger.debug(f"注入跳过: intent={detected_intent}, reason={skip_reason}")
             return None, False, detected_intent
 
-        if not self._content_engine:
-            return None, False, detected_intent
+        # 3. 时间衰减提示（仅剩 0~15 分钟时显示，让 LLM 感知活动即将切换）
+        remaining_minutes = self._compute_remaining_minutes(current_activity)
 
-        enable_detailed_description = self._plugin.config.schedule.enable_detailed_description
-        desc_to_inject = current_description if enable_detailed_description else None
-        inject_content = self._content_engine.build_inject_content(
+        # 4. 按 intent 渲染统一模板
+        inject_content = self._render_unified_prompt(
             intent=intent,
             current_activity=current_activity,
-            current_description=desc_to_inject,
-            activity_state=None,
-            state_desc=desc_to_inject,
-            next_activities=future_activities,
+            current_description=current_description,
+            future_activities=future_activities,
+            remaining_minutes=remaining_minutes,
+            context_continue_inject=context_continue_inject,
+            context_reason=context_reason,
         )
-        if self._inject_optimizer:
-            self._inject_optimizer.record_injection(user_id, current_activity, inject_content or "", intent)
+        if inject_content is None:
+            return None, False, detected_intent
 
-        logger.info(f"✅ Rule 注入: intent={detected_intent}, confidence={confidence:.2f}")
+        # 5. 记录注入历史（让 InjectOptimizer 的冷却生效）
+        if self._inject_optimizer is not None:
+            self._inject_optimizer.record_injection(
+                user_id, current_activity, inject_content, intent,
+            )
+
+        logger.info(
+            f"✅ 注入: intent={detected_intent}, confidence={confidence:.2f}, "
+            f"len={len(inject_content)}, remaining={remaining_minutes}"
+        )
         return inject_content, True, detected_intent
 
-    def _build_smart_inject_prompt(
+    def _render_unified_prompt(
         self,
+        intent: "UserIntent",
         current_activity: str,
-        description: str,
+        current_description: Optional[str],
         future_activities: List[Tuple[str, str]],
-        user_message: str,
-        activity_type: Optional[str] = None,
-    ) -> str:
-        """构建 smart 模式的注入文本（LLM 软注入）。
+        remaining_minutes: Optional[int],
+        context_continue_inject: bool,
+        context_reason: Optional[str],
+    ) -> Optional[str]:
+        """按 intent 路由统一模板（v4.2 新增）。
 
-        与 v3 实现等价。
+        Token 预算（含开关 ``enable_detailed_description`` / ``max_future_activities``）：
+            - QUERY_CURRENT  → ~70 token（描述 + 1 条未来 + 剩余时间）
+            - QUERY_FUTURE   → ~90 token（多条未来 + 剩余时间）
+            - CASUAL_CHAT    → ~25 token（仅"现在 xxx"）
+            - GREETING/其他  → ~30 token（minimal + 兜底提示）
+            - TECH_QUESTION  → None（理论上 optimizer 已拒，兜底保险）
+            - COMMAND        → None
         """
-        del activity_type  # 当前未使用，保留参数兼容未来扩展
-
-        msg_lower = (user_message or "").lower()
-        is_direct_query = any(kw in msg_lower for kw in [
-            "在干嘛", "做什么", "忙吗", "在做", "正在",
-            "日程", "计划", "安排", "行程",
-            "现在", "当前", "这会儿",
-        ])
-        is_future_query = any(kw in msg_lower for kw in [
-            "接下来", "等下", "稍后", "之后", "待会",
-            "明天", "今晚", "晚上", "下午", "上午",
-        ])
-        is_greeting = any(kw in msg_lower for kw in [
-            "早上好", "晚上好", "早安", "晚安",
-            "你好", "hi", "hello", "嗨",
-        ])
-        is_tech_question = any(kw in msg_lower for kw in [
-            "怎么", "如何", "为什么", "什么是",
-            "报错", "错误", "bug", "异常",
-            "代码", "配置", "安装", "调试",
-        ])
-        is_command = user_message.startswith("/") or user_message.startswith("sudo") if user_message else False
+        if intent in (UserIntent.TECH_QUESTION, UserIntent.COMMAND_EXECUTION):
+            return None
 
         cfg = self._plugin.config.schedule
-        enable_detailed_description = cfg.enable_detailed_description
+        enable_detailed = cfg.enable_detailed_description
         max_show = cfg.max_future_activities
 
-        prompt_parts: List[str] = ["【可选上下文 - Bot 的当前日程】"]
-        if enable_detailed_description and description:
-            prompt_parts.append(f"现在：{current_activity}（{description}）")
+        # 当前活动 + 时间衰减提示
+        remaining_hint = ""
+        if remaining_minutes is not None and 0 < remaining_minutes <= 15:
+            remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
+
+        if enable_detailed and current_description:
+            current_line = f"现在：{current_activity}（{current_description}）{remaining_hint}"
         else:
-            prompt_parts.append(f"现在：{current_activity}")
+            current_line = f"现在：{current_activity}{remaining_hint}"
 
-        if future_activities:
-            prompt_parts.append("接下来的安排:")
-            for time_str, activity_name in future_activities[:max_show]:
-                prompt_parts.append(f"  {time_str} - {activity_name}")
-        prompt_parts.append("")
+        lines: List[str] = ["【可选上下文 - Bot 的当前日程】", current_line]
 
-        # 使用指导
-        if is_command:
-            prompt_parts.append("⚠️ 用户正在执行命令，请忽略以上日程信息，专注处理命令。")
-        elif is_tech_question:
-            prompt_parts.append("⚠️ 用户在询问技术问题，请忽略以上日程信息，专注回答技术内容。")
-        elif is_direct_query:
-            prompt_parts.append("💡 用户直接询问当前状态，请如实告知当前活动及状态。")
-        elif is_future_query:
-            prompt_parts.append("💡 用户询问未来计划，请自然地介绍后续安排。")
-        elif is_greeting:
-            prompt_parts.append("💡 用户在问候，可以自然地顺便提一下今天的计划（可选，不要强行提及）。")
+        # 按 intent 决定文本复杂度
+        if intent == UserIntent.QUERY_FUTURE and future_activities and max_show > 0:
+            # 询问未来 → 展示多条未来活动
+            lines.append("接下来的安排:")
+            for time_str, name in future_activities[:max_show]:
+                lines.append(f"  {time_str} - {name}")
+            lines.extend(["", "💡 用户询问未来计划，请自然地介绍后续安排。"])
+
+        elif intent == UserIntent.QUERY_CURRENT:
+            # 询问当前 → 展示 1 条未来即可
+            if future_activities and max_show > 0:
+                time_str, name = future_activities[0]
+                lines.append(f"接下来：{time_str} - {name}")
+            lines.extend(["", "💡 用户直接询问当前状态，请如实告知当前活动及状态。"])
+
         else:
-            prompt_parts.append("💡 以上是 Bot 当前的日程信息，仅供参考。")
-            prompt_parts.append("   - 如果与用户问题相关，可以自然提及")
-            prompt_parts.append("   - 如果不相关，请完全忽略此信息")
-            prompt_parts.append("   - 不要为了提及日程而刻意转移话题")
+            # CASUAL_CHAT / UNKNOWN / 兜底 → minimal
+            if context_continue_inject:
+                lines.extend(["", f"💡 对话延续中（{context_reason}），可自然带过当前活动。"])
+            else:
+                lines.extend(["", "💡 仅供参考；不相关请完全忽略，不要刻意提及。"])
 
-        prompt_parts.extend(["", "---", ""])
-        return "\n".join(prompt_parts)
+        lines.extend(["", "---", ""])
+        return "\n".join(lines)
+
+    def _compute_remaining_minutes(self, activity_name: str) -> Optional[int]:
+        """估算当前活动剩余多少分钟。
+
+        从 GoalManager 反查活动的 ``time_window``，结合当前时间计算剩余分钟。
+        跨夜活动（``end_minutes > 1440``）做归一化。
+
+        Args:
+            activity_name: 当前活动名称。
+
+        Returns:
+            剩余分钟数；查不到时间窗 / 已结束 / 解析失败时返回 ``None``。
+        """
+        try:
+            goal_manager = get_goal_manager()
+            goals = goal_manager.get_active_goals(chat_id="global")
+            if not goals:
+                return None
+
+            now = self._tz_manager.get_now()
+            current_min = now.hour * 60 + now.minute
+
+            for goal in goals:
+                if goal.name != activity_name:
+                    continue
+                tw: Optional[List[int]] = None
+                if goal.parameters and "time_window" in goal.parameters:
+                    tw = goal.parameters.get("time_window")
+                elif goal.conditions:
+                    tw = goal.conditions.get("time_window")
+                if not tw:
+                    continue
+                start, end = parse_time_window(tw)
+                if start is None or end is None:
+                    continue
+                # 跨夜归一化：end_minutes > 1440 表示跨夜，凌晨阶段 end 减 1440 即真实结束分钟
+                if end > 1440 and current_min < 720:
+                    end -= 1440
+                remaining = end - current_min
+                if remaining <= 0:
+                    return None
+                return remaining
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("计算剩余分钟失败: %s", exc)
+        return None
 
     # ------------------------------------------------------------
     # 对外公开：当前活动快照（供 @API 转发，跨插件可调）

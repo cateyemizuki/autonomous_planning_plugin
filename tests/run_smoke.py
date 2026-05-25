@@ -135,7 +135,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.0.0", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.2.0", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -182,7 +182,7 @@ def test_ui_schema():
         assert f["hint"], f"{fname}.hint 缺失"
 
 
-@step("04. v4.0 → v4.1 配置迁移")
+@step("04. v4.0 → v4.2 配置迁移")
 def test_migration():
     old_cfg = {
         "plugin": {"enabled": True, "config_version": "4.0.0"},
@@ -200,6 +200,7 @@ def test_migration():
     assert inst.config.schedule.inject_schedule is False
     assert inst.config.schedule.allowed_streams == ["qq:group:111"]
     # v4.1.1+ 移除 traditional 模式，迁移层自动降级为 smart
+    # v4.2 起 inject_mode 字段已 deprecated，但保留向后兼容
     assert inst.config.inject.inject_mode == "smart"
     assert inst.config.autonomous_planning.cleanup_interval == 1800
 
@@ -213,8 +214,9 @@ def test_current_toml():
     # 不假设具体值（用户可能改过），只确认字段都能解析
     assert isinstance(inst.config.schedule.admin_users, list)
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
-    assert inst.config.inject.inject_mode in ("smart", "rule", "traditional")
-    assert inst.config.plugin.config_version == "4.1.0"
+    # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
+    assert inst.config.inject.inject_mode in ("smart", "rule")
+    assert inst.config.plugin.config_version == "4.2.0"
 
 
 @step("06. stream_filter 白名单匹配")
