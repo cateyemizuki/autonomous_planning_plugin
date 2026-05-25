@@ -135,7 +135,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.3.1", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.3.2", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -215,7 +215,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.3.1"
+    assert inst.config.plugin.config_version == "4.3.2"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -538,6 +538,55 @@ def test_v43_inject_enhancements():
     # 不再覆盖 replyer extra_prompt 注入断言（主程序无对应 hook）。
 
 
+@step("19. _extract_last_user_text 跳过主程序时间戳消息（v4.3.2 hotfix）")
+def test_extract_last_user_text_skip_time_prefix():
+    inj_mod = imp("services.inject_service")
+    extract = inj_mod.InjectService._extract_last_user_text
+
+    # 场景 1：单条时间戳消息 → 跳过后无可用消息，返回空
+    msgs = [
+        {"role": "system", "content": "人设"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs) == "", "纯时间戳消息应该返回空（让 intent 走兜底）"
+
+    # 场景 2：真实问题 + 时间戳追加 → 跳过时间戳，返回真实问题
+    msgs2 = [
+        {"role": "user", "content": "在干嘛"},
+        {"role": "assistant", "content": "在写代码"},
+        {"role": "user", "content": "怎么修这个 bug"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs2) == "怎么修这个 bug", f"应跳过时间戳取真实问题，实际：{extract(msgs2)!r}"
+
+    # 场景 3：list 形式 content + 时间戳 part → 跳过该 part
+    msgs3 = [
+        {"role": "user", "content": [
+            {"text": "当前时间：2026-05-25 11:00:00"},
+        ]},
+        {"role": "user", "content": "明天有什么计划"},
+    ]
+    # reversed 先看最后一条（真实问题）应该直接返回，不会动到时间戳
+    assert extract(msgs3) == "明天有什么计划"
+
+    # 场景 4：真实问题包含"当前时间"字样但不是纯时间戳 → 不应被误删
+    msgs4 = [
+        {"role": "user", "content": "当前时间不重要，告诉我安排"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs4) == "当前时间不重要，告诉我安排"
+
+    # 场景 5：用真实"现在在干嘛"问题过 IntentClassifier，应判为 QUERY_CURRENT
+    UserIntent = imp("handlers.inject.intent_classifier").UserIntent
+    classifier = imp("handlers.inject.intent_classifier").IntentClassifier()
+    intent_q, conf_q = classifier.classify("你现在在干嘛？")
+    assert intent_q == UserIntent.QUERY_CURRENT, f"'你现在在干嘛？'应判为 query_current，实际 {intent_q}"
+
+    # 场景 6：技术问题过分类器，应判为 TECH_QUESTION（验证修复后 intent 多样性恢复）
+    intent_t, conf_t = classifier.classify("怎么配置数据库连接")
+    assert intent_t == UserIntent.TECH_QUESTION, f"'怎么配置数据库连接'应判为 tech_question，实际 {intent_t}"
+
+
 def main() -> int:
     print(f"\n{'=' * 60}")
     print("自主规划插件 v4 完整冒烟测试")
@@ -560,6 +609,7 @@ def main() -> int:
     test_energy_model()
     test_proactive_inject()
     test_v43_inject_enhancements()
+    test_extract_last_user_text_skip_time_prefix()
 
     print(f"\n{'=' * 60}")
     print(f"通过: {len(_PASS)} / 失败: {len(_FAIL)}")

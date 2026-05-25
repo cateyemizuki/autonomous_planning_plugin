@@ -296,18 +296,28 @@ class InjectService:
     # 消息提取与插入
     # ------------------------------------------------------------
 
+    # 主程序 maisaka 会在 messages 末尾追加一条独立 user 消息
+    # 形如 "当前时间：YYYY-MM-DD HH:MM:SS"（见
+    # ``src/maisaka/chat_loop_service.py:_build_current_time_user_message``）。
+    # 若不跳过，"当前时间"四字会撞上 IntentClassifier 的 ``current_keywords``，
+    # 导致所有用户问题被误判为 QUERY_CURRENT。
+    _CURRENT_TIME_PREFIX_PATTERN = re.compile(
+        r"^当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$"
+    )
+
     @staticmethod
     def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
-        """从 PromptMessage 列表里提取最新一条 **含文本** 的 user 消息。
+        """从 PromptMessage 列表里提取最新一条 **含真实文本** 的 user 消息。
 
-        如果最新一条 user 消息只含图片（纯 image part），向上继续找前一条 user
-        消息，直至找到含文本的或耗尽。
+        跳过两类污染：
+            1. 纯图片（无 text part）的 user 消息
+            2. 主程序 maisaka 追加的 ``"当前时间：YYYY-MM-DD HH:MM:SS"`` 时间戳消息
 
         Args:
             messages: 序列化后的 PromptMessage dict 列表
 
         Returns:
-            最近一条含文本的 user 消息内容（找不到时返回空串）
+            最近一条含真实文本的 user 消息内容（找不到时返回空串）
         """
         for msg in reversed(messages):
             if not isinstance(msg, dict):
@@ -316,19 +326,25 @@ class InjectService:
                 continue
             content = msg.get("content")
             if isinstance(content, str):
-                if content.strip():
-                    return content
-                continue  # 空文本 → 找上一条 user
+                text = content.strip()
+                if not text:
+                    continue  # 空文本 → 找上一条 user
+                if InjectService._CURRENT_TIME_PREFIX_PATTERN.match(text):
+                    continue  # 时间戳消息 → 跳过，找上一条 user
+                return content
             if isinstance(content, list):
                 for part in content:
+                    candidate = ""
                     if isinstance(part, str) and part.strip():
-                        return part
-                    if isinstance(part, dict) and "text" in part:
-                        text = str(part["text"]).strip()
-                        if text:
-                            return text
-                    # 图片 / 元组形式跳过本 part
-                # 当前 user 消息无文本 part → 继续找前一条 user
+                        candidate = part.strip()
+                    elif isinstance(part, dict) and "text" in part:
+                        candidate = str(part["text"]).strip()
+                    if not candidate:
+                        continue
+                    if InjectService._CURRENT_TIME_PREFIX_PATTERN.match(candidate):
+                        continue  # 时间戳片段 → 跳过该 part
+                    return candidate
+                # 当前 user 消息无可用文本 part → 继续找前一条 user
                 continue
             # content 是其他类型 → 继续找
         return ""

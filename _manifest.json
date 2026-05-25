@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.3.1",
+  "version": "4.3.2",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.3.1 hotfix: 移除主程序未提供的 maisaka.replyer.before_request hook 依赖，让 v4.1+ 注入功能能真正生效。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.3.2 hotfix: 修复主程序时间戳消息污染意图分类导致所有问题被误判为 query_current 的 bug。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"

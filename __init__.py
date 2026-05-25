@@ -6,4 +6,4 @@
 from .plugin import AutonomousPlanningPluginV4, create_plugin
 
 __all__ = ["AutonomousPlanningPluginV4", "create_plugin"]
-__version__ = "4.3.1"
+__version__ = "4.3.2"
