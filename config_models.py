@@ -50,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.4.0",
+        default="4.4.1",
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -485,13 +485,17 @@ class ScheduleConfig(PluginConfigBase):
     proactive_streams: List[str] = Field(
         default_factory=list,
         description="允许触发『主动发起对话 / 频率调控』的聊天流白名单（v4.4 新增）。"
-                    "默认空 = 完全禁用，避免误打扰；必须显式列出 stream_id "
-                    "（与 allowed_streams 同格式）才生效。仅在确认主动行为是想要的时再启用。",
+                    "默认空 = 完全禁用，避免误打扰；必须显式列出才生效。"
+                    "支持 3 种格式（v4.4.1 起）："
+                    "(1) qq:group:<群号>（推荐，自动解析为 session_id）；"
+                    "(2) qq:private:<QQ 号>（私聊）；"
+                    "(3) session:<session_id>（直接 session_id）。"
+                    "解析失败的条目会被自动跳过 + 警告，不影响其他条目。",
         json_schema_extra={
             "label": "主动行为白名单",
-            "hint": "v4.4；留空=禁用；显式列群才会主动发起/频率调控",
+            "hint": '支持 qq:group:123456 / qq:private:789 / session:xxx；留空=禁用',
             "item_type": "string",
-            "placeholder": '[] 或 ["session:abc123"]',
+            "placeholder": '[] 或 ["qq:group:123456"]',
             "order": 92,
         },
     )

@@ -429,22 +429,40 @@ class InjectService:
     # 消息提取与插入
     # ------------------------------------------------------------
 
-    # 主程序 maisaka 会在 messages 末尾追加一条独立 user 消息
-    # 形如 "当前时间：YYYY-MM-DD HH:MM:SS"（见
-    # ``src/maisaka/chat_loop_service.py:_build_current_time_user_message``）。
-    # 若不跳过，"当前时间"四字会撞上 IntentClassifier 的 ``current_keywords``，
-    # 导致所有用户问题被误判为 QUERY_CURRENT。
-    _CURRENT_TIME_PREFIX_PATTERN = re.compile(
-        r"^当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$"
-    )
+    # 主程序 maisaka 会在 messages 末尾追加多条独立 user 消息作为元数据上下文，
+    # 这些消息**不是真实用户问题**，不应进入 IntentClassifier，否则会污染意图判定。
+    #
+    # 已知的元数据消息类型（见 src/maisaka/chat_loop_service.py 与
+    # src/maisaka/person_profile_injector.py）：
+    #     1. ``当前时间：YYYY-MM-DD HH:MM:SS`` —— 时间戳（v4.3.2 已修）
+    #     2. ``【人物画像-内部参考】...`` —— 人物档案块（v4.4.1 新增过滤）
+    #
+    # 主程序未来若追加新的元数据消息，可继续向本列表新增 pattern。
+    _METADATA_USER_MESSAGE_PATTERNS: List[re.Pattern] = [
+        re.compile(r"^当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$"),
+        re.compile(r"^【人物画像-内部参考】"),
+    ]
+
+    # 向后兼容：v4.3.2 单 pattern 别名（其他代码若引用此名仍可用）
+    _CURRENT_TIME_PREFIX_PATTERN = _METADATA_USER_MESSAGE_PATTERNS[0]
+
+    @staticmethod
+    def _is_metadata_user_message(text: str) -> bool:
+        """判定一条 user 消息文本是否是主程序追加的元数据（非真实用户问题）。"""
+        for pattern in InjectService._METADATA_USER_MESSAGE_PATTERNS:
+            if pattern.match(text):
+                return True
+        return False
 
     @staticmethod
     def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
         """从 PromptMessage 列表里提取最新一条 **含真实文本** 的 user 消息。
 
-        跳过两类污染：
+        跳过三类污染：
             1. 纯图片（无 text part）的 user 消息
-            2. 主程序 maisaka 追加的 ``"当前时间：YYYY-MM-DD HH:MM:SS"`` 时间戳消息
+            2. 主程序 maisaka 追加的 ``当前时间：YYYY-MM-DD HH:MM:SS`` 时间戳消息
+            3. 主程序 maisaka 追加的 ``【人物画像-内部参考】...`` 元数据块
+               （v4.4.1 新增）
 
         Args:
             messages: 序列化后的 PromptMessage dict 列表
@@ -462,8 +480,8 @@ class InjectService:
                 text = content.strip()
                 if not text:
                     continue  # 空文本 → 找上一条 user
-                if InjectService._CURRENT_TIME_PREFIX_PATTERN.match(text):
-                    continue  # 时间戳消息 → 跳过，找上一条 user
+                if InjectService._is_metadata_user_message(text):
+                    continue  # 元数据消息 → 跳过，找上一条 user
                 return content
             if isinstance(content, list):
                 for part in content:
@@ -474,8 +492,8 @@ class InjectService:
                         candidate = str(part["text"]).strip()
                     if not candidate:
                         continue
-                    if InjectService._CURRENT_TIME_PREFIX_PATTERN.match(candidate):
-                        continue  # 时间戳片段 → 跳过该 part
+                    if InjectService._is_metadata_user_message(candidate):
+                        continue  # 元数据 part → 跳过
                     return candidate
                 # 当前 user 消息无可用文本 part → 继续找前一条 user
                 continue

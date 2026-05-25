@@ -19,7 +19,7 @@
     - 后台循环 60 秒一次，启动延迟 15 秒等其他组件就绪
 """
 
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import asyncio
 import logging
 import time
@@ -74,6 +74,9 @@ class ProactiveService:
     LOOP_INTERVAL_SECONDS = 60.0
     # 启动延迟（秒），等其他组件就绪
     STARTUP_DELAY_SECONDS = 15.0
+    # v4.4.1：proactive_streams 解析缓存有效期
+    RESOLVE_CACHE_TTL_SUCCESS = 600.0  # 解析成功缓存 10 分钟
+    RESOLVE_CACHE_TTL_FAILURE = 60.0   # 解析失败缓存 60 秒（短期避免反复查 + 允许群恢复重试）
 
     def __init__(self, plugin: "AutonomousPlanningPluginV4") -> None:
         """初始化 ProactiveService。
@@ -90,6 +93,10 @@ class ProactiveService:
         self._proactive_history: Dict[Tuple[str, str, str], float] = {}
         # 已应用的频率因子缓存：{stream_id: factor}（避免重复 set_adjust）
         self._current_factor: Dict[str, float] = {}
+        # v4.4.1 新增：proactive_streams 解析缓存
+        # 结构：{raw_entry: (session_id 或 None, expire_at)}
+        # 解析成功缓存 10 分钟；失败缓存 60 秒（短期避免反复查 + 允许群恢复重试）
+        self._resolved_cache: Dict[str, Tuple[Optional[str], float]] = {}
         logger.debug("ProactiveService 初始化（v4.4）")
 
     async def run_loop(self) -> None:
@@ -128,9 +135,19 @@ class ProactiveService:
     async def _check_and_act(self) -> None:
         """读当前活动 → 决定是否触发主动发起 / 调整频率。"""
         cfg = self._plugin.config.schedule
-        proactive_streams = cfg.proactive_streams
-        if not proactive_streams:
+        # v4.4.1：兼容旧 ScheduleConfig 实例（hot-reload 过渡态）
+        if not hasattr(cfg, "proactive_streams"):
+            logger.debug("当前 config 无 proactive_streams 字段（hot-reload 过渡），跳过本轮")
+            return
+        raw_streams = cfg.proactive_streams
+        if not raw_streams:
             # 白名单为空 = 主动行为完全禁用（默认安全）
+            return
+
+        # v4.4.1：把 qq:group:xxx / qq:private:xxx 等格式解析为真实 session_id
+        proactive_streams = await self._resolve_proactive_streams(raw_streams)
+        if not proactive_streams:
+            # 所有条目都解析失败 → 跳过本轮
             return
 
         # 找当前正在进行的活动
@@ -159,6 +176,132 @@ class ProactiveService:
                 continue  # 同一天同一活动只触发一次
             await self._trigger_proactive(stream_id, activity_name, goal_type)
             self._proactive_history[key] = time.time()
+
+    # ------------------------------------------------------------
+    # v4.4.1 新增：proactive_streams 格式解析
+    # ------------------------------------------------------------
+
+    async def _resolve_proactive_streams(self, raw_entries: list[str]) -> list[str]:
+        """把 ``proactive_streams`` 配置项解析为真实 session_id 列表。
+
+        支持三种格式（与 ``allowed_streams`` 一致）：
+            - ``session:<id>``       → 直接取 ``<id>``
+            - ``qq:group:<gid>``     → ``ctx.chat.get_stream_by_group_id`` 解析
+            - ``qq:private:<uid>``   → ``ctx.chat.get_stream_by_user_id`` 解析
+            - ``<id>``               → 当作 session_id 直接用（向后兼容）
+
+        遵守 CLAUDE.md 会话 ID 规范：**不自行计算 session_id**，解析失败的条目直接
+        跳过 + warn，不写入任何 fallback hash。
+
+        Args:
+            raw_entries: 配置文件中原始的 ``proactive_streams`` 列表。
+
+        Returns:
+            解析成功的 session_id 列表（按输入顺序，去重）。
+        """
+        resolved: list[str] = []
+        seen: set[str] = set()
+        now = time.time()
+        ctx_obj = getattr(self._plugin, "ctx", None)
+
+        for raw in raw_entries:
+            entry = str(raw).strip()
+            if not entry:
+                continue
+
+            # 命中缓存（含失败缓存）
+            cached = self._resolved_cache.get(entry)
+            if cached is not None and now < cached[1]:
+                resolved_sid = cached[0]
+                if resolved_sid and resolved_sid not in seen:
+                    resolved.append(resolved_sid)
+                    seen.add(resolved_sid)
+                continue
+
+            # 解析逻辑：按格式分支
+            session_id: Optional[str] = None
+            if entry.startswith("session:"):
+                # session:<id> → 直接取
+                session_id = entry[len("session:"):].strip() or None
+            elif ":group:" in entry:
+                # qq:group:<gid> → 用 chat_manager 解析
+                session_id = await self._resolve_via_chat_capability(
+                    entry, kind="group", ctx_obj=ctx_obj,
+                )
+            elif ":private:" in entry:
+                # qq:private:<uid> → 用 chat_manager 解析
+                session_id = await self._resolve_via_chat_capability(
+                    entry, kind="private", ctx_obj=ctx_obj,
+                )
+            else:
+                # 兜底：纯字符串直接当 session_id（向后兼容旧配置）
+                session_id = entry
+
+            # 写缓存
+            ttl = self.RESOLVE_CACHE_TTL_SUCCESS if session_id else self.RESOLVE_CACHE_TTL_FAILURE
+            self._resolved_cache[entry] = (session_id, now + ttl)
+
+            if session_id and session_id not in seen:
+                resolved.append(session_id)
+                seen.add(session_id)
+
+        return resolved
+
+    async def _resolve_via_chat_capability(
+        self,
+        entry: str,
+        kind: str,
+        ctx_obj: Any,
+    ) -> Optional[str]:
+        """通过 ``ctx.chat`` 把 ``qq:group:<gid>`` / ``qq:private:<uid>`` 解析为 session_id。
+
+        Args:
+            entry: 原始配置条目（如 ``"qq:group:123456"``）。
+            kind: ``"group"`` 或 ``"private"``。
+            ctx_obj: ``self._plugin.ctx``，可能为 ``None``（SDK 不可用时）。
+
+        Returns:
+            真实 session_id；解析失败返回 ``None`` 并 warn。
+        """
+        if ctx_obj is None or not hasattr(ctx_obj, "chat"):
+            logger.warning(f"无法解析 {entry}：ctx.chat 能力不可用（SDK < 2.4？）")
+            return None
+
+        parts = entry.split(":", 2)
+        if len(parts) != 3:
+            logger.warning(f"配置条目格式错误：{entry}（应为 <platform>:{kind}:<id>）")
+            return None
+        platform, _, target_id = parts
+        platform = platform.strip() or "qq"
+        target_id = target_id.strip()
+        if not target_id:
+            logger.warning(f"配置条目缺失 ID：{entry}")
+            return None
+
+        try:
+            if kind == "group":
+                result = await ctx_obj.chat.get_stream_by_group_id(target_id, platform)
+            else:
+                result = await ctx_obj.chat.get_stream_by_user_id(target_id, platform)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"解析 {entry} 异常: {exc}")
+            return None
+
+        if not isinstance(result, dict) or not result.get("success"):
+            logger.warning(
+                f"解析 {entry} 失败：{result.get('error') if isinstance(result, dict) else result}"
+            )
+            return None
+        stream = result.get("stream")
+        if not isinstance(stream, dict):
+            logger.warning(f"解析 {entry} 失败：主程序未找到对应聊天流（可能未注册或已退群）")
+            return None
+        session_id = str(stream.get("session_id") or "").strip()
+        if not session_id:
+            logger.warning(f"解析 {entry} 失败：返回 stream 无 session_id 字段")
+            return None
+        logger.debug(f"解析成功 {entry} → session_id={session_id}")
+        return session_id
 
     async def _find_current_activity(
         self,

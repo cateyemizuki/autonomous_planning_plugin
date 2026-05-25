@@ -139,7 +139,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.4.0", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.4.1", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -220,7 +220,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.4.0"
+    assert inst.config.plugin.config_version == "4.4.1"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -602,7 +602,7 @@ def test_v43_inject_enhancements():
     asyncio.run(run_replyer())
 
 
-@step("19. _extract_last_user_text 跳过主程序时间戳消息（v4.3.2 hotfix）")
+@step("19. _extract_last_user_text 跳过主程序元数据消息（v4.3.2/v4.4.1 hotfix）")
 def test_extract_last_user_text_skip_time_prefix():
     inj_mod = imp("services.inject_service")
     extract = inj_mod.InjectService._extract_last_user_text
@@ -640,18 +640,43 @@ def test_extract_last_user_text_skip_time_prefix():
     ]
     assert extract(msgs4) == "当前时间不重要，告诉我安排"
 
-    # 场景 5：用真实"现在在干嘛"问题过 IntentClassifier，应判为 QUERY_CURRENT
+    # 场景 5：v4.4.1 新增 ——【人物画像-内部参考】块也要跳过
+    profile_block = (
+        "【人物画像-内部参考】\n"
+        "以下内容仅供内部推理，不要向用户逐字复述。\n\n"
+        "- 神秘靓仔（person_id=xxx）：喜欢吃辣，编程很厉害\n\n"
+        "使用时把它当作对当前人物的背景理解；若与当前对话冲突，以当前对话为准。"
+    )
+    msgs5 = [
+        {"role": "user", "content": "在干嘛？"},
+        {"role": "user", "content": profile_block},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs5) == "在干嘛？", (
+        f"应跳过人物画像+时间戳取真实问题，实际：{extract(msgs5)!r}"
+    )
+
+    # 场景 6：v4.4.1 ——真实用户消息以【】开头不应被误删（如群里有人玩梗）
+    msgs6 = [
+        {"role": "user", "content": "【吐槽】今天天气好烂"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs6) == "【吐槽】今天天气好烂", (
+        f"非内部参考的【】消息不应被误删，实际：{extract(msgs6)!r}"
+    )
+
+    # 场景 7：用真实"现在在干嘛"问题过 IntentClassifier，应判为 QUERY_CURRENT
     UserIntent = imp("handlers.inject.intent_classifier").UserIntent
     classifier = imp("handlers.inject.intent_classifier").IntentClassifier()
     intent_q, conf_q = classifier.classify("你现在在干嘛？")
     assert intent_q == UserIntent.QUERY_CURRENT, f"'你现在在干嘛？'应判为 query_current，实际 {intent_q}"
 
-    # 场景 6：技术问题过分类器，应判为 TECH_QUESTION（验证修复后 intent 多样性恢复）
+    # 场景 8：技术问题过分类器，应判为 TECH_QUESTION（验证修复后 intent 多样性恢复）
     intent_t, conf_t = classifier.classify("怎么配置数据库连接")
     assert intent_t == UserIntent.TECH_QUESTION, f"'怎么配置数据库连接'应判为 tech_question，实际 {intent_t}"
 
 
-@step("20. ProactiveService 主动发起 + 频率调控（v4.4 新增）")
+@step("20. ProactiveService 主动发起 + 频率调控 + 多格式 stream 解析（v4.4 / v4.4.1）")
 def test_proactive_service():
     from unittest.mock import AsyncMock
 
@@ -678,18 +703,18 @@ def test_proactive_service():
         plugin.ctx.maisaka.trigger_proactive.assert_not_awaited()
         plugin.ctx.frequency.set_adjust.assert_not_awaited()
 
-        # 2) 显式列入白名单 + 启用频率调控 + 主动发起开关均开 → 应触发两个调用
+        # 2) session:<id> 格式 → 解析为 <id>，双开关全开 → 触发两个调用
         plugin.config.schedule.proactive_streams = ["session:test"]
         plugin.config.schedule.enable_proactive_trigger = True
         plugin.config.schedule.enable_frequency_modulation = True
         svc2 = proactive_mod.ProactiveService(plugin)
         await svc2._check_and_act()
-        # 频率调控：study → 0.3
-        plugin.ctx.frequency.set_adjust.assert_awaited_with("session:test", 0.3)
+        # v4.4.1：session: 前缀被剥除，传给主程序的应该是裸 session_id "test"
+        plugin.ctx.frequency.set_adjust.assert_awaited_with("test", 0.3)
         # 主动发起：intent 含 study 模板的关键短语
         plugin.ctx.maisaka.trigger_proactive.assert_awaited()
         call_args = plugin.ctx.maisaka.trigger_proactive.call_args
-        assert call_args.kwargs.get("stream_id") == "session:test"
+        assert call_args.kwargs.get("stream_id") == "test"
         assert "写专栏" in call_args.kwargs.get("intent", "")
 
         # 3) 同活动同天再次 _check_and_act 不应重复触发主动发起
@@ -707,6 +732,62 @@ def test_proactive_service():
         svc3 = proactive_mod.ProactiveService(plugin)
         await svc3._check_and_act()
         plugin.ctx.frequency.set_adjust.assert_not_awaited()
+
+        # ============ v4.4.1 新增：多格式 stream 解析 ============
+
+        # 6) qq:group:<gid> → 调 ctx.chat.get_stream_by_group_id 解析为 session_id
+        plugin2 = mock_plugin()
+        plugin2.ctx = MagicMock()
+        plugin2.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
+        plugin2.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
+        plugin2.ctx.chat.get_stream_by_group_id = AsyncMock(return_value={
+            "success": True,
+            "stream": {"session_id": "real_session_for_group_123456", "platform": "qq", "group_id": "123456"},
+        })
+        plugin2.config.schedule.proactive_streams = ["qq:group:123456"]
+        plugin2.config.schedule.enable_proactive_trigger = True
+        plugin2.config.schedule.enable_frequency_modulation = True
+        svc6 = proactive_mod.ProactiveService(plugin2)
+        await svc6._check_and_act()
+        plugin2.ctx.chat.get_stream_by_group_id.assert_awaited_with("123456", "qq")
+        plugin2.ctx.frequency.set_adjust.assert_awaited_with("real_session_for_group_123456", 0.3)
+        proactive_call = plugin2.ctx.maisaka.trigger_proactive.call_args
+        assert proactive_call.kwargs.get("stream_id") == "real_session_for_group_123456"
+
+        # 7) qq:private:<uid> → 调 ctx.chat.get_stream_by_user_id 解析
+        plugin3 = mock_plugin()
+        plugin3.ctx = MagicMock()
+        plugin3.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
+        plugin3.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
+        plugin3.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={
+            "success": True,
+            "stream": {"session_id": "real_session_for_user_789", "platform": "qq", "user_id": "789"},
+        })
+        plugin3.config.schedule.proactive_streams = ["qq:private:789"]
+        plugin3.config.schedule.enable_proactive_trigger = True
+        plugin3.config.schedule.enable_frequency_modulation = True
+        svc7 = proactive_mod.ProactiveService(plugin3)
+        await svc7._check_and_act()
+        plugin3.ctx.chat.get_stream_by_user_id.assert_awaited_with("789", "qq")
+        plugin3.ctx.frequency.set_adjust.assert_awaited_with("real_session_for_user_789", 0.3)
+
+        # 8) 解析失败（主程序找不到对应聊天流）→ 该条目被跳过
+        plugin4 = mock_plugin()
+        plugin4.ctx = MagicMock()
+        plugin4.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
+        plugin4.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
+        # 模拟主程序返回 stream=None（群没注册）
+        plugin4.ctx.chat.get_stream_by_group_id = AsyncMock(return_value={
+            "success": True, "stream": None,
+        })
+        plugin4.config.schedule.proactive_streams = ["qq:group:999999"]
+        plugin4.config.schedule.enable_proactive_trigger = True
+        plugin4.config.schedule.enable_frequency_modulation = True
+        svc8 = proactive_mod.ProactiveService(plugin4)
+        await svc8._check_and_act()
+        # 解析失败 → 不调用 frequency / proactive
+        plugin4.ctx.frequency.set_adjust.assert_not_awaited()
+        plugin4.ctx.maisaka.trigger_proactive.assert_not_awaited()
 
     asyncio.run(run())
 
