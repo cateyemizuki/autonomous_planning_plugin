@@ -50,7 +50,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.2.0",
+        default="4.3.0",
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -528,10 +528,11 @@ class InjectConfig(PluginConfigBase):
     )
     enable_state_analysis: bool = Field(
         default=True,
-        description="启用活动状态分析（生成情感化活动描述，仅 rule 模式生效）。",
+        description="启用活动状态分析（v4.3 重激活）：按活动进度生成情绪化短语，"
+                    "如\"学了一会儿了，还算专注\"，并注入到 planner/replyer 提示词。",
         json_schema_extra={
             "label": "启用状态分析",
-            "hint": "情感化活动描述（仅 rule 模式生效）",
+            "hint": "v4.3 重激活；生成情绪化活动描述，让回复语气更贴合阶段",
             "order": 3,
         },
     )

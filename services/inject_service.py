@@ -13,6 +13,15 @@ v4.2 改造点：
       CASUAL_CHAT ~25 token，相比 v4.1 smart 平均省 50% 注入 token
     - 当前活动剩余 0~15 分钟时附"约还剩 X 分钟"时间衰减提示
     - replyer 注入文本从 ~100 token 缩到 ~30 token（planner 已提供完整上下文）
+
+v4.3 活人感增强：
+    - 重激活 ``ActivityStateAnalyzer``：按活动进度（刚开始/进行中/快结束）+
+      goal_type 注入情绪化短语（"学了一会儿了，还算专注"）
+    - 接入 ``utils.energy_model``：按当前小时插入"精神状态"行（精神满满 / 状态不错 /
+      有点累 / 困了 / 快撑不住），让 LLM 感知凌晨和上午的回复语气差异
+    - ``InjectOptimizer.should_proactive_inject`` 主动碎碎念：闲聊场景概率性触发，
+      让 bot 在用户没问的时候也会自然带出一句当前在做什么（每会话每天 ≤3 次，
+      间隔 ≥30 分钟，概率 0.15）
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -26,6 +35,7 @@ from ..cache.lru_cache import LRUCache
 from ..handlers.exception_handler import handle_exception, handle_exception_silent
 from ..handlers.inject import UserIntent
 from ..planner.goal_manager import get_goal_manager
+from ..utils.energy_model import describe_energy, get_energy_level
 from ..utils.stream_filter import is_stream_allowed
 from ..utils.time_utils import parse_time_window, strip_tz
 from ..utils.timezone_manager import TimezoneManager
@@ -215,7 +225,7 @@ class InjectService:
             chat_id = session_id or "global"
             user_id = session_id or "unknown"
 
-            current_activity, current_description, future_activities, _activity_type = (
+            current_activity, current_description, future_activities, activity_type = (
                 await self._get_current_schedule(chat_id)
             )
             if not current_activity:
@@ -232,11 +242,14 @@ class InjectService:
                     logger.debug(f"replyer 注入被冷却跳过: {skip_reason}")
                     return {"action": "continue"}
 
+            # v4.3：一次查询拿到 剩余分钟 + 状态情绪短语
+            remaining_minutes, state_hint = self._compute_activity_aux(current_activity, activity_type)
             extra_prompt = self._build_replyer_extra_prompt(
                 current_activity=current_activity,
                 description=current_description or "",
                 future_activities=future_activities,
-                remaining_minutes=self._compute_remaining_minutes(current_activity),
+                remaining_minutes=remaining_minutes,
+                state_hint=state_hint,
             )
 
             if self._inject_optimizer is not None and self._intent_classifier is not None:
@@ -260,19 +273,25 @@ class InjectService:
         description: str,
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
+        state_hint: Optional[str],
     ) -> str:
-        """构建 replyer 极简 extra_prompt（v4.2：30 token 内 + 时间衰减提示）。
+        """构建 replyer 极简 extra_prompt（v4.2: 30 token 内；v4.3: 加状态/能量）。
 
         v4.2 改造点：
             - planner 已注入完整上下文（system 消息），replyer 只需要锚定当前状态
             - 文本从 80~100 token 缩到 ~30 token，省 50% 调用成本
             - 仍保留"不要主动提及"指令，避免 LLM 强行转话题
 
+        v4.3 改造点：
+            - 接入 ``ActivityStateAnalyzer`` 情绪短语（"学了一会儿了，还算专注"）
+            - 接入 ``energy_model`` 时段能量描述（"精神满满"/"困了"/...）
+
         Args:
             current_activity: 当前活动名。
             description: 活动描述；启用时附在括号中。
             future_activities: 后续活动；只取最近 1 条做锚定。
             remaining_minutes: 当前活动剩余分钟；仅 0~15 分钟时附加。
+            state_hint: ``ActivityStateAnalyzer`` 给的情绪短语；``None`` 时不附加。
         """
         cfg = self._plugin.config.schedule
         enable_detailed = cfg.enable_detailed_description
@@ -286,7 +305,13 @@ class InjectService:
         else:
             state_line = f"你现在正在 {current_activity}{remaining_hint}。"
 
-        lines: List[str] = ["【角色当前状态】", state_line]
+        # v4.3：拼接情绪短语 + 能量描述
+        if state_hint:
+            state_line += f" {state_hint}。"
+        now = self._tz_manager.get_now()
+        energy_desc = describe_energy(get_energy_level(now.hour))
+
+        lines: List[str] = ["【角色当前状态】", state_line, f"精神：{energy_desc}。"]
         if future_activities:
             time_str, name = future_activities[0]
             lines.append(f"接下来 {time_str} 要 {name}。")
@@ -503,8 +528,6 @@ class InjectService:
             (inject_content, injected, detected_intent) 三元组。``inject_content``
             为 ``None`` 时表示决策跳过；``detected_intent`` 用于上下文缓存追踪。
         """
-        del activity_type  # 当前未使用，保留参数兼容未来扩展
-
         # 1. 意图分类（关键词唯一在 IntentClassifier 维护）
         intent: UserIntent
         confidence: float
@@ -536,23 +559,41 @@ class InjectService:
             logger.debug(f"注入跳过: intent={detected_intent}, reason={skip_reason}")
             return None, False, detected_intent
 
-        # 3. 时间衰减提示（仅剩 0~15 分钟时显示，让 LLM 感知活动即将切换）
-        remaining_minutes = self._compute_remaining_minutes(current_activity)
+        # 3. 一次查询拿到剩余分钟 + 活动情绪短语（v4.3 接入 ActivityStateAnalyzer）
+        remaining_minutes, state_hint = self._compute_activity_aux(current_activity, activity_type)
 
-        # 4. 按 intent 渲染统一模板
+        # 4. 主动碎碎念判定（v4.3 思路 B）：仅 CASUAL_CHAT/UNKNOWN 才考虑
+        proactive_hit = False
+        if (
+            intent in (UserIntent.CASUAL_CHAT, UserIntent.UNKNOWN)
+            and not context_continue_inject
+            and self._inject_optimizer is not None
+        ):
+            proactive_hit, proactive_reason = self._inject_optimizer.should_proactive_inject(
+                user_id, current_activity,
+            )
+            if proactive_hit:
+                logger.info(f"🎲 主动碎碎念触发: scope={user_id}, activity={current_activity}")
+                self._inject_optimizer.record_proactive_inject(user_id)
+            else:
+                logger.debug(f"主动碎碎念未触发: {proactive_reason}")
+
+        # 5. 按 intent 渲染统一模板（v4.3：state_hint + energy_hint + proactive）
         inject_content = self._render_unified_prompt(
             intent=intent,
             current_activity=current_activity,
             current_description=current_description,
             future_activities=future_activities,
             remaining_minutes=remaining_minutes,
+            state_hint=state_hint,
+            proactive_hit=proactive_hit,
             context_continue_inject=context_continue_inject,
             context_reason=context_reason,
         )
         if inject_content is None:
             return None, False, detected_intent
 
-        # 5. 记录注入历史（让 InjectOptimizer 的冷却生效）
+        # 6. 记录注入历史（让 InjectOptimizer 的冷却生效）
         if self._inject_optimizer is not None:
             self._inject_optimizer.record_injection(
                 user_id, current_activity, inject_content, intent,
@@ -560,7 +601,8 @@ class InjectService:
 
         logger.info(
             f"✅ 注入: intent={detected_intent}, confidence={confidence:.2f}, "
-            f"len={len(inject_content)}, remaining={remaining_minutes}"
+            f"len={len(inject_content)}, remaining={remaining_minutes}, "
+            f"state={state_hint!r}, proactive={proactive_hit}"
         )
         return inject_content, True, detected_intent
 
@@ -571,16 +613,24 @@ class InjectService:
         current_description: Optional[str],
         future_activities: List[Tuple[str, str]],
         remaining_minutes: Optional[int],
+        state_hint: Optional[str],
+        proactive_hit: bool,
         context_continue_inject: bool,
         context_reason: Optional[str],
     ) -> Optional[str]:
-        """按 intent 路由统一模板（v4.2 新增）。
+        """按 intent 路由统一模板（v4.2 引入，v4.3 增强活人感）。
 
-        Token 预算（含开关 ``enable_detailed_description`` / ``max_future_activities``）：
-            - QUERY_CURRENT  → ~70 token（描述 + 1 条未来 + 剩余时间）
-            - QUERY_FUTURE   → ~90 token（多条未来 + 剩余时间）
-            - CASUAL_CHAT    → ~25 token（仅"现在 xxx"）
-            - GREETING/其他  → ~30 token（minimal + 兜底提示）
+        v4.3 新增字段：
+            - ``state_hint``：``ActivityStateAnalyzer`` 给的情绪化短语（"学了一会儿了，还算专注"）
+            - ``proactive_hit``：``InjectOptimizer.should_proactive_inject`` 命中标志，
+              命中后闲聊场景把"如不相关请忽略"切到"可以自然带出来"
+            - 按当前时段加 ``energy_hint``（"状态不错"/"困了"/...）
+
+        Token 预算：
+            - QUERY_CURRENT  → ~80~100 token（含描述 + 1 条未来 + 剩余 + 状态 + 能量）
+            - QUERY_FUTURE   → ~100 token（多条未来 + 剩余 + 状态 + 能量）
+            - CASUAL_CHAT    → ~30~50 token（仅活动行 + 能量；命中 proactive 时多一句）
+            - GREETING/其他  → ~30 token
             - TECH_QUESTION  → None（理论上 optimizer 已拒，兜底保险）
             - COMMAND        → None
         """
@@ -591,7 +641,7 @@ class InjectService:
         enable_detailed = cfg.enable_detailed_description
         max_show = cfg.max_future_activities
 
-        # 当前活动 + 时间衰减提示
+        # 当前活动 + 时间衰减 + 情绪短语
         remaining_hint = ""
         if remaining_minutes is not None and 0 < remaining_minutes <= 15:
             remaining_hint = f"（约还剩 {remaining_minutes} 分钟）"
@@ -600,8 +650,18 @@ class InjectService:
             current_line = f"现在：{current_activity}（{current_description}）{remaining_hint}"
         else:
             current_line = f"现在：{current_activity}{remaining_hint}"
+        if state_hint:
+            current_line += f" —— {state_hint}"
 
-        lines: List[str] = ["【可选上下文 - Bot 的当前日程】", current_line]
+        # 能量基线（按当前小时）
+        now = self._tz_manager.get_now()
+        energy_desc = describe_energy(get_energy_level(now.hour))
+
+        lines: List[str] = [
+            "【可选上下文 - Bot 的当前日程】",
+            current_line,
+            f"精神状态：{energy_desc}",
+        ]
 
         # 按 intent 决定文本复杂度
         if intent == UserIntent.QUERY_FUTURE and future_activities and max_show > 0:
@@ -616,12 +676,15 @@ class InjectService:
             if future_activities and max_show > 0:
                 time_str, name = future_activities[0]
                 lines.append(f"接下来：{time_str} - {name}")
-            lines.extend(["", "💡 用户直接询问当前状态，请如实告知当前活动及状态。"])
+            lines.extend(["", "💡 用户直接询问当前状态，请如实告知，并自然带出此刻的精神状态。"])
 
         else:
-            # CASUAL_CHAT / UNKNOWN / 兜底 → minimal
+            # CASUAL_CHAT / UNKNOWN / 兜底 → minimal（v4.3：碎碎念命中时改语气）
             if context_continue_inject:
                 lines.extend(["", f"💡 对话延续中（{context_reason}），可自然带过当前活动。"])
+            elif proactive_hit:
+                # 主动碎碎念：让 LLM 倾向于在回复里捎一句"我这会儿正 xxx"
+                lines.extend(["", "💡 可以在回答中自然带出此刻你正在做的事（一两句即可，不要刻意转移话题）。"])
             else:
                 lines.extend(["", "💡 仅供参考；不相关请完全忽略，不要刻意提及。"])
 
@@ -640,11 +703,34 @@ class InjectService:
         Returns:
             剩余分钟数；查不到时间窗 / 已结束 / 解析失败时返回 ``None``。
         """
+        remaining, _state_hint = self._compute_activity_aux(activity_name, goal_type=None)
+        return remaining
+
+    def _compute_activity_aux(
+        self,
+        activity_name: str,
+        goal_type: Optional[str],
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """一次查询返回（剩余分钟，状态情绪文本）。
+
+        组合 ``_compute_remaining_minutes`` 与 ``ActivityStateAnalyzer``，
+        避免两次 goal_manager 查询。
+
+        Args:
+            activity_name: 当前活动名称。
+            goal_type: 活动类型（study/meal/...）。``None`` 时跳过状态分析。
+
+        Returns:
+            ``(remaining_minutes, state_hint)``：
+                - ``remaining_minutes``：剩余分钟（已结束 / 查不到时为 ``None``）
+                - ``state_hint``：情绪化短语（如"学了一会儿了，还算专注"），
+                  ``_state_analyzer`` 未启用或查不到时为 ``None``
+        """
         try:
             goal_manager = get_goal_manager()
             goals = goal_manager.get_active_goals(chat_id="global")
             if not goals:
-                return None
+                return None, None
 
             now = self._tz_manager.get_now()
             current_min = now.hour * 60 + now.minute
@@ -667,11 +753,27 @@ class InjectService:
                     end -= 1440
                 remaining = end - current_min
                 if remaining <= 0:
-                    return None
-                return remaining
+                    return None, None
+
+                # v4.3 新增：调 ActivityStateAnalyzer 生成情绪化短语
+                state_hint: Optional[str] = None
+                if self._state_analyzer is not None and goal_type:
+                    try:
+                        _state, emotion_text = self._state_analyzer.analyze_activity_state(
+                            activity_name=activity_name,
+                            start_minutes=start,
+                            end_minutes=end,
+                            current_minutes=current_min,
+                            activity_type=goal_type,
+                        )
+                        state_hint = emotion_text or None
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("活动状态分析失败: %s", exc)
+
+                return remaining, state_hint
         except Exception as exc:  # noqa: BLE001
-            logger.debug("计算剩余分钟失败: %s", exc)
-        return None
+            logger.debug("计算活动辅助信息失败: %s", exc)
+        return None, None
 
     # ------------------------------------------------------------
     # 对外公开：当前活动快照（供 @API 转发，跨插件可调）

@@ -135,7 +135,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.2.0", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.3.0", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -216,7 +216,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.2.0"
+    assert inst.config.plugin.config_version == "4.3.0"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -453,6 +453,146 @@ def test_auto_scheduler():
     asyncio.run(run())
 
 
+@step("16. energy_model 时段能量基线")
+def test_energy_model():
+    em = imp("utils.energy_model")
+    # 时段能量曲线（极值）
+    assert em.get_energy_level(2) <= 20, "凌晨 2 点应为低能量"
+    assert em.get_energy_level(11) >= 80, "上午 11 点应为高能量"
+    assert em.get_energy_level(23) <= 35, "深夜 23 点应为低能量"
+    # 描述映射（5 档）
+    assert em.describe_energy(95) == "精神满满"
+    assert em.describe_energy(70) == "状态不错"
+    assert em.describe_energy(50) == "正常"
+    assert em.describe_energy(30) == "有点累"
+    assert em.describe_energy(15) == "困了"
+    assert em.describe_energy(5) == "快撑不住"
+    # 时段标签
+    assert em.get_time_period(2) == "凌晨"
+    assert em.get_time_period(15) == "下午"
+    # 越界 clamp
+    assert em.get_energy_level(-1) == em.get_energy_level(0)
+    assert em.get_energy_level(99) == em.get_energy_level(23)
+
+
+@step("17. InjectOptimizer 主动碎碎念配额 + 间隔 + 概率")
+def test_proactive_inject():
+    inj_mod = imp("handlers.inject.inject_optimizer")
+    # 把概率拉到 1，去掉随机性；配额 2、间隔 0 秒
+    opt = inj_mod.InjectOptimizer(
+        cache_ttl=300,
+        casual_inject_probability=0.5,
+        proactive_daily_quota=2,
+        proactive_probability=1.0,
+        proactive_gap_seconds=0,
+    )
+    # 无活动 → 拒绝
+    ok, reason = opt.should_proactive_inject("scope1", None)
+    assert not ok and "无当前活动" in reason
+
+    # 第 1 次：通过
+    ok, _ = opt.should_proactive_inject("scope1", "晚餐")
+    assert ok
+    opt.record_proactive_inject("scope1")
+    # 第 2 次：通过
+    ok, _ = opt.should_proactive_inject("scope1", "晚餐")
+    assert ok
+    opt.record_proactive_inject("scope1")
+    # 第 3 次：配额已满
+    ok, reason = opt.should_proactive_inject("scope1", "晚餐")
+    assert not ok and "配额" in reason
+
+    # 概率为 0 时永远不触发
+    opt2 = inj_mod.InjectOptimizer(
+        cache_ttl=300, casual_inject_probability=0.5,
+        proactive_daily_quota=10, proactive_probability=0.0, proactive_gap_seconds=0,
+    )
+    ok, reason = opt2.should_proactive_inject("scope2", "晚餐")
+    assert not ok and "概率" in reason
+
+    # 间隔限制：刚 record 完，下一次因间隔被拒
+    opt3 = inj_mod.InjectOptimizer(
+        cache_ttl=300, casual_inject_probability=0.5,
+        proactive_daily_quota=10, proactive_probability=1.0, proactive_gap_seconds=3600,
+    )
+    opt3.should_proactive_inject("scope3", "晚餐")  # 第一次允许
+    opt3.record_proactive_inject("scope3")
+    ok, reason = opt3.should_proactive_inject("scope3", "晚餐")
+    assert not ok and "间隔" in reason
+
+
+@step("18. 注入文本 v4.3 增强（state_hint + 精神状态 + 主动碎碎念语气切换）")
+def test_v43_inject_enhancements():
+    gm_mod = imp("planner.goal_manager")
+    gm = gm_mod.GoalManager(data_dir=str(Path(tempfile.mkdtemp())))
+    gm_mod._goal_manager = gm
+    now_min = datetime.now().hour * 60 + datetime.now().minute
+    # 用 study 类型让 state_analyzer 出 study 情绪词
+    gm.create_goal(
+        name="写专栏", goal_type="study",
+        description="正在赶稿子",
+        creator_id="system", chat_id="global", priority="high",
+        parameters={"time_window": [max(0, now_min - 30), min(1440, now_min + 60)]},
+    )
+    inj_mod = imp("services.inject_service")
+    plugin = mock_plugin()
+    # v4.3 起 state_analyzer 由 enable_state_analysis 控制，要打开
+    plugin.config.inject.enable_state_analysis = True
+    svc = inj_mod.InjectService(plugin)
+
+    # 校验：QUERY_CURRENT 文本包含 "精神状态：" + 描述行
+    UserIntent = imp("handlers.inject.intent_classifier").UserIntent
+    txt_q = svc._render_unified_prompt(
+        intent=UserIntent.QUERY_CURRENT,
+        current_activity="写专栏",
+        current_description="正在赶稿子",
+        future_activities=[],
+        remaining_minutes=None,
+        state_hint="学得还挺认真",
+        proactive_hit=False,
+        context_continue_inject=False,
+        context_reason=None,
+    )
+    assert "精神状态：" in txt_q
+    assert "学得还挺认真" in txt_q, "state_hint 应嵌到当前活动行"
+
+    # 校验：CASUAL_CHAT + proactive_hit=True → 用"自然带出"提示
+    txt_p = svc._render_unified_prompt(
+        intent=UserIntent.CASUAL_CHAT,
+        current_activity="写专栏",
+        current_description=None,
+        future_activities=[],
+        remaining_minutes=None,
+        state_hint=None,
+        proactive_hit=True,
+        context_continue_inject=False,
+        context_reason=None,
+    )
+    assert "自然带出" in txt_p, "命中主动碎碎念应改提示词"
+
+    # 校验：CASUAL_CHAT + proactive_hit=False → 走"不相关请忽略"
+    txt_n = svc._render_unified_prompt(
+        intent=UserIntent.CASUAL_CHAT,
+        current_activity="写专栏",
+        current_description=None,
+        future_activities=[],
+        remaining_minutes=None,
+        state_hint=None,
+        proactive_hit=False,
+        context_continue_inject=False,
+        context_reason=None,
+    )
+    assert "完全忽略" in txt_n, "未命中碎碎念应走默认提示"
+
+    # 校验：replyer extra_prompt 也包含 "精神：" + state_hint
+    async def run_replyer():
+        r = await svc.inject_into_replyer_extra_prompt(session_id="s_v43", attempt=1)
+        extra = r.get("modified_kwargs", {}).get("extra_prompt", "")
+        assert "精神：" in extra, "replyer 应注入能量描述"
+        assert "写专栏" in extra
+    asyncio.run(run_replyer())
+
+
 def main() -> int:
     print(f"\n{'=' * 60}")
     print("自主规划插件 v4 完整冒烟测试")
@@ -473,6 +613,9 @@ def main() -> int:
     test_replyer_inject()
     test_recent_schedule_summary()
     test_auto_scheduler()
+    test_energy_model()
+    test_proactive_inject()
+    test_v43_inject_enhancements()
 
     print(f"\n{'=' * 60}")
     print(f"通过: {len(_PASS)} / 失败: {len(_FAIL)}")
