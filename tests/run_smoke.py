@@ -139,7 +139,7 @@ def mock_plugin(**schedule_overrides):
 
 @step("01. 插件包导入（cache 模块未缺失）")
 def test_pkg_import():
-    assert plugin_mod.__version__ == "4.4.1", f"version={plugin_mod.__version__}"
+    assert plugin_mod.__version__ == "4.4.3", f"version={plugin_mod.__version__}"
     cache_mod = imp("cache.lru_cache")
     c = cache_mod.LRUCache(max_size=2)
     c["a"] = 1; c["b"] = 2; c["c"] = 3
@@ -220,7 +220,7 @@ def test_current_toml():
     assert isinstance(inst.config.schedule.inject_into_replyer, bool)
     # inject_mode 在 v4.2 起 deprecated 但保留向后兼容
     assert inst.config.inject.inject_mode in ("smart", "rule")
-    assert inst.config.plugin.config_version == "4.4.1"
+    assert inst.config.plugin.config_version == "4.4.3"
 
 
 @step("06. stream_filter 白名单匹配")
@@ -602,7 +602,7 @@ def test_v43_inject_enhancements():
     asyncio.run(run_replyer())
 
 
-@step("19. _extract_last_user_text 跳过主程序元数据消息（v4.3.2/v4.4.1 hotfix）")
+@step("19. _extract_last_user_text 跳过主程序元数据消息（v4.3.2/v4.4.1/v4.4.2 hotfix）")
 def test_extract_last_user_text_skip_time_prefix():
     inj_mod = imp("services.inject_service")
     extract = inj_mod.InjectService._extract_last_user_text
@@ -640,7 +640,7 @@ def test_extract_last_user_text_skip_time_prefix():
     ]
     assert extract(msgs4) == "当前时间不重要，告诉我安排"
 
-    # 场景 5：v4.4.1 新增 ——【人物画像-内部参考】块也要跳过
+    # 场景 5：v4.4.1 ——【人物画像-内部参考】块也要跳过
     profile_block = (
         "【人物画像-内部参考】\n"
         "以下内容仅供内部推理，不要向用户逐字复述。\n\n"
@@ -665,13 +665,73 @@ def test_extract_last_user_text_skip_time_prefix():
         f"非内部参考的【】消息不应被误删，实际：{extract(msgs6)!r}"
     )
 
-    # 场景 7：用真实"现在在干嘛"问题过 IntentClassifier，应判为 QUERY_CURRENT
+    # 场景 7：v4.4.2 ——<system-reminder> deferred tool 提示也要跳过
+    system_reminder_block = (
+        "<system-reminder>\n"
+        "以下工具当前未直接暴露给你，但可以通过 tool_search 工具发现并在后续轮次中使用：\n"
+        "1. send_email\n"
+        "2. fetch_weather\n\n"
+        "如需其中某个工具，请先调用 tool_search。tool_search 只负责发现工具，不直接执行业务。\n"
+        "</system-reminder>"
+    )
+    msgs7 = [
+        {"role": "user", "content": "在干嘛？"},
+        {"role": "user", "content": system_reminder_block},
+        {"role": "user", "content": "【人物画像-内部参考】\n以下内容仅供内部推理"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs7) == "在干嘛？", (
+        f"应跳过 system-reminder + 人物画像 + 时间戳取真实问题，实际：{extract(msgs7)!r}"
+    )
+
+    # 场景 8：v4.4.2 ——真实用户消息以 < 开头不应被误删
+    msgs8 = [
+        {"role": "user", "content": "<3 这个表情怎么打"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    assert extract(msgs8) == "<3 这个表情怎么打", (
+        f"非 system-reminder 的 < 开头消息不应被误删，实际：{extract(msgs8)!r}"
+    )
+
+    # 场景 9：v4.4.3 ——剥除 build_planner_prefix 的 <message msg_id="..." time="..." user="..."> 包装
+    planner_wrapped = (
+        '<message msg_id="317284630" time="19:05:24" user="神秘靓仔">\n'
+        "你现在在干嘛？"
+    )
+    msgs9 = [
+        {"role": "user", "content": planner_wrapped},
+        {"role": "user", "content": "【人物画像-内部参考】\n以下内容仅供内部推理"},
+        {"role": "user", "content": "当前时间：2026-05-25 11:00:00"},
+    ]
+    extracted = extract(msgs9)
+    assert "<message" not in extracted, f"应剥除 <message ...> 前缀，实际：{extracted!r}"
+    assert "你现在在干嘛？" in extracted, (
+        f"应保留真实问题，实际：{extracted!r}"
+    )
+
+    # 场景 10：v4.4.3 ——带 quote/group_card 属性的更复杂前缀也要剥
+    complex_wrapped = (
+        '<message msg_id="abc" time="20:00:00" user="李四" group_card="老李" quote="def,ghi">\n'
+        "明天下午一起开会？"
+    )
+    msgs10 = [{"role": "user", "content": complex_wrapped}]
+    e10 = extract(msgs10)
+    assert e10.strip() == "明天下午一起开会？", f"复杂前缀应被剥除，实际：{e10!r}"
+
+    # 场景 11：v4.4.3 ——剥除后内容为空时跳过这条
+    msgs11 = [
+        {"role": "user", "content": "真实问题"},
+        {"role": "user", "content": '<message msg_id="x" time="y" user="z">\n'},
+    ]
+    assert extract(msgs11) == "真实问题", "前缀+空内容应跳过该条"
+
+    # 场景 12：用真实"现在在干嘛"问题过 IntentClassifier，应判为 QUERY_CURRENT
     UserIntent = imp("handlers.inject.intent_classifier").UserIntent
     classifier = imp("handlers.inject.intent_classifier").IntentClassifier()
     intent_q, conf_q = classifier.classify("你现在在干嘛？")
     assert intent_q == UserIntent.QUERY_CURRENT, f"'你现在在干嘛？'应判为 query_current，实际 {intent_q}"
 
-    # 场景 8：技术问题过分类器，应判为 TECH_QUESTION（验证修复后 intent 多样性恢复）
+    # 场景 13：技术问题过分类器，应判为 TECH_QUESTION
     intent_t, conf_t = classifier.classify("怎么配置数据库连接")
     assert intent_t == UserIntent.TECH_QUESTION, f"'怎么配置数据库连接'应判为 tech_question，实际 {intent_t}"
 

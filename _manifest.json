@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.4.1",
+  "version": "4.4.3",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.4.1 hotfix: 修复主程序新加的「人物画像-内部参考」消息污染意图分类导致所有问题被误判为 query_current 的 bug。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.4.3 hotfix: 剥除主程序 build_planner_prefix 的 <message msg_id=...> 包装，让意图分类拿到真实用户文本。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"
@@ -29,7 +29,11 @@
     "message.get_recent",
     "message.get_by_time_in_chat",
     "chat.get_all_streams",
-    "knowledge.search"
+    "chat.get_stream_by_group_id",
+    "chat.get_stream_by_user_id",
+    "knowledge.search",
+    "maisaka.proactive.trigger",
+    "frequency.set_adjust"
   ],
   "i18n": {
     "default_locale": "zh-CN",

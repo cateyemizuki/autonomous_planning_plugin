@@ -432,19 +432,43 @@ class InjectService:
     # 主程序 maisaka 会在 messages 末尾追加多条独立 user 消息作为元数据上下文，
     # 这些消息**不是真实用户问题**，不应进入 IntentClassifier，否则会污染意图判定。
     #
-    # 已知的元数据消息类型（见 src/maisaka/chat_loop_service.py 与
-    # src/maisaka/person_profile_injector.py）：
+    # 已知的元数据消息类型（见 src/maisaka/chat_loop_service.py /
+    # src/maisaka/person_profile_injector.py / src/maisaka/runtime.py）：
     #     1. ``当前时间：YYYY-MM-DD HH:MM:SS`` —— 时间戳（v4.3.2 已修）
-    #     2. ``【人物画像-内部参考】...`` —— 人物档案块（v4.4.1 新增过滤）
+    #     2. ``【人物画像-内部参考】...`` —— 人物档案块（v4.4.1 已修）
+    #     3. ``<system-reminder>...</system-reminder>`` —— deferred tool 提示（v4.4.2 已修）
     #
     # 主程序未来若追加新的元数据消息，可继续向本列表新增 pattern。
     _METADATA_USER_MESSAGE_PATTERNS: List[re.Pattern] = [
         re.compile(r"^当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$"),
         re.compile(r"^【人物画像-内部参考】"),
+        re.compile(r"^<system-reminder>"),
     ]
+
+    # v4.4.3：主程序 src/maisaka/planner_message_utils.py:build_planner_prefix
+    # 会给 chat history 里**每条** user 消息加 ``<message msg_id="..." time="..."
+    # user="...">\n真实文本`` 前缀。意图分类前必须剥除前缀，否则会把"msg_id/time/user"
+    # 等元数据当成关键词。
+    _PLANNER_PREFIX_PATTERN: re.Pattern = re.compile(r"^<message\s+[^>]*>\s*\n?")
 
     # 向后兼容：v4.3.2 单 pattern 别名（其他代码若引用此名仍可用）
     _CURRENT_TIME_PREFIX_PATTERN = _METADATA_USER_MESSAGE_PATTERNS[0]
+
+    @staticmethod
+    def _strip_planner_prefix(text: str) -> str:
+        """剥除主程序 build_planner_prefix 加的 ``<message ...>\\n`` 前缀。
+
+        主程序 ``src/maisaka/planner_message_utils.py`` 会给 chat history 里的
+        每条 user 消息加这个前缀（含 msg_id / time / user / group_card / quote
+        等属性），后面接真实文本。意图分类时必须剥除，否则前缀里的属性会污染分类。
+
+        Args:
+            text: 可能带前缀的消息文本。
+
+        Returns:
+            剥除前缀后的文本；无前缀时原样返回。
+        """
+        return InjectService._PLANNER_PREFIX_PATTERN.sub("", text, count=1)
 
     @staticmethod
     def _is_metadata_user_message(text: str) -> bool:
@@ -458,11 +482,16 @@ class InjectService:
     def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
         """从 PromptMessage 列表里提取最新一条 **含真实文本** 的 user 消息。
 
-        跳过三类污染：
+        跳过四类污染：
             1. 纯图片（无 text part）的 user 消息
             2. 主程序 maisaka 追加的 ``当前时间：YYYY-MM-DD HH:MM:SS`` 时间戳消息
-            3. 主程序 maisaka 追加的 ``【人物画像-内部参考】...`` 元数据块
-               （v4.4.1 新增）
+            3. 主程序 maisaka 追加的 ``【人物画像-内部参考】...`` 元数据块（v4.4.1）
+            4. 主程序 maisaka 追加的 ``<system-reminder>...`` 工具提示块（v4.4.2）
+
+        额外做一步剥除（v4.4.3 新增）：
+            - 真实用户消息可能被主程序 build_planner_prefix 包装为
+              ``<message msg_id="..." time="..." user="...">\\n真实文本`` 格式，
+              本方法返回前剥除前缀
 
         Args:
             messages: 序列化后的 PromptMessage dict 列表
@@ -482,7 +511,13 @@ class InjectService:
                     continue  # 空文本 → 找上一条 user
                 if InjectService._is_metadata_user_message(text):
                     continue  # 元数据消息 → 跳过，找上一条 user
-                return content
+                # v4.4.3：剥除 build_planner_prefix 的 <message ...>\n 包装
+                stripped = InjectService._strip_planner_prefix(content)
+                if InjectService._is_metadata_user_message(stripped.strip()):
+                    continue  # 剥除前缀后还是元数据（极少见）也跳过
+                if not stripped.strip():
+                    continue  # 剥除后空白 → 继续找
+                return stripped
             if isinstance(content, list):
                 for part in content:
                     candidate = ""
@@ -494,7 +529,12 @@ class InjectService:
                         continue
                     if InjectService._is_metadata_user_message(candidate):
                         continue  # 元数据 part → 跳过
-                    return candidate
+                    stripped = InjectService._strip_planner_prefix(candidate)
+                    if InjectService._is_metadata_user_message(stripped.strip()):
+                        continue
+                    if not stripped.strip():
+                        continue
+                    return stripped
                 # 当前 user 消息无可用文本 part → 继续找前一条 user
                 continue
             # content 是其他类型 → 继续找
