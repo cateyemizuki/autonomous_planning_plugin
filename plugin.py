@@ -103,6 +103,37 @@ def _migrate_v40_to_v41(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     return cfg, True
 
 
+def _downgrade_traditional_inject_mode(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """v4.1.1+：``inject_mode='traditional'`` 已移除，自动降级为 ``smart``。
+
+    避免 SDK 的 ``Literal["smart", "rule"]`` 校验拒绝旧用户的 config.toml。
+    traditional 模式的语义（固定模板）已被 smart 模式的关键词预判 + LLM
+    自判断覆盖，无功能损失。
+
+    Args:
+        raw: 用户提供的配置字典（可能已经过 ``_migrate_v40_to_v41``）。
+
+    Returns:
+        (新配置字典, 是否产生了降级)。
+    """
+    if not isinstance(raw, dict):
+        return raw, False
+    inject_section = raw.get(_INJECT_SUBKEY)
+    if not isinstance(inject_section, dict):
+        return raw, False
+    if str(inject_section.get("inject_mode") or "").strip() != "traditional":
+        return raw, False
+    new_inject = dict(inject_section)
+    new_inject["inject_mode"] = "smart"
+    cfg = dict(raw)
+    cfg[_INJECT_SUBKEY] = new_inject
+    logger.warning(
+        "inject_mode='traditional' 在 v4.1.1+ 已移除（语义被 smart 模式覆盖），"
+        "已自动降级为 'smart'"
+    )
+    return cfg, True
+
+
 class AutonomousPlanningPluginV4(MaiBotPlugin):
     """麦麦自主规划插件 v4"""
 
@@ -128,18 +159,22 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self,
         config_data: Mapping[str, Any] | None,
     ) -> tuple[dict[str, Any], bool]:
-        """v4.0 → v4.1 配置迁移 + 委托 SDK 默认归一化。
+        """v4.0 → v4.1 配置迁移 + traditional 模式降级 + 委托 SDK 默认归一化。
 
         SDK 会在 config_data 与默认配置之间 merge，且 extra="ignore" 会丢弃未声明字段。
-        所以这里必须**在 super 之前**把旧 ``[autonomous_planning.schedule.*]`` 搬到顶层。
+        所以这里必须**在 super 之前**把旧 ``[autonomous_planning.schedule.*]`` 搬到顶层，
+        并把 v4.1.1 前已移除的 ``inject_mode='traditional'`` 降级到 ``smart``。
         """
         raw = dict(config_data) if isinstance(config_data, Mapping) else {}
         migrated, did_migrate = _migrate_v40_to_v41(raw) if raw else (raw, False)
         if did_migrate:
             logger.info("检测到 v4.0 旧配置，已迁移 [autonomous_planning.schedule.*] 到顶层 [schedule.*] / [inject.*]")
 
+        # 单独的内部归一化（不依赖 v4.0→4.1 迁移触发）
+        migrated, did_downgrade = _downgrade_traditional_inject_mode(migrated)
+
         normalized, default_changed = super().normalize_plugin_config(migrated)
-        return normalized, did_migrate or default_changed
+        return normalized, did_migrate or did_downgrade or default_changed
 
     # ============================================================
     # 生命周期

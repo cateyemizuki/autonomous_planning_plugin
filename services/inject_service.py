@@ -90,7 +90,12 @@ class InjectService:
         )
 
     def _load_smart_components(self) -> None:
-        """加载智能注入子模块，加载失败则降级为 traditional 模式。"""
+        """加载智能注入子模块（IntentClassifier 等）。
+
+        组件加载成功 → rule / smart 模式都可用；
+        组件加载失败 → 强制降级为 smart 模式（smart 模式只依赖 LLM 软注入，
+        不需要任何智能子模块）。
+        """
         inj = self._plugin.config.inject
         cfg = self._plugin.config.schedule
 
@@ -133,8 +138,8 @@ class InjectService:
                 inj.context_ttl,
             )
         except ImportError as exc:
-            logger.warning(f"智能注入组件加载失败，降级为 traditional 模式: {exc}")
-            self._inject_mode = "traditional"
+            logger.warning(f"智能注入组件加载失败，降级为 smart 模式（LLM 软注入）: {exc}")
+            self._inject_mode = "smart"
             self._intent_classifier = None
             self._state_analyzer = None
             self._content_engine = None
@@ -466,16 +471,7 @@ class InjectService:
         Returns:
             (inject_content, injected, detected_intent) 三元组
         """
-        if self._inject_mode == "smart":
-            return self._build_smart_text(
-                user_message=user_message,
-                current_activity=current_activity,
-                current_description=current_description,
-                future_activities=future_activities,
-                activity_type=activity_type,
-                context_continue_inject=context_continue_inject,
-                context_reason=context_reason,
-            )
+        # rule 模式需要智能组件，组件缺失时降级到 smart
         if self._inject_mode == "rule" and self._intent_classifier and self._inject_optimizer:
             return self._build_rule_text(
                 user_message=user_message,
@@ -486,10 +482,15 @@ class InjectService:
                 context_reason=context_reason,
                 user_id=user_id,
             )
-        return self._build_traditional_text(
+        # 默认走 smart 模式（LLM 软注入）
+        return self._build_smart_text(
+            user_message=user_message,
             current_activity=current_activity,
             current_description=current_description,
             future_activities=future_activities,
+            activity_type=activity_type,
+            context_continue_inject=context_continue_inject,
+            context_reason=context_reason,
         )
 
     def _build_smart_text(
@@ -573,25 +574,6 @@ class InjectService:
 
         logger.info(f"✅ Rule 注入: intent={detected_intent}, confidence={confidence:.2f}")
         return inject_content, True, detected_intent
-
-    def _build_traditional_text(
-        self,
-        current_activity: str,
-        current_description: Optional[str],
-        future_activities: List[Tuple[str, str]],
-    ) -> Tuple[Optional[str], bool, Optional[str]]:
-        """传统模式：固定模板注入。"""
-        enable_detailed_description = self._plugin.config.schedule.enable_detailed_description
-        inject_content = f"【当前状态】\n这会儿正{current_activity}"
-        if enable_detailed_description and current_description:
-            inject_content += f"（{current_description}）"
-        inject_content += "\n回复时可以自然提到当前在做什么，不要刻意强调。"
-        if future_activities:
-            next_time, next_activity = future_activities[0]
-            inject_content += f"\n等下 {next_time} 要 {next_activity}。"
-        inject_content += "\n"
-        logger.info(f"✅ Traditional 注入: {current_activity}")
-        return inject_content, True, None
 
     def _build_smart_inject_prompt(
         self,

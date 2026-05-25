@@ -142,7 +142,7 @@ class ScheduleConfig(PluginConfigBase):
         description="智能注入时最多显示的未来活动数量。",
         json_schema_extra={
             "label": "未来活动条数",
-            "hint": "0 = 不显示；smart / traditional 模式注入文本中的'接下来'数量",
+            "hint": "0 = 不显示；注入文本中'接下来'的活动数量",
             "order": 4,
         },
     )
@@ -507,12 +507,12 @@ class InjectConfig(PluginConfigBase):
     __ui_icon__: ClassVar[str] = "zap"
     __ui_order__: ClassVar[int] = 3
 
-    inject_mode: Literal["smart", "rule", "traditional"] = Field(
+    inject_mode: Literal["smart", "rule"] = Field(
         default="smart",
-        description="注入模式。smart=LLM 软注入（推荐）；rule=规则引擎（按意图决定）；traditional=固定模板。",
+        description="注入模式。smart=LLM 软注入（推荐）；rule=规则引擎（按意图决定，需启用智能注入子模块）。",
         json_schema_extra={
             "label": "注入模式",
-            "hint": "smart=LLM 软注入（推荐） / rule=规则引擎 / traditional=固定模板",
+            "hint": "smart=LLM 软注入（推荐） / rule=规则引擎",
             "order": 1,
         },
     )

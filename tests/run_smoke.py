@@ -199,7 +199,8 @@ def test_migration():
     inst.set_plugin_config(old_cfg)
     assert inst.config.schedule.inject_schedule is False
     assert inst.config.schedule.allowed_streams == ["qq:group:111"]
-    assert inst.config.inject.inject_mode == "traditional"
+    # v4.1.1+ 移除 traditional 模式，迁移层自动降级为 smart
+    assert inst.config.inject.inject_mode == "smart"
     assert inst.config.autonomous_planning.cleanup_interval == 1800
 
 
