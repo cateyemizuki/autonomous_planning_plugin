@@ -64,6 +64,15 @@ _PROACTIVE_INTENT_TEMPLATES: Dict[str, str] = {
 }
 _DEFAULT_PROACTIVE_INTENT = "Bot 切换到新活动了，可以自然地在群里说一两句近况"
 
+# v4.4.5：约定（pending_commitment）来源的活动用强指令模板，让 Maisaka 不要陷入
+# "自行决定是否回复"的工具调用循环。占位符会在 _trigger_proactive 中填充。
+_COMMITMENT_INTENT_TEMPLATE = (
+    "你之前答应过对方今天{time_hint}要在私聊里{title}（约定备注：{notes_hint}）。\n"
+    "现在到点了，请用符合人设的语气**立即在私聊里发出**这条消息（例如叫醒、问候、"
+    "提醒等），不要询问对方、不要等用户先开口、不要陷入工具调用循环。\n"
+    "活动名：{activity_name}"
+)
+
 
 class ProactiveService:
     """活动驱动的主动行为服务（v4.4 新增）。"""
@@ -154,7 +163,7 @@ class ProactiveService:
         activity_info = await self._find_current_activity()
         if activity_info is None:
             return
-        activity_name, goal_type, start_minutes, _end_minutes = activity_info
+        activity_name, goal_type, start_minutes, _end_minutes, activity_params = activity_info
 
         now = self._tz_manager.get_now()
         current_min = now.hour * 60 + now.minute
@@ -174,7 +183,7 @@ class ProactiveService:
             key = (stream_id, activity_name, date_str)
             if key in self._proactive_history:
                 continue  # 同一天同一活动只触发一次
-            await self._trigger_proactive(stream_id, activity_name, goal_type)
+            await self._trigger_proactive(stream_id, activity_name, goal_type, activity_params)
             self._proactive_history[key] = time.time()
 
     # ------------------------------------------------------------
@@ -287,29 +296,38 @@ class ProactiveService:
             logger.warning(f"解析 {entry} 异常: {exc}")
             return None
 
-        if not isinstance(result, dict) or not result.get("success"):
-            logger.warning(
-                f"解析 {entry} 失败：{result.get('error') if isinstance(result, dict) else result}"
-            )
+        # SDK 的 _normalize_capability_result 对 chat.get_stream_by_xxx 自动解包：
+        # - Host 原始 `{"success": True, "stream": <dict>}` 被剥出 → 直接拿到 stream dict
+        # - Host 找不到对应聊天流时 stream 字段为 None → SDK 透传 None 给我们
+        # - 真正失败（capability_denied 等）返回原始 `{"success": False, "error": "..."}`
+        #   （没有 stream key 时不被剥包）
+        # 所以判断顺序必须是：先看是否含 success=False，再看是否 None，最后才取 session_id
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning(f"解析 {entry} 失败: {result.get('error', '主程序拒绝')}")
             return None
-        stream = result.get("stream")
-        if not isinstance(stream, dict):
-            logger.warning(f"解析 {entry} 失败：主程序未找到对应聊天流（可能未注册或已退群）")
+        if result is None:
+            logger.warning(f"解析 {entry} 失败：主程序未找到对应聊天流（可能 bot 与该 QQ 未建立过私聊 / 已退群）")
             return None
-        session_id = str(stream.get("session_id") or "").strip()
+        if not isinstance(result, dict):
+            logger.warning(f"解析 {entry} 失败：SDK 返回类型异常 {type(result).__name__}={result!r}")
+            return None
+        session_id = str(result.get("session_id") or "").strip()
         if not session_id:
-            logger.warning(f"解析 {entry} 失败：返回 stream 无 session_id 字段")
+            logger.warning(f"解析 {entry} 失败：返回 stream 无 session_id 字段（result={result!r}）")
             return None
-        logger.debug(f"解析成功 {entry} → session_id={session_id}")
+        logger.info(f"解析成功 {entry} → session_id={session_id}")
         return session_id
 
     async def _find_current_activity(
         self,
-    ) -> Optional[Tuple[str, str, int, int]]:
+    ) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
         """从 GoalManager 找当前正在进行的活动。
 
         Returns:
-            ``(name, goal_type, start_minutes, end_minutes)``，没找到时为 ``None``。
+            ``(name, goal_type, start_minutes, end_minutes, parameters)`` —— 多返回的
+            ``parameters`` dict 透传 goal.parameters 原始内容，供下游识别
+            ``is_commitment`` / ``commitment_*`` 等 v4.4.5 新增字段。
+            没找到时为 ``None``。
         """
         try:
             gm = get_goal_manager()
@@ -337,7 +355,13 @@ class ProactiveService:
                 if end > 1440 and current_min < 720:
                     end -= 1440
                 if start <= current_min < end:
-                    return goal.name, goal.goal_type or "daily_routine", start, end
+                    return (
+                        goal.name,
+                        goal.goal_type or "daily_routine",
+                        start,
+                        end,
+                        dict(goal.parameters) if goal.parameters else {},
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"查找当前活动失败: {exc}")
         return None
@@ -388,6 +412,7 @@ class ProactiveService:
         stream_id: str,
         activity_name: str,
         goal_type: str,
+        activity_params: Dict[str, Any],
     ) -> None:
         """对单个聊天流触发一次主动开口。
 
@@ -395,20 +420,38 @@ class ProactiveService:
             stream_id: 目标聊天流 ID
             activity_name: 当前活动名（用于注入 intent prompt）
             goal_type: 当前活动类型（决定 intent 模板）
+            activity_params: 当前活动的 goal.parameters。若含 ``is_commitment=True``
+                则切换到强指令模板（v4.4.5）—— 普通模板里"自行决定是否回复"会让 LLM
+                陷入工具调用循环不发消息，约定来源的活动必须强制发出。
         """
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
             return
 
-        template = _PROACTIVE_INTENT_TEMPLATES.get(goal_type, _DEFAULT_PROACTIVE_INTENT)
-        intent_prompt = f"{template}（活动名：{activity_name}）"
+        # v4.4.5：约定来源走强指令模板
+        is_commitment = bool(activity_params.get("is_commitment"))
+        if is_commitment:
+            commit_title = str(activity_params.get("commitment_title") or activity_name).strip()
+            commit_time = str(activity_params.get("commitment_time") or "").strip()
+            commit_notes = str(activity_params.get("commitment_notes") or "").strip()
+            intent_prompt = _COMMITMENT_INTENT_TEMPLATE.format(
+                time_hint=f"{commit_time} " if commit_time else "",
+                title=commit_title,
+                notes_hint=commit_notes or "无",
+                activity_name=activity_name,
+            )
+            reason = f"autonomous_planning_v4: 约定到期 → {commit_title}"
+        else:
+            template = _PROACTIVE_INTENT_TEMPLATES.get(goal_type, _DEFAULT_PROACTIVE_INTENT)
+            intent_prompt = f"{template}（活动名：{activity_name}）"
+            reason = f"autonomous_planning_v4: 活动切换 → {activity_name}"
 
         try:
             result = await ctx_obj.maisaka.trigger_proactive(
                 stream_id=stream_id,
                 intent=intent_prompt,
-                reason=f"autonomous_planning_v4: 活动切换 → {activity_name}",
-                priority="normal",
+                reason=reason,
+                priority="high" if is_commitment else "normal",
             )
             if isinstance(result, dict) and not result.get("success", False):
                 logger.warning(
@@ -418,7 +461,7 @@ class ProactiveService:
                 return
             logger.info(
                 f"🚀 主动发起触发: stream={stream_id}, activity={activity_name}, "
-                f"goal_type={goal_type}"
+                f"goal_type={goal_type}, commitment={is_commitment}"
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"主动发起异常: stream={stream_id}, {exc}")

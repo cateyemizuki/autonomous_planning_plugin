@@ -796,13 +796,15 @@ def test_proactive_service():
         # ============ v4.4.1 新增：多格式 stream 解析 ============
 
         # 6) qq:group:<gid> → 调 ctx.chat.get_stream_by_group_id 解析为 session_id
+        # 注意：v4.4.4 起按 SDK 解包后契约 mock —— 直接返回 stream dict（不是 {"success":True,"stream":...}）
         plugin2 = mock_plugin()
         plugin2.ctx = MagicMock()
         plugin2.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
         plugin2.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
         plugin2.ctx.chat.get_stream_by_group_id = AsyncMock(return_value={
-            "success": True,
-            "stream": {"session_id": "real_session_for_group_123456", "platform": "qq", "group_id": "123456"},
+            "session_id": "real_session_for_group_123456",
+            "platform": "qq",
+            "group_id": "123456",
         })
         plugin2.config.schedule.proactive_streams = ["qq:group:123456"]
         plugin2.config.schedule.enable_proactive_trigger = True
@@ -820,8 +822,9 @@ def test_proactive_service():
         plugin3.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
         plugin3.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
         plugin3.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={
-            "success": True,
-            "stream": {"session_id": "real_session_for_user_789", "platform": "qq", "user_id": "789"},
+            "session_id": "real_session_for_user_789",
+            "platform": "qq",
+            "user_id": "789",
         })
         plugin3.config.schedule.proactive_streams = ["qq:private:789"]
         plugin3.config.schedule.enable_proactive_trigger = True
@@ -831,15 +834,13 @@ def test_proactive_service():
         plugin3.ctx.chat.get_stream_by_user_id.assert_awaited_with("789", "qq")
         plugin3.ctx.frequency.set_adjust.assert_awaited_with("real_session_for_user_789", 0.3)
 
-        # 8) 解析失败（主程序找不到对应聊天流）→ 该条目被跳过
+        # 8) 解析失败（主程序找不到对应聊天流）→ stream 为 None 被跳过
         plugin4 = mock_plugin()
         plugin4.ctx = MagicMock()
         plugin4.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
         plugin4.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
-        # 模拟主程序返回 stream=None（群没注册）
-        plugin4.ctx.chat.get_stream_by_group_id = AsyncMock(return_value={
-            "success": True, "stream": None,
-        })
+        # SDK 解包后：找不到对应聊天流时直接返回 None
+        plugin4.ctx.chat.get_stream_by_group_id = AsyncMock(return_value=None)
         plugin4.config.schedule.proactive_streams = ["qq:group:999999"]
         plugin4.config.schedule.enable_proactive_trigger = True
         plugin4.config.schedule.enable_frequency_modulation = True
@@ -848,6 +849,23 @@ def test_proactive_service():
         # 解析失败 → 不调用 frequency / proactive
         plugin4.ctx.frequency.set_adjust.assert_not_awaited()
         plugin4.ctx.maisaka.trigger_proactive.assert_not_awaited()
+
+        # 9) v4.4.4 新增：失败时返回 {"success": False, "error": "..."} 也要正确识别
+        plugin5 = mock_plugin()
+        plugin5.ctx = MagicMock()
+        plugin5.ctx.maisaka.trigger_proactive = AsyncMock(return_value={"success": True})
+        plugin5.ctx.frequency.set_adjust = AsyncMock(return_value={"success": True})
+        # 模拟主程序拒绝（capability_denied 等失败）
+        plugin5.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={
+            "success": False, "error": "fake denied",
+        })
+        plugin5.config.schedule.proactive_streams = ["qq:private:000000"]
+        plugin5.config.schedule.enable_proactive_trigger = True
+        plugin5.config.schedule.enable_frequency_modulation = True
+        svc9 = proactive_mod.ProactiveService(plugin5)
+        await svc9._check_and_act()
+        plugin5.ctx.frequency.set_adjust.assert_not_awaited()
+        plugin5.ctx.maisaka.trigger_proactive.assert_not_awaited()
 
     asyncio.run(run())
 

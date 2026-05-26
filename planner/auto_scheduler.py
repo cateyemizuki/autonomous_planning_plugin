@@ -343,7 +343,9 @@ class ScheduleAutoScheduler:
                 ran_any_task = False
 
                 if infer_enabled and self._is_time_due(now, infer_time_str, self._last_infer_date):
-                    schedule_config = self.plugin.config.schedule.model_dump()
+                    # v4.4.4：使用 plugin.build_schedule_config 统一构建（含 bot_profile），
+                    # 不再用 schedule.model_dump()（会漏掉 bot_profile 字段）
+                    schedule_config = self.plugin.build_schedule_config()
                     await self._infer_next_day_prompt(schedule_config)
                     self._last_infer_date = today_str
                     ran_any_task = True
@@ -424,7 +426,10 @@ class ScheduleAutoScheduler:
                 return
 
             # 生成日程
-            schedule_config = self.plugin.config.schedule.model_dump()
+            # v4.4.4：使用 plugin.build_schedule_config 统一构建（含 bot_profile），
+            # 不再用 schedule.model_dump()（会漏掉 bot_profile 字段，导致 prompt
+            # 中"未配置或为空"报错）
+            schedule_config = self.plugin.build_schedule_config()
             fallback_prompt = str(schedule_config.get("custom_prompt", "") or "")
             effective_prompt = self._get_effective_custom_prompt(today, fallback_prompt)
             if effective_prompt != fallback_prompt:

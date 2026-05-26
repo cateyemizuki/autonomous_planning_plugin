@@ -114,6 +114,8 @@ class CommandService:
             await self._handle_status(stream_id)
         elif subcommand == "list":
             await self._handle_list(stream_id)
+        elif subcommand == "regenerate":
+            await self._handle_regenerate(stream_id, parts)
         elif subcommand == "delete":
             return await self._handle_delete(stream_id, parts)
         elif subcommand == "clear":
@@ -260,6 +262,41 @@ class CommandService:
             except Exception as exc2:
                 logger.error(f"文本输出也失败: {exc2}", exc_info=True)
 
+    async def _handle_regenerate(self, stream_id: str, parts: List[str]) -> None:
+        """``/plan regenerate [额外要求...]``：立即重新生成今日日程。
+
+        会先删掉今天已有的 schedule_goals，再走 ``ScheduleGenerator`` 全量重生成并
+        自动 apply。``parts[2:]`` 拼成的剩余字符串将作为 ``extra_prompt`` 临时叠加
+        到 ``custom_prompt`` 上（生成完成后自动还原）。
+
+        Args:
+            stream_id: 来源会话 ID。
+            parts: 已 split 的命令片段，``parts[0]=/plan``，``parts[1]=regenerate``，
+                ``parts[2:]`` 为可选的额外要求文本。
+        """
+        tools_svc = self._plugin._tools_svc
+        if tools_svc is None:
+            await self._send(stream_id, "❌ 插件未完成初始化，无法重新生成日程")
+            return
+
+        # 剩余参数拼为 extra_prompt（允许带空格的自然描述）
+        extra_prompt = " ".join(parts[2:]).strip()
+
+        hint = "♻️ 正在重新生成今日日程，请稍候（约 30s ~ 2min）..."
+        if extra_prompt:
+            hint += f"\n📝 额外要求：{extra_prompt}"
+        await self._send(stream_id, hint)
+
+        try:
+            schedule = await tools_svc.regenerate_today_schedule_now(extra_prompt=extra_prompt)
+        except Exception as exc:
+            logger.error(f"重新生成日程失败: {exc}", exc_info=True)
+            await self._send(stream_id, f"❌ 重新生成失败: {exc}")
+            return
+
+        msg = f"✅ 已重新生成今日日程，共 {len(schedule.items)} 项活动\n\n💡 使用 /plan list 查看图片，或 /plan status 查看文字详情"
+        await self._send(stream_id, msg)
+
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
         """``/plan delete <id|序号>``：删除目标。"""
         goal_manager = get_goal_manager()
@@ -363,6 +400,7 @@ class CommandService:
 📋 命令列表:
 /plan status - 查看今日日程（详细文字格式，含描述）
 /plan list - 查看今日日程（美观图片格式）
+/plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
 /plan delete <goal_id或序号> - 删除指定目标
 /plan clear - 清理昨天及更早的旧日程
 /plan help - 显示此帮助
@@ -371,13 +409,19 @@ class CommandService:
 1. 对我说 "帮我生成今天的日程" 我会自动创建
 2. 对我说 "今天有什么安排" 我会查看并告诉你
 3. 使用 status 查看详细文字信息，list 查看美观图片
-4. 使用 clear 清理旧日程，保持目标列表整洁
+4. 使用 regenerate 在不满意当前日程时立即重新生成
+5. 使用 clear 清理旧日程，保持目标列表整洁
 
 ✨ 示例对话:
 "帮我生成今天的日程"
 "今天有什么安排"
 "现在应该做什么"
 "提醒我每天早上9点问候大家"
+
+♻️ 重新生成示例:
+/plan regenerate                # 直接重新生成今日日程
+/plan regenerate 加入下午跑步     # 重新生成并临时叠加要求
+/plan regenerate 今天生日要庆祝   # 重新生成并融入特殊事件
 
 🗑️ 清理示例:
 /plan clear          # 清理昨天及更早的日程
@@ -387,6 +431,7 @@ class CommandService:
 📌 注意:
 - 日程每天自动生成，无需手动创建
 - status/list 命令只显示今天的日程
+- regenerate 会丢弃今天已有日程并重新生成，操作不可逆
 - clear 命令会自动保留今天的日程
 """
         await self._send(stream_id, help_text)

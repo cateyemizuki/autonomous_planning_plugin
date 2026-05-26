@@ -236,6 +236,42 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             logger.warning("[v4] 预拉取 bot_profile 失败，使用空值: %s", exc)
         return profile
 
+    # ============================================================
+    # 对外暴露：ScheduleGenerator 配置构建（单一来源）
+    # ============================================================
+
+    def build_schedule_config(self) -> Dict[str, Any]:
+        """构建供 ``ScheduleGenerator`` 使用的 dict 配置。
+
+        统一所有 ScheduleGenerator 构造入口（``ToolsService`` /
+        ``ScheduleAutoScheduler`` / ``CommandService``）的配置来源，避免出现
+        "部分入口漏带 bot_profile"等路径不一致问题（v4.4.4 修复的 bug 即源于此：
+        ``auto_scheduler`` 原本用 ``self.plugin.config.schedule.model_dump()``
+        构造 config，而 pydantic 模型里不存在 ``bot_profile`` 字段，导致 prompt
+        生成时人设缺失）。
+
+        Returns:
+            包含 schedule 段全部强类型字段，以及插件层缓存的 ``bot_profile`` 的
+            可变 dict。调用方拿到后可临时覆盖 ``custom_prompt`` 等字段而不影响下次调用。
+        """
+        cfg = self.config.schedule
+        return {
+            "use_multi_round": cfg.use_multi_round,
+            "max_rounds": cfg.max_rounds,
+            "quality_threshold": cfg.quality_threshold,
+            "min_activities": cfg.min_activities,
+            "max_activities": cfg.max_activities,
+            "enable_detailed_description": cfg.enable_detailed_description,
+            "min_description_length": cfg.min_description_length,
+            "max_description_length": cfg.max_description_length,
+            "max_tokens": cfg.max_tokens,
+            "custom_prompt": cfg.custom_prompt,
+            "timezone": cfg.timezone,
+            "llm_task_name": cfg.llm_task_name,
+            "recent_schedule_days": cfg.recent_schedule_days,
+            "bot_profile": dict(self._bot_profile) if self._bot_profile else {},
+        }
+
     async def on_unload(self) -> None:
         """插件卸载：通知所有循环停止 → cancel 后台任务 → 等待退出 → 关闭数据库。"""
         if self._cleanup_svc is not None:

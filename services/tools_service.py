@@ -155,28 +155,47 @@ class ToolsService:
     # ------------------------------------------------------------
 
     def _build_schedule_config(self) -> Dict[str, Any]:
-        """从插件强类型配置构建供 ScheduleGenerator 使用的 dict 配置。"""
-        cfg = self._plugin.config.schedule
-        return {
-            "use_multi_round": cfg.use_multi_round,
-            "max_rounds": cfg.max_rounds,
-            "quality_threshold": cfg.quality_threshold,
-            "min_activities": cfg.min_activities,
-            "max_activities": cfg.max_activities,
-            "enable_detailed_description": cfg.enable_detailed_description,
-            "min_description_length": cfg.min_description_length,
-            "max_description_length": cfg.max_description_length,
-            "max_tokens": cfg.max_tokens,
-            "custom_prompt": cfg.custom_prompt,
-            "timezone": cfg.timezone,
-            "llm_task_name": cfg.llm_task_name,
-            "recent_schedule_days": cfg.recent_schedule_days,
-            "bot_profile": getattr(self._plugin, "_bot_profile", {}) or {},
-        }
+        """从插件强类型配置构建供 ScheduleGenerator 使用的 dict 配置。
+
+        v4.4.4 起，实际构造逻辑已上移到 :meth:`AutonomousPlanningPluginV4.build_schedule_config`
+        作为单一来源；本方法保留只为兼容现有调用点（``update_schedule`` 等）。
+        新代码请直接调用 ``self._plugin.build_schedule_config()``。
+        """
+        return self._plugin.build_schedule_config()
 
     def _make_tz_manager(self) -> TimezoneManager:
         """根据配置创建 TimezoneManager。"""
         return TimezoneManager(self._plugin.config.schedule.timezone)
+
+    # ------------------------------------------------------------
+    # 对外暴露：供 CommandService 直接复用的重生成入口
+    # ------------------------------------------------------------
+
+    async def regenerate_today_schedule_now(self, *, extra_prompt: str = "") -> Schedule:
+        """立即重新生成今日日程（绕过 LLM 工具链）。
+
+        供 ``CommandService`` 的 ``/plan regenerate`` 命令调用，封装了
+        "构建配置 → 实例化 ScheduleGenerator → 调用 regenerate_today_schedule"
+        的全流程，避免 command 层直接访问 ToolsService 的私有 ``_build_schedule_config``。
+
+        Args:
+            extra_prompt: 临时追加到 ``custom_prompt`` 的额外要求（可选），
+                例如 "加入下午跑步"、"今天是生日"。生成完成后会自动还原。
+
+        Returns:
+            新生成的 :class:`Schedule` 对象（``auto_apply=True``，已写入数据库）。
+        """
+        goal_manager = get_goal_manager()
+        schedule_config = self._build_schedule_config()
+        schedule_generator = ScheduleGenerator(
+            goal_manager, config=schedule_config, plugin=self._plugin,
+        )
+        return await schedule_generator.regenerate_today_schedule(
+            user_id="system",
+            chat_id="global",
+            extra_prompt=extra_prompt,
+            auto_apply=True,
+        )
 
     # ------------------------------------------------------------
     # Tool 1：manage_goal

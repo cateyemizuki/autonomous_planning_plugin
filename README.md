@@ -93,6 +93,7 @@
 | `/plan` 或 `/规划` | 显示帮助 |
 | `/plan status` | 今日日程（文字详细） |
 | `/plan list` | 今日日程（图片） |
+| `/plan regenerate [额外要求]` | 重新生成今日日程（先删今天再重生，可附加临时要求） |
 | `/plan delete <id或序号>` | 删除指定目标 |
 | `/plan clear [days]` | 清理旧日程，默认仅保留今天 |
 

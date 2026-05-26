@@ -385,10 +385,29 @@ class ScheduleGenerator:
 
         goals_data = []
 
-        for item in schedule.items:
+        # v4.4.5：先把"今日 pending_commitments"映射到 schedule.items 上
+        # —— LLM 生成日程时不一定显式标记哪个 item 来自约定，这里用"最接近的时间窗口"
+        # 找出每条约定对应的 item，给那个 item 注入 ``is_commitment`` / ``commitment_*``
+        # 元数据，落库后 ProactiveService 才能识别出"这是约定，要用强指令叫 LLM 发送"。
+        commitment_metadata_by_item_idx: Dict[int, Dict[str, Any]] = {}
+        if schedule.schedule_type == ScheduleType.DAILY:
+            try:
+                today_str = self.tz_manager.get_now().strftime("%Y-%m-%d")
+                commitment_metadata_by_item_idx = self._match_commitments_to_items(
+                    schedule.items, today_str,
+                )
+            except Exception as exc:
+                logger.warning(f"约定→日程项 匹配失败（不影响落库）: {exc}", exc_info=True)
+
+        for idx, item in enumerate(schedule.items):
             try:
                 # 设置时间窗口
                 parameters = item.parameters.copy() if item.parameters else {}
+
+                # v4.4.5：把匹配到的 commitment 元数据注入 parameters
+                commitment_meta = commitment_metadata_by_item_idx.get(idx)
+                if commitment_meta:
+                    parameters.update(commitment_meta)
 
                 # 从time_slot解析时间窗口
                 if item.time_slot:
@@ -449,6 +468,108 @@ class ScheduleGenerator:
         else:
             logger.warning("没有有效的日程项可以应用")
             return []
+
+    def _match_commitments_to_items(
+        self,
+        items: List[ScheduleItem],
+        today_str: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        """把今日 pending_commitments 一对一匹配到 schedule items。
+
+        LLM 生成日程 JSON 时**不会显式标记**哪个 item 来自约定（prompt 里只是
+        要求"把上述约定安排到合适时间段"），落库后无法直接区分。本方法在
+        :meth:`apply_schedule` 落库前，按以下规则把约定与 item 建立映射：
+
+        1. 优先按时间匹配：约定 ``time="HH:MM"`` 与 item ``time_slot`` 差 ≤ 30 分钟
+        2. 若约定无时间，按标题子串匹配（约定 title 出现在 item.name/description 中）
+        3. 一对一约束：每个约定只匹配一个 item，每个 item 最多接收一个约定
+           （首次匹配优先；同时段多个约定时按 commitment 加入顺序）
+
+        Args:
+            items: LLM 生成的当日日程项列表（未落库）
+            today_str: ``YYYY-MM-DD``，用于查询当日 pending_commitments
+
+        Returns:
+            ``{item_index: {"is_commitment": True, "commitment_title": ..., ...}}``
+            映射，调用方把对应 dict ``update`` 到 item 的 parameters 中即可。
+        """
+        pending = self.goal_manager.get_pending_commitments(today_str)
+        if not pending:
+            return {}
+
+        # 解析 item.time_slot 为分钟数（与 parse_time_window 一致的格式）
+        def _item_start_minutes(it: ScheduleItem) -> Optional[int]:
+            if not it.time_slot:
+                return None
+            try:
+                parts = it.time_slot.split(":")
+                return int(parts[0]) * 60 + (int(parts[1]) if len(parts) > 1 else 0)
+            except (ValueError, IndexError):
+                return None
+
+        result: Dict[int, Dict[str, Any]] = {}
+        used_item_idx: set[int] = set()
+
+        for commit in pending:
+            params = commit.parameters or {}
+            commit_time = str(params.get("time") or "").strip()
+            commit_title = commit.name.strip()
+            commit_notes = str(params.get("notes") or "").strip()
+            commit_reason = str(params.get("reason") or "").strip()
+
+            best_idx: Optional[int] = None
+
+            # 规则 1：按时间匹配（≤ 30 分钟）
+            if commit_time and ":" in commit_time:
+                try:
+                    th, tm = commit_time.split(":", 1)
+                    commit_minutes = int(th) * 60 + int(tm)
+                except ValueError:
+                    commit_minutes = None
+                if commit_minutes is not None:
+                    best_diff = 31
+                    for idx, it in enumerate(items):
+                        if idx in used_item_idx:
+                            continue
+                        item_minutes = _item_start_minutes(it)
+                        if item_minutes is None:
+                            continue
+                        diff = abs(item_minutes - commit_minutes)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_idx = idx
+
+            # 规则 2：标题子串匹配（兜底；约定无 time 或时间匹配未命中时）
+            if best_idx is None and commit_title:
+                for idx, it in enumerate(items):
+                    if idx in used_item_idx:
+                        continue
+                    haystack = f"{it.name or ''}{it.description or ''}"
+                    if commit_title in haystack:
+                        best_idx = idx
+                        break
+
+            if best_idx is None:
+                logger.warning(
+                    "约定 %r 未在日程项中找到对应活动（time=%s）",
+                    commit_title, commit_time or "未指定",
+                )
+                continue
+
+            result[best_idx] = {
+                "is_commitment": True,
+                "commitment_title": commit_title,
+                "commitment_notes": commit_notes,
+                "commitment_reason": commit_reason,
+                "commitment_time": commit_time,
+            }
+            used_item_idx.add(best_idx)
+            logger.info(
+                "🔗 约定 %r → 日程项[%d] %r（time_slot=%s）",
+                commit_title, best_idx, items[best_idx].name, items[best_idx].time_slot,
+            )
+
+        return result
 
     def get_schedule_summary(self, schedule: Schedule) -> str:
         """获取日程摘要（简洁版 - 显示时间范围）"""
