@@ -618,6 +618,8 @@ class ToolsService:
                 model=cfg.llm_task_name,
                 temperature=cfg.role_judge_temperature,
                 max_tokens=cfg.max_tokens,
+                # v4.5.0：角色裁判同样受 generation_timeout 约束（issue #9）
+                timeout_ms=int(float(cfg.generation_timeout) * 1000),
                 log_dir=log_dir,
                 log_enabled=cfg.llm_log_enabled,
             )
