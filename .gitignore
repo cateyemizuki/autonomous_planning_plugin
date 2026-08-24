@@ -1,30 +1,37 @@
-# Python
+# ============================================================
+# 麦麦自主规划插件 v4 - .gitignore（v4.5.0 重构精简版）
+# ============================================================
+
+# ── Python ──────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
+.venv/
+venv/
+env/
+.python-version
 
-# 运行时数据与日志
+# ── 运行时数据与日志（不进仓库）──────────────────────────────
 data/
 *.log
-
-# cache/ 是 Python 源码目录（lru_cache.py / conversation_cache.py），
-# 只忽略其中的字节码，不要整目录忽略
-cache/__pycache__/
-
-# 本机专属：不进仓库
 config.toml
+next_day_prompt.json
+
+# ── 本机专属 / 开发残留 ─────────────────────────────────────
 config_back/
 changelogs/
 POC_RESULT.md
+.claude/
+.bot/
+.dsh/
 
-# 环境与编辑器
+# ── 环境与编辑器 ────────────────────────────────────────────
 .env
-.venv/
-venv/
+.env.*
+!.env.example
 .idea/
 .vscode/
 *.swp
 .DS_Store
-.claude/
+Thumbs.db
