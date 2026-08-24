@@ -1,4 +1,4 @@
-"""自主规划插件 v4 - 配置模型。
+﻿"""自主规划插件 v4 - 配置模型。
 
 **v4.1 结构扁平化**：SDK 只展开"顶层 PluginConfigBase 字段"为 WebUI section，
 因此把原嵌套的 ``schedule`` / ``inject`` 段提到顶层，让 UI 能直接渲染。
@@ -27,6 +27,11 @@ from typing import ClassVar, List, Literal
 
 from maibot_sdk import Field, PluginConfigBase
 
+# 配置版本（config_version）：与 _manifest.json 的 version 保持同步（v4.5.0）。
+# config_version 用于跟踪配置结构版本；插件升级后若配置结构发生变化，
+# 可对比该值触发配置迁移/重建。
+SUPPORTED_CONFIG_VERSION = "4.5.0"
+
 
 # ============================================================
 # [plugin]
@@ -50,7 +55,7 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="4.4.4",
+        default=SUPPORTED_CONFIG_VERSION,
         description="配置文件版本号",
         json_schema_extra={
             "label": "配置版本",
@@ -153,10 +158,11 @@ class ScheduleConfig(PluginConfigBase):
 
     custom_prompt: str = Field(
         default="",
-        description="自定义日程生成提示词（如\"今天想多运动\"、\"专注学习\"等，留空使用默认风格）。",
+        description="自定义日程生成提示词。语义：角色的长期生活状态/持续阶段（如\"正在环游世界\"\"备考研究生\"），"
+                    "日程生成与次日推断都会延续这一方向（留空使用默认风格）。",
         json_schema_extra={
-            "label": "自定义生成 prompt",
-            "hint": "留空使用默认；如\"今天想多运动\"\"专注学习\"",
+            "label": "当前生活阶段 / 长期状态",
+            "hint": "留空使用默认；如\"正在环游世界\"\"备考研究生\"；日程与次日推断都会延续这一方向",
             "rows": 3,
             "placeholder": "（留空使用默认风格）",
             "order": 10,
@@ -271,6 +277,41 @@ class ScheduleConfig(PluginConfigBase):
             "label": "回看天数",
             "hint": "1-14；防止交替式重复（周一审稿/周二写专栏/周三又审稿）；推荐 3",
             "order": 21,
+        },
+    )
+
+    # ── 22-23 自定义日程时间范围（v4.5.0，issue #12） ────────────────
+
+    day_start_time: str = Field(
+        default="",
+        description="v4.5.0 新增：一天的日程开始时间（HH:MM）。留空 = 全天 00:00 开始。"
+                    "生成日程时所有活动将限制在该时间之后（如规定睡眠从 23:00 开始）。",
+        json_schema_extra={
+            "label": "日程开始时间",
+            "hint": "HH:MM；留空=00:00；规定一天日程从几点开始（如\"23:00\"表示睡眠从23点起）",
+            "placeholder": "留空（00:00）",
+            "order": 22,
+        },
+    )
+    day_end_time: str = Field(
+        default="",
+        description="v4.5.0 新增：一天的日程结束时间（HH:MM）。留空 = 24:00 结束。"
+                    "生成日程时所有活动将限制在该时间之前（如规定睡眠到次日 07:00 结束）。",
+        json_schema_extra={
+            "label": "日程结束时间",
+            "hint": "HH:MM；留空=24:00；规定一天日程到几点结束（如\"07:00\"表示睡眠到次日7点）",
+            "placeholder": "留空（24:00）",
+            "order": 23,
+        },
+    )
+    no_sleep_mode: bool = Field(
+        default=False,
+        description="v4.5.0 新增：无睡眠模式。开启后生成日程时不安排\"睡觉/睡眠/安睡\"类活动，"
+                    "原本属于睡眠的时段改为\"无所事事\"（自由活动 / 放空）。",
+        json_schema_extra={
+            "label": "无睡眠模式",
+            "hint": "开启后不生成睡眠类活动，睡眠时段改为无所事事；适合不需要睡眠的角色设定",
+            "order": 24,
         },
     )
 
