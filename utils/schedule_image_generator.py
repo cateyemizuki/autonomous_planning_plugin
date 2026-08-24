@@ -60,9 +60,9 @@ class ScheduleImageGenerator:
     # 插件根目录（使用相对路径）
     PLUGIN_ROOT = Path(__file__).parent.parent
 
-    # 图片资源路径（相对于插件根目录）
-    BIRD_IMAGE_PATH = PLUGIN_ROOT / "assets" / "bird.jpg"
-    WINTER_CHAR_IMAGE_PATH = PLUGIN_ROOT / "assets" / "winter_char.jpg"
+    # v4.5.0 重构：logo.jpg 位于插件根目录作为图标（_manifest display.icon 引用），
+    # 删除 assets/winter_char.jpg，日程图片背景改为纯渐变（不再依赖冬季角色素材）。
+    LOGO_IMAGE_PATH = PLUGIN_ROOT / "logo.jpg"
 
     # 目标类型图标（不使用emoji）
     TYPE_ICONS = {
@@ -80,36 +80,20 @@ class ScheduleImageGenerator:
     }
 
     # ===== 性能优化：缓存机制 =====
-    _cached_bird_image = None
-    _cached_winter_char = None
-    _cached_winter_char_alpha = None  # 预处理后的透明角色
+    _cached_logo_image = None
     _cached_fonts = {}  # 字体缓存 {size: font}
 
     @classmethod
     def _load_images(cls):
-        """加载并缓存图片资源"""
-        if cls._cached_bird_image is None:
+        """加载并缓存图片资源（v4.5.0：仅 logo.jpg，冬季角色素材已移除）"""
+        if cls._cached_logo_image is None:
             try:
-                cls._cached_bird_image = Image.open(cls.BIRD_IMAGE_PATH).convert('RGBA')
+                cls._cached_logo_image = Image.open(cls.LOGO_IMAGE_PATH).convert('RGBA')
             except (FileNotFoundError, IOError) as e:
                 logger.warning(f"加载鸟图片失败: {e}")
-                cls._cached_bird_image = Image.new('RGBA', (100, 100), (255, 150, 80, 255))
+                cls._cached_logo_image = Image.new('RGBA', (100, 100), (255, 150, 80, 255))
 
-        if cls._cached_winter_char is None:
-            try:
-                winter_char = Image.open(cls.WINTER_CHAR_IMAGE_PATH).convert('RGBA')
-                # 预处理：调整大小和透明度（缩小以适应720p）
-                winter_char_resized = winter_char.resize((367, 533))  # 从550x800缩小
-                # 使用PIL的内置方法调整透明度，比逐像素快得多
-                alpha = winter_char_resized.split()[3]  # 获取alpha通道
-                alpha = alpha.point(lambda p: int(p * 0.65))  # 批量处理透明度
-                winter_char_resized.putalpha(alpha)
-                cls._cached_winter_char_alpha = winter_char_resized
-            except (FileNotFoundError, IOError) as e:
-                logger.warning(f"加载冬季角色图片失败: {e}")
-                cls._cached_winter_char_alpha = Image.new('RGBA', (367, 533), (150, 200, 255, 165))
-
-        return cls._cached_bird_image, cls._cached_winter_char_alpha
+        return cls._cached_logo_image
 
     @classmethod
     def _get_font(cls, size: int) -> ImageFont.FreeTypeFont:
@@ -243,7 +227,7 @@ class ScheduleImageGenerator:
             width: 请求的图片宽度
 
         Returns:
-            (实际宽度, 实际高度, 鸟图片, 冬季角色图片)
+            (实际宽度, 实际高度, 鸟图片)
         """
         # 使用默认值或限制最大分辨率
         if width is None:
@@ -256,23 +240,21 @@ class ScheduleImageGenerator:
         height = min(height, cls.MAX_HEIGHT)
 
         # 使用缓存加载图片资源（性能优化）
-        bird, winter_char_alpha = cls._load_images()
+        logo = cls._load_images()
 
-        return width, height, bird, winter_char_alpha
+        return width, height, logo
 
     @classmethod
     def _create_base_canvas(
         cls,
         width: int,
         height: int,
-        winter_char_alpha: Any
     ) -> Tuple[Any, Any, Any]:
-        """创建基础画布：背景渐变、纹理、冬季角色、雪花
+        """创建基础画布：背景渐变、纹理、雪花（v4.5.0：冬季角色素材已移除）
 
         Args:
             width: 画布宽度
             height: 画布高度
-            winter_char_alpha: 冬季角色图片（已预处理）
 
         Returns:
             (主图像, draw对象, overlay图像)
@@ -301,21 +283,8 @@ class ScheduleImageGenerator:
         overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw_overlay = ImageDraw.Draw(overlay)
 
-        # 添加冬季角色（根据分辨率缩放）
-        char_scale = width / 1280
-        char_x = int(width - 400 * char_scale)
-        char_y = int(height - 553 * char_scale)
-
-        if char_scale != 1.0:
-            new_char_width = int(367 * char_scale)
-            new_char_height = int(533 * char_scale)
-            winter_char_scaled = winter_char_alpha.resize((new_char_width, new_char_height))
-            img.paste(winter_char_scaled, (char_x, char_y), winter_char_scaled)
-            del winter_char_scaled
-        else:
-            img.paste(winter_char_alpha, (char_x, char_y), winter_char_alpha)
-
         # 绘制雪花装饰
+        char_scale = width / 1280
         snowflake_count_large = int(12 * char_scale)
         snowflake_count_small = int(25 * char_scale)
 
@@ -408,7 +377,7 @@ class ScheduleImageGenerator:
         title: str,
         width: int,
         height: int,
-        bird: Any
+        logo: Any
     ) -> Any:
         """绘制标题区域：头像、标题、副标题、装饰线
 
@@ -419,7 +388,7 @@ class ScheduleImageGenerator:
             title: 标题文字
             width: 画布宽度
             height: 画布高度
-            bird: 鸟图片
+            logo: 头像图片
 
         Returns:
             更新后的overlay对象
@@ -432,22 +401,22 @@ class ScheduleImageGenerator:
         draw_overlay = ImageDraw.Draw(overlay)
 
         # 绘制小鸟头像
-        bird_size = int(90 * font_scale)
-        bird_avatar = bird.resize((bird_size, bird_size))
-        mask = Image.new('L', (bird_size, bird_size), 0)
+        logo_size = int(90 * font_scale)
+        logo_avatar = logo.resize((logo_size, logo_size))
+        mask = Image.new('L', (logo_size, logo_size), 0)
         mask_draw = ImageDraw.Draw(mask)
-        mask_draw.ellipse([0, 0, bird_size, bird_size], fill=255)
+        mask_draw.ellipse([0, 0, logo_size, logo_size], fill=255)
 
-        bird_avatar_circle = Image.new('RGBA', (bird_size, bird_size), (0, 0, 0, 0))
-        bird_avatar_circle.paste(bird_avatar, (0, 0), mask)
-        del bird_avatar, mask, mask_draw
+        logo_avatar_circle = Image.new('RGBA', (logo_size, logo_size), (0, 0, 0, 0))
+        logo_avatar_circle.paste(logo_avatar, (0, 0), mask)
+        del logo_avatar, mask, mask_draw
 
         # 头像光晕
         for r in range(int(55 * font_scale), 0, int(-8 * font_scale)):
             alpha = int(100 * (r / 55))
             draw_overlay.ellipse(
                 [int(70 * font_scale) - r, title_y - r,
-                 int(160 * font_scale) + r, title_y + bird_size + r],
+                 int(160 * font_scale) + r, title_y + logo_size + r],
                 fill=(180, 210, 255, alpha)
             )
 
@@ -456,7 +425,7 @@ class ScheduleImageGenerator:
         draw_overlay = ImageDraw.Draw(overlay)
 
         draw.ellipse([70, title_y, 160, title_y + 90], outline=(150, 200, 255), width=4)
-        img.paste(bird_avatar_circle, (70, title_y), bird_avatar_circle)
+        img.paste(logo_avatar_circle, (70, title_y), logo_avatar_circle)
 
         # 绘制标题
         title_x = 180
@@ -731,16 +700,16 @@ class ScheduleImageGenerator:
 
         try:
             # 1️⃣ 准备资源：验证参数、加载图片、计算尺寸
-            width, height, bird, winter_char_alpha = cls._prepare_resources(width)
+            width, height, logo = cls._prepare_resources(width)
 
-            # 2️⃣ 创建基础画布：背景渐变、纹理、冬季角色、雪花
-            img, draw, overlay = cls._create_base_canvas(width, height, winter_char_alpha)
+            # 2️⃣ 创建基础画布：背景渐变、纹理、雪花
+            img, draw, overlay = cls._create_base_canvas(width, height)
 
             # 3️⃣ 计算要显示的日程项：固定5个，当前/下一个在第3个位置
             display_items, display_target_index = cls._calculate_display_items(schedule_items)
 
             # 4️⃣ 绘制标题区域：头像、标题、副标题、装饰线
-            overlay = cls._draw_title_area(img, draw, overlay, title, width, height, bird)
+            overlay = cls._draw_title_area(img, draw, overlay, title, width, height, logo)
 
             # 5️⃣ 绘制日程卡片：遍历日程项，绘制卡片、图标、文字、状态
             if display_items:
