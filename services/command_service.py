@@ -2,6 +2,9 @@
 
 通过 ``self._plugin.ctx.send.text(...) / ctx.send.image(...)`` 发送消息，
 通过 host 注入的 ``user_id`` / ``stream_id`` 解析上下文，无须再访问 ``self.message``。
+
+v4.5.0：长文本返回（status / help / list 降级）改为「头部 + 正文」两条
+合并转发（``ctx.send.forward``），避免长文本刷屏；短消息保持普通文本。
 """
 
 from datetime import timedelta
@@ -157,6 +160,47 @@ class CommandService:
             return
         await self._plugin.ctx.send.text(text, stream_id)
 
+    async def _send_forward_split(self, stream_id: str, header: str, body: str) -> None:
+        """把「头部固定输出 + 剩余正文」切成两条消息合并转发，避免长文本刷屏。
+
+        v4.5.0 重构：/plan 系列命令的长文本返回（status / help / list 降级等）
+        不再直接以单条长文本发送，而是拆成两条合并转发消息：
+
+        - 第 1 条：头部固定输出（如 ``📅 今日日程 2026-05-25 周一 / 共 N 项活动``）
+        - 第 2 条：剩余正文（如逐条活动明细）
+
+        通过 ``ctx.send.forward`` 合并转发为一条转发气泡；若转发失败
+        （平台不支持 / RPC 异常）则回退为普通文本发送，保证功能可用。
+
+        Args:
+            stream_id: 目标消息流 ID。
+            header: 头部固定输出文本。
+            body: 剩余正文文本。
+        """
+        if not stream_id:
+            logger.warning("无 stream_id，跳过合并转发")
+            return
+
+        # 组装转发消息：两条，头部 + 正文（兼容 cateye_skland_sign 已验证的消息格式）
+        messages: List[Dict[str, Any]] = [
+            {
+                "user_id": "0",
+                "nickname": "日程规划",
+                "segments": [{"type": "text", "content": header}],
+            },
+            {
+                "user_id": "0",
+                "nickname": "日程规划",
+                "segments": [{"type": "text", "content": body}],
+            },
+        ]
+        try:
+            await self._plugin.ctx.send.forward(messages, stream_id)
+            logger.info("✅ 已合并转发 %s + %s 字符", len(header), len(body))
+        except Exception as exc:
+            logger.warning(f"合并转发失败，回退为普通文本: {exc}")
+            await self._send(stream_id, f"{header}\n{body}")
+
     def _get_today_schedule_goals(self, goal_manager: Any) -> List[Any]:
         """获取今天的日程目标（沿用 v3 统一方法）。"""
         return goal_manager.get_schedule_goals(chat_id="global")
@@ -191,20 +235,23 @@ class CommandService:
         today = now.strftime("%Y-%m-%d")
         weekday = _WEEKDAY_NAMES[now.weekday()]
 
-        messages = [f"📅 今日日程 {today} {weekday}\n", f"共 {len(schedule_goals)} 项活动\n"]
+        # v4.5.0：头部固定输出（标题 + 统计）切为第一条转发消息
+        header = f"📅 今日日程 {today} {weekday}\n共 {len(schedule_goals)} 项活动"
 
+        # 剩余正文：逐条活动明细
+        body_lines: List[str] = []
         for idx, goal in enumerate(schedule_goals, 1):
             start_minutes, end_minutes = get_time_window_from_goal(goal)
             start_time = format_minutes_to_time(start_minutes)
             end_time = format_minutes_to_time(end_minutes)
             type_emoji = _GOAL_TYPE_EMOJI.get(goal.goal_type, "📌")
 
-            messages.append(f"{idx}. ⏰ {start_time}-{end_time}  {type_emoji} {goal.name}")
+            body_lines.append(f"{idx}. ⏰ {start_time}-{end_time}  {type_emoji} {goal.name}")
             if self._enable_detailed_description and goal.description:
-                messages.append(f"   📝 {goal.description}")
-            messages.append("")  # 空行分隔
+                body_lines.append(f"   📝 {goal.description}")
+            body_lines.append("")  # 空行分隔
 
-        await self._send(stream_id, "\n".join(messages))
+        await self._send_forward_split(stream_id, header, "\n".join(body_lines).rstrip())
 
     async def _handle_list(self, stream_id: str) -> None:
         """``/plan list``：图片格式显示今日日程。"""
@@ -250,15 +297,16 @@ class CommandService:
             logger.info("✅ 日程图片已发送（base64）")
         except Exception as exc:
             logger.error(f"发送图片失败: {exc}，降级为文本输出", exc_info=True)
-            # 降级方案：文本输出
+            # 降级方案：文本输出（v4.5.0：头部 + 明细合并转发）
             try:
-                fallback = ["📅 今日日程详情\n"]
+                header = "📅 今日日程详情"
+                body_lines: List[str] = []
                 for item in schedule_items:
-                    fallback.append(f"  ⏰ {item['time']}  {item['name']}")
+                    body_lines.append(f"  ⏰ {item['time']}  {item['name']}")
                     if self._enable_detailed_description and item["description"]:
-                        fallback.append(f"     {item['description']}")
-                    fallback.append("")
-                await self._send(stream_id, "\n".join(fallback))
+                        body_lines.append(f"     {item['description']}")
+                    body_lines.append("")
+                await self._send_forward_split(stream_id, header, "\n".join(body_lines).rstrip())
             except Exception as exc2:
                 logger.error(f"文本输出也失败: {exc2}", exc_info=True)
 
@@ -394,10 +442,9 @@ class CommandService:
             await self._send(stream_id, "❌ 清理失败")
 
     async def _show_help(self, stream_id: str) -> None:
-        """显示帮助。"""
-        help_text = """🤖 日程规划系统
-
-📋 命令列表:
+        """显示帮助（v4.5.0：头部 + 命令说明合并转发）。"""
+        header = "🤖 日程规划系统\n\n请选择要查看的命令："
+        body = """📋 命令列表:
 /plan status - 查看今日日程（详细文字格式，含描述）
 /plan list - 查看今日日程（美观图片格式）
 /plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
@@ -434,4 +481,4 @@ class CommandService:
 - regenerate 会丢弃今天已有日程并重新生成，操作不可逆
 - clear 命令会自动保留今天的日程
 """
-        await self._send(stream_id, help_text)
+        await self._send_forward_split(stream_id, header, body)
