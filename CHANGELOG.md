@@ -50,9 +50,14 @@
   `_apply_no_sleep_postprocess` 后处理强制转换为"无所事事"。
 - **/plan 命令返回改合并转发**：`/plan status`、`/plan help`、`/plan list`
   降级文本等长文本返回不再直接刷屏，改为构造**单条完整消息**（内容不切割）
-  并通过 `ctx.send.forward` 合并转发（`ctx.send.forward`）发出；短消息
+  并通过 `ctx.send.forward` 合并转发发出（消息格式参考
+  deepseek-v4-pro_system-info-plugin 的 `/sys` 命令）；短消息
   （权限 / 删除 / 清理 / 错误提示）保持普通文本。转发失败时自动回退为
   普通文本，不影响功能。
+- **修复合并转发不生效**：`_manifest.json` 的 `capabilities` 此前**缺少
+  `send.forward` 能力声明**，导致主程序拒绝/降级 `send.forward` 调用，
+  `/plan` 长文本实际仍以单条普通消息发出。已补充 `send.forward` 声明
+  （现共 14 项能力），与 `/sys` 等已验证插件保持一致。
 
 ### 重构
 
