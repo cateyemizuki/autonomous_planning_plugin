@@ -1,4 +1,4 @@
-"""Schedule Generator Module (Refactored).
+﻿"""Schedule Generator Module (Refactored).
 
 重构版本：使用组件化设计，遵循SOLID原则
 - 职责单一：每个类只负责一件事
@@ -16,7 +16,7 @@
 
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 import logging
 
@@ -691,6 +691,11 @@ class ScheduleGenerator:
 
                 # 验证和评分
                 validated_items, warnings = self.validator.validate(raw_items)
+
+                # v4.5.0：无睡眠模式后处理（把漏网的睡眠类活动改为无所事事）
+                validated_items, sleep_warnings = self._apply_no_sleep_postprocess(validated_items)
+                warnings.extend(sleep_warnings)
+
                 score = self.quality_scorer.calculate_score(validated_items, warnings)
 
                 logger.debug(f"📊 第{round_num}轮质量分数: {score:.2f}")
@@ -754,6 +759,10 @@ class ScheduleGenerator:
         # 验证
         validated_items, warnings = self.validator.validate(raw_items)
 
+        # v4.5.0：无睡眠模式后处理（把漏网的睡眠类活动改为无所事事）
+        validated_items, sleep_warnings = self._apply_no_sleep_postprocess(validated_items)
+        warnings.extend(sleep_warnings)
+
         if warnings:
             logger.warning(f"语义验证发现 {len(warnings)} 个问题")
             for warning in warnings[:3]:
@@ -765,8 +774,48 @@ class ScheduleGenerator:
         logger.info(f"✅ 生成 {len(schedule_items)} 个日程项")
         return schedule_items
 
+    def _apply_no_sleep_postprocess(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """v4.5.0：无睡眠模式后处理。
+
+        prompt 层已要求不生成睡眠类活动，但 LLM 偶尔会漏网。此方法把
+        仍带有睡眠语义的活动改为"无所事事"（自由活动 / 放空），保证
+        开启 ``no_sleep_mode`` 后日程中绝不出现睡眠活动。
+
+        Args:
+            items: validator 校验后的日程项字典列表。
+
+        Returns:
+            (处理后的列表, 附加警告列表)。
+        """
+        if not bool(getattr(self.config, "no_sleep_mode", False)):
+            return items, []
+
+        sleep_keywords = ("睡觉", "睡眠", "安睡", "睡午觉", "小憩", "补觉", "入睡", "瞌睡", "就寝", "夜间睡眠")
+        converted = 0
+        for item in items:
+            name = str(item.get("name", "") or "")
+            if any(kw in name for kw in sleep_keywords):
+                item["name"] = "无所事事"
+                item["goal_type"] = "rest"
+                item["description"] = "放空发呆，什么也不做，享受一段没有安排的时间"
+                converted += 1
+
+        warnings = []
+        if converted:
+            warnings.append(f"无睡眠模式：已将 {converted} 个睡眠类活动改为'无所事事'")
+            logger.info(f"😴→🛋️ 无睡眠模式：转换了 {converted} 个睡眠类活动为无所事事")
+        return items, warnings
+
     async def _call_llm(self, prompt: str) -> List[Dict[str, Any]]:
         """调用 LLM 并解析响应（v4：通过 ctx.llm.generate）
+
+        v4.5.0 修复（issue #9）：``generation_timeout`` 配置此前只做了校验
+        从未生效，SDK 层 RPC 默认 30 秒就超时，而主程序模型配置可能设了更长
+        超时。现在把 ``generation_timeout``（秒）换算为 ``timeout_ms`` 传给
+        ``ctx.llm.generate``，让超时真正可配置。
 
         Args:
             prompt: 提示词
@@ -784,11 +833,16 @@ class ScheduleGenerator:
         if self._plugin is None:
             raise LLMError("ScheduleGenerator 未注入 plugin 实例，无法调用 ctx.llm.generate")
 
+        # v4.5.0：把配置的生成超时（秒）转换为 timeout_ms 传给 SDK RPC 层，
+        # 避免被 SDK/Host 默认 30s 超时截断（issue #9）。
+        timeout_ms = int(float(self.config.generation_timeout) * 1000)
+
         llm_result = await self._plugin.ctx.llm.generate(
             prompt=prompt,
             model=task_name,
             max_tokens=max_tokens,
             temperature=temperature,
+            timeout_ms=timeout_ms,
         )
         success = bool(llm_result.get("success", False))
         response = str(llm_result.get("response", ""))
