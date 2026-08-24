@@ -117,6 +117,7 @@ async def judge_schedule_request(
     model: str,
     temperature: float = 0.3,
     max_tokens: int = 2000,
+    timeout_ms: Optional[int] = None,
     log_dir: Optional[Path] = None,
     log_enabled: bool = True,
 ) -> Optional[Dict[str, Any]]:
@@ -132,6 +133,7 @@ async def judge_schedule_request(
         model: 主程序 model_config 中的任务名。
         temperature: LLM 温度。
         max_tokens: LLM 最大 tokens。
+        timeout_ms: v4.5.0 新增；LLM 调用 RPC 超时（毫秒）。``None`` 使用 SDK/Host 默认。
         log_dir: LLM 调用归档目录；为 None 时不归档。
         log_enabled: 是否开启归档。
 
@@ -148,11 +150,17 @@ async def judge_schedule_request(
     )
 
     try:
+        # v4.5.0：透传 timeout_ms（由调用方 tools_service 从 generation_timeout 换算），
+        # 避免角色裁判被 SDK/Host 默认 30s 超时截断（issue #9）。
+        llm_kwargs: Dict[str, Any] = {}
+        if timeout_ms is not None and timeout_ms > 0:
+            llm_kwargs["timeout_ms"] = timeout_ms
         result = await plugin.ctx.llm.generate(
             prompt=prompt,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            **llm_kwargs,
         )
     except Exception as exc:
         logger.warning(f"角色裁判 LLM 调用失败: {exc}")
