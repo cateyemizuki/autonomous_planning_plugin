@@ -1,4 +1,4 @@
-"""麦麦自主规划插件 v4 - 主入口
+﻿"""麦麦自主规划插件 v4 - 主入口
 
 完整 7 个组件外壳，业务逻辑下沉到 ``services/``。
 
@@ -269,6 +269,11 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             "timezone": cfg.timezone,
             "llm_task_name": cfg.llm_task_name,
             "recent_schedule_days": cfg.recent_schedule_days,
+            # v4.5.0（issue #12）：自定义日程时间范围
+            "day_start_time": cfg.day_start_time,
+            "day_end_time": cfg.day_end_time,
+            # v4.5.0：无睡眠模式
+            "no_sleep_mode": cfg.no_sleep_mode,
             "bot_profile": dict(self._bot_profile) if self._bot_profile else {},
         }
 
