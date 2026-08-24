@@ -1,4 +1,4 @@
-"""Schedule Generator Configuration Module.
+﻿"""Schedule Generator Configuration Module.
 
 This module provides centralized configuration management for schedule generation,
 following the DRY principle by avoiding repeated config.get() calls.
@@ -78,6 +78,13 @@ class ScheduleGeneratorConfig:
         # === 自定义Prompt ===
         self.custom_prompt = config_dict.get('custom_prompt', '').strip()
 
+        # === v4.5.0（issue #12）：自定义日程时间范围 ===
+        self.day_start_time = str(config_dict.get('day_start_time', '') or '').strip()
+        self.day_end_time = str(config_dict.get('day_end_time', '') or '').strip()
+
+        # === v4.5.0：无睡眠模式 ===
+        self.no_sleep_mode = bool(config_dict.get('no_sleep_mode', False))
+
         # === 缓存配置 ===
         self.cache_ttl = config_dict.get('cache_ttl', 300)
         self.cache_max_size = config_dict.get('cache_max_size', 100)
@@ -154,6 +161,18 @@ class ScheduleGeneratorConfig:
                 f"generation_timeout 必须≥10秒，当前值: {self.generation_timeout}"
             )
 
+        # v4.5.0（issue #12）：校验 day_start_time / day_end_time 格式（HH:MM）
+        for field_name, value in (("day_start_time", self.day_start_time), ("day_end_time", self.day_end_time)):
+            if not value:
+                continue
+            try:
+                hh, mm = str(value).split(":", 1)
+                hour, minute = int(hh), int(mm)
+            except (ValueError, IndexError) as exc:
+                raise ValueError(f"{field_name} 格式错误: {value!r}（应为 HH:MM）") from exc
+            if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+                raise ValueError(f"{field_name} 时间非法: {value!r}（应为 HH:MM，时 0-23 分 0-59）")
+
     @property
     def target_description_length(self) -> int:
         """目标描述长度（中位数）
@@ -195,6 +214,11 @@ class ScheduleGeneratorConfig:
             'max_tokens': self.max_tokens,
             'generation_timeout': self.generation_timeout,
             'custom_prompt': self.custom_prompt,
+            # v4.5.0（issue #12）
+            'day_start_time': self.day_start_time,
+            'day_end_time': self.day_end_time,
+            # v4.5.0：无睡眠模式
+            'no_sleep_mode': self.no_sleep_mode,
             'cache_ttl': self.cache_ttl,
             'cache_max_size': self.cache_max_size,
             # v4 新增：LLM 任务名 + bot 全局配置 + 时区
