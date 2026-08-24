@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.4.5",
+  "version": "4.5.0",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.4.5: 约定到点真发出（强指令模板）+ /plan regenerate 命令 + ScheduleGenerator 配置单一来源（修 auto_scheduler 漏带 bot_profile）。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.5.0: 兼容 MaiBot v1.1.0 + LLM 调用超时可配置 + custom_prompt 作为日程演化主信号 + 支持自定义日程时间范围 + 无睡眠模式（No Sleep Mode）。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"
@@ -13,13 +13,21 @@
   },
   "host_application": {
     "min_version": "1.0.0",
-    "max_version": "1.0.0"
+    "max_version": "1.99.99"
   },
   "sdk": {
     "min_version": "2.0.0",
     "max_version": "2.99.99"
   },
   "dependencies": [],
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "logo.jpg",
+      "fallback": "logo",
+      "background": "#F0F5FC"
+    }
+  },
   "capabilities": [
     "send.text",
     "send.image",
