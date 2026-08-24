@@ -262,13 +262,26 @@ class ScheduleAutoScheduler:
             "如果基础要求存在，必须兼容且优先满足。"
         )
 
-        prompt = (
-            f"{instruction}\n\n"
-            f"目标日期：{target_date} {target_weekday}\n"
-            f"基础固定要求（可为空）：{base_prompt if base_prompt else '无'}\n\n"
-            f"最近日程历史：\n{history_summary}\n\n"
-            "请直接输出策略提示词正文："
-        )
+        # v4.5.0（issue #11）：custom_prompt 是"角色的长期状态/生活阶段"，是推断的
+        # 主信号而非次要信息 —— 把它从末位提到首位并标注语义，让 LLM 清楚知道
+        # 策略必须延续这个长期状态，日程历史只是它的具体表现。
+        if base_prompt:
+            prompt = (
+                f"{instruction}\n\n"
+                f"目标日期：{target_date} {target_weekday}\n"
+                f"【角色的长期状态】这是角色正在经历的持续人生阶段，策略必须延续：\n"
+                f"{base_prompt}\n\n"
+                f"最近日程历史（长期状态的具体表现）：\n{history_summary}\n\n"
+                "请直接输出策略提示词正文："
+            )
+        else:
+            prompt = (
+                f"{instruction}\n\n"
+                f"目标日期：{target_date} {target_weekday}\n"
+                "基础固定要求（可为空）：无\n\n"
+                f"最近日程历史：\n{history_summary}\n\n"
+                "请直接输出策略提示词正文："
+            )
 
         try:
             model_helper = BaseScheduleGenerator(goal_manager, schedule_config)
@@ -280,11 +293,15 @@ class ScheduleAutoScheduler:
             if self.plugin is None or not hasattr(self.plugin, "ctx"):
                 raise RuntimeError("ScheduleAutoScheduler 未注入 plugin 实例，无法调用 ctx.llm.generate")
 
+            # v4.5.0：推断链路同样把配置超时传给 SDK RPC 层（issue #9）
+            timeout_ms = int(float(schedule_config.get("generation_timeout", 180.0)) * 1000)
+
             llm_result = await self.plugin.ctx.llm.generate(
                 prompt=prompt,
                 model=task_name,
                 max_tokens=infer_max_tokens,
                 temperature=infer_temperature,
+                timeout_ms=timeout_ms,
             )
             success = bool(llm_result.get("success", False))
             response = str(llm_result.get("response", ""))
@@ -315,11 +332,31 @@ class ScheduleAutoScheduler:
             return False
 
     def _get_effective_custom_prompt(self, today: str, fallback_prompt: str) -> str:
+        """合并推断结果与配置的 custom_prompt（v4.5.0，issue #11）。
+
+        此前推断结果存在时直接覆盖配置的 custom_prompt，导致用户在配置里填的
+        "长期状态"（如"我正在环游世界"）被丢弃。现在改为**合并**：
+
+        - 有当日推断结果 + 配置了 custom_prompt → ``推断结果 + 【底层的长期状态】配置值``
+        - 有当日推断结果 + 未配置 → 仅用推断结果
+        - 无推断结果 → 回退配置值
+
+        Args:
+            today: ``YYYY-MM-DD`` 今日日期。
+            fallback_prompt: 配置的 custom_prompt（可为空串）。
+
+        Returns:
+            最终生效的 custom_prompt 字符串。
+        """
         inferred_date = str(self._inferred_prompt_cache.get("target_date", "") or "")
         inferred_prompt = str(self._inferred_prompt_cache.get("prompt", "") or "").strip()
+        configured_prompt = str(fallback_prompt or "").strip()
+
         if inferred_date == today and inferred_prompt:
+            if configured_prompt:
+                return f"{inferred_prompt}\n\n【底层的长期状态】{configured_prompt}"
             return inferred_prompt
-        return fallback_prompt
+        return configured_prompt
 
     async def _schedule_loop(self):
         """
