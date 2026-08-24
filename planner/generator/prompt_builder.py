@@ -1,4 +1,4 @@
-"""Prompt Builder Module.
+﻿"""Prompt Builder Module.
 
 This module provides prompt building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
@@ -109,6 +109,13 @@ class PromptBuilder:
         # 读取自定义prompt配置
         custom_prompt = self.config.get('custom_prompt', '').strip()
 
+        # v4.5.0（issue #12）：自定义日程时间范围（day_start_time / day_end_time）
+        day_start_time = str(self.config.get('day_start_time', '') or '').strip()
+        day_end_time = str(self.config.get('day_end_time', '') or '').strip()
+
+        # v4.5.0：无睡眠模式
+        no_sleep_mode = bool(self.config.get('no_sleep_mode', False))
+
         # 使用时区管理器获取时间信息
         today = self.tz_manager.get_now()
         date_str = today.strftime("%Y-%m-%d")
@@ -182,10 +189,11 @@ class PromptBuilder:
             commit_lines.append("要求：把上述约定安排到合适时间段（与已知作息冲突时优先约定），goal_type 用 social_maintenance 或对应类型。")
             prompt += "\n".join(commit_lines) + "\n"
 
-        # 添加自定义prompt（如果配置了）
+        # 添加自定义prompt（如果配置了）—— v4.5.0（issue #11）：语义从"一次性
+        # 要求"改为"当前生活阶段/长期状态"，与推断链路（auto_scheduler）的口径一致
         if custom_prompt:
             prompt += f"""
-【特殊要求】
+【当前生活阶段与今日重点】
 {custom_prompt}
 """
 
@@ -195,13 +203,36 @@ class PromptBuilder:
         else:
             desc_requirement = "2. description字段填空字符串\"\"即可（不需要描述）"
 
+        # v4.5.0（issue #12）：把自定义日程时间范围作为硬约束注入生成要求
+        time_range_requirement = ""
+        if day_start_time or day_end_time:
+            start_text = day_start_time or "00:00"
+            end_text = day_end_time or "24:00"
+            time_range_requirement = f"""
+🔴 【日程时间范围】本角色的一天日程被限定在 {start_text} - {end_text} 之间！
+   - 所有活动的开始时间（time_slot）不得早于 {start_text}，也不得晚于 {end_text}
+   - 若 {end_text} < {start_text}（跨夜），则活动允许延续到次日 {end_text}
+   - 睡眠/睡前等作息必须安排在这个范围内（例如范围 23:00-07:00 = 23:00 睡到次日 07:00）
+   - 范围外的时段不要安排任何活动
+"""
+
+        # v4.5.0：无睡眠模式 —— 不生成睡眠类活动，原睡眠时段改为"无所事事"
+        no_sleep_requirement = ""
+        if no_sleep_mode:
+            no_sleep_requirement = f"""
+🔴 【无睡眠模式】本角色**不需要睡觉**！
+   - 禁止生成"睡觉 / 睡眠 / 安睡 / 睡午觉 / 小憩补觉"等睡眠类活动（goal_type 不得用 sleep）
+   - 原本属于睡眠的时段改为**无所事事**（自由活动 / 放空 / 发呆 / 发呆放松），goal_type 用 rest / free_time
+   - 凌晨时段（如果日程范围覆盖）同样安排无所事事或安静的休闲活动，而不是睡觉
+   - 一天仍然要无缝衔接，不能因为去掉睡眠就出现大段空档
+"""
+
         prompt += f"""
 【任务】生成今天的详细日程JSON：
 🔴 核心要求：日程必须全天无缝衔接，不允许任何时间空档！
    - 每个活动的结束时间 = 下一个活动的开始时间
    - 计算公式：结束时间 = time_slot + duration_hours
-
-【原则】（重要！）
+{time_range_requirement}{no_sleep_requirement}【原则】（重要！）
 - 作息框架（睡眠 / 三餐 / 起床 / 睡前）每天稳定，是基础保留项 —— 不动这个框架
 - 真实的人 ≠ 日程机器：同一作息框架下，每天的"做什么"与"心情"应有微变化
 - 例：早餐时段不变，但今天可能粥配油条，明天面包黄油；上午时段不变，但今天审稿子，明天写专栏
@@ -231,7 +262,7 @@ class PromptBuilder:
 
         # 如果有自定义prompt，强调一下
         if custom_prompt:
-            prompt += f"6. ⚠️ 优先满足上述【特殊要求】的内容\n"
+            prompt += f"6. ⚠️ 优先延续上述【当前生活阶段与今日重点】的内容\n"
 
         prompt += """
 【活动类型】
