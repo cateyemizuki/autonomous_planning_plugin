@@ -1,4 +1,4 @@
-"""对话上下文缓存模块
+﻿"""对话上下文缓存模块
 
 管理用户的对话历史，支持多轮对话的连续性判断。
 用于智能注入决策，判断是否需要在连续对话中继续注入日程信息。
@@ -254,19 +254,3 @@ class ConversationContextCache:
         if user_id in self.user_contexts:
             del self.user_contexts[user_id]
             logger.debug(f"清除用户对话历史: user={user_id}")
-
-    def get_stats(self) -> Dict[str, int]:
-        """获取缓存统计信息
-
-        Returns:
-            统计信息字典
-        """
-        total_users = len(self.user_contexts)
-        total_turns = sum(len(turns) for turns in self.user_contexts.values())
-
-        return {
-            "total_users": total_users,
-            "total_turns": total_turns,
-            "max_turns": self.max_turns,
-            "ttl": self.ttl
-        }

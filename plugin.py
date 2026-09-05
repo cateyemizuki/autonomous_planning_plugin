@@ -1,12 +1,20 @@
-﻿"""麦麦自主规划插件 v4 - 主入口
+﻿"""麦麦自主规划插件 v4 - 主入口（v4.6.0）
 
 完整 7 个组件外壳，业务逻辑下沉到 ``services/``。
 
 组件总览：
-- 4 个 ``@Tool``      ：manage_goal_v4 / get_planning_status_v4 / generate_schedule_v4 / apply_schedule_v4
+- 4 个 ``@Tool``      ：manage_goal_v4 / get_planning_status_v4 / apply_schedule_v4 / update_schedule_v4
 - 1 个 ``@Command``   ：planning_v4 (``/plan`` 或 ``/规划``)
-- 1 个 ``@EventHandler`` ：autonomous_planner_v4 (ON_START)
-- 1 个 ``@HookHandler``  ：schedule_inject_v4 (maisaka.planner.before_request) ⭐ 注入入口
+- 2 个 ``@HookHandler`` ：schedule_inject_v4 (maisaka.planner.before_request) ⭐ 注入入口
+                         schedule_inject_replyer_v4 (maisaka.replyer.before_request)
+- 1 个 ``@API``       ：get_current_activity（供其他插件读取当前活动）
+
+v4.6.0：
+    - 移除 ``generate_schedule_v4`` 工具（日程生成收敛到 定时调度 / /plan list /
+      /plan regenerate / 角色裁判 today 四条路径）
+    - 移除 ON_START EventHandler（仅剩一条日志，无功能作用）
+    - 配置迁移：day_start_time/day_end_time → sleep_time/wake_time（新作息语义），
+      并清理 auto_generate / inject_mode / 次日推断（infer_*）字段
 """
 
 from collections.abc import Mapping
@@ -15,8 +23,8 @@ from typing import Any, ClassVar, Dict, List, Tuple
 import asyncio
 import logging
 
-from maibot_sdk import API, Command, EventHandler, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
+from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .config_models import AutonomousPlanningV4Config
 from .services import CleanupService, CommandService, InjectService, ProactiveService, ToolsService
@@ -26,22 +34,19 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# v4.0 → v4.1 配置迁移：把 [autonomous_planning.schedule.*] 搬到顶层 [schedule.*]
+# v4.5 → v4.6 配置迁移：作息字段改名 + 失效字段清理
 # ============================================================
 
-_SCHEDULE_SUBKEY = "schedule"
-_INJECT_SUBKEY = "inject"
+def _migrate_v45_to_v46(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """把 v4.5 配置迁移到 v4.6 结构。
 
-
-def _migrate_v40_to_v41(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-    """把旧 ``[autonomous_planning.schedule.xxx]`` 字段搬到顶层 ``[schedule.xxx]``。
-
-    SDK 只展开顶层 PluginConfigBase 子段为 UI section，旧版的三级嵌套结构
-    会让 schedule / inject 段在 WebUI 中不可见。本迁移把它们提到顶层，
-    并保留 ``[autonomous_planning]`` 段下的清理参数原位。
-
-    Args:
-        raw: 用户提供的原始配置字典。
+    - ``day_start_time``（旧语义：一天日程的入睡起点）→ ``sleep_time``；
+      ``day_end_time``（旧语义：日程结束=醒来时刻）→ ``wake_time``；
+    - 移除从未生效的 ``auto_generate``、已弃用的 ``inject_mode``、
+      次日推断（``infer_*``）字段；
+    - 管理员 / 会话白名单 / LLM 日志控制从 ``[schedule]`` 迁到 ``[admin]``；
+    - 主动行为配置从 ``[schedule]`` 迁到 ``[proactive]``，
+      ``proactive_streams`` → ``proactive_other_streams``。
 
     Returns:
         (新配置字典, 是否产生了迁移)。
@@ -49,89 +54,53 @@ def _migrate_v40_to_v41(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     if not isinstance(raw, dict):
         return raw, False
 
-    ap = raw.get("autonomous_planning")
-    if not isinstance(ap, dict):
-        return raw, False
+    changed = False
+    schedule = raw.get("schedule")
+    admin: Dict[str, Any] = dict(raw.get("admin") or {})
+    proactive: Dict[str, Any] = dict(raw.get("proactive") or {})
+    if isinstance(schedule, dict):
+        schedule = dict(schedule)
+        if "day_start_time" in schedule:
+            old = str(schedule.pop("day_start_time") or "").strip()
+            schedule.setdefault("sleep_time", old or "23:00")
+            changed = True
+        if "day_end_time" in schedule:
+            old = str(schedule.pop("day_end_time") or "").strip()
+            schedule.setdefault("wake_time", old or "07:00")
+            changed = True
+        for key in ("auto_generate", "auto_infer_next_day_prompt", "infer_time", "infer_lookback_days",
+                    "infer_max_prompt_chars", "infer_use_completion_signal"):
+            if key in schedule:
+                schedule.pop(key)
+                changed = True
+        # 管理与日志字段迁移
+        for key in ("admin_users", "allowed_streams", "llm_log_enabled", "llm_log_retention_days"):
+            if key in schedule:
+                admin.setdefault(key, schedule.pop(key))
+                changed = True
+        # 主动行为字段迁移
+        if "proactive_streams" in schedule:
+            proactive.setdefault("proactive_other_streams", schedule.pop("proactive_streams"))
+            changed = True
+        for key in ("enable_proactive_trigger", "enable_frequency_modulation"):
+            if key in schedule:
+                proactive.setdefault(key, schedule.pop(key))
+                changed = True
+        raw["schedule"] = schedule
 
-    legacy_schedule = ap.get(_SCHEDULE_SUBKEY)
-    if not isinstance(legacy_schedule, dict):
-        return raw, False
+    inject = raw.get("inject")
+    if isinstance(inject, dict) and "inject_mode" in inject:
+        inject = dict(inject)
+        inject.pop("inject_mode")
+        raw["inject"] = inject
+        changed = True
 
-    cfg = dict(raw)
-    new_ap = dict(ap)
-    new_ap.pop(_SCHEDULE_SUBKEY, None)
-    cfg["autonomous_planning"] = new_ap
+    if admin:
+        raw["admin"] = admin
+    if proactive:
+        raw["proactive"] = proactive
 
-    # 把 schedule.inject 拆出来作为顶层 [inject]
-    legacy_schedule = dict(legacy_schedule)
-    legacy_inject = legacy_schedule.pop(_INJECT_SUBKEY, None)
-
-    # 顶层 [schedule] 合并（保留用户在新位置自定义的字段，冲突时优先新位置）
-    top_schedule = dict(cfg.get(_SCHEDULE_SUBKEY) or {})
-    schedule_conflicts: List[str] = []
-    for k, v in legacy_schedule.items():
-        if k in top_schedule and top_schedule[k] != v:
-            schedule_conflicts.append(k)
-        else:
-            top_schedule.setdefault(k, v)
-    cfg[_SCHEDULE_SUBKEY] = top_schedule
-
-    inject_conflicts: List[str] = []
-    if isinstance(legacy_inject, dict):
-        top_inject = dict(cfg.get(_INJECT_SUBKEY) or {})
-        for k, v in legacy_inject.items():
-            if k in top_inject and top_inject[k] != v:
-                inject_conflicts.append(k)
-            else:
-                top_inject.setdefault(k, v)
-        cfg[_INJECT_SUBKEY] = top_inject
-
-    # 当新旧位置同字段值不一致时，明确告诉用户保留了新位置值（避免静默丢失旧设置）
-    if schedule_conflicts:
-        logger.warning(
-            "v4.0→4.1 配置迁移：schedule 段下列字段在新旧位置都存在但值不同，"
-            "已保留新位置 [schedule.X] 的值，旧位置 [autonomous_planning.schedule.X] 被丢弃：%s",
-            schedule_conflicts,
-        )
-    if inject_conflicts:
-        logger.warning(
-            "v4.0→4.1 配置迁移：inject 段下列字段在新旧位置都存在但值不同，"
-            "已保留新位置 [inject.X] 的值，旧位置 [autonomous_planning.schedule.inject.X] 被丢弃：%s",
-            inject_conflicts,
-        )
-
-    return cfg, True
-
-
-def _downgrade_traditional_inject_mode(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-    """v4.1.1+：``inject_mode='traditional'`` 已移除，自动降级为 ``smart``。
-
-    避免 SDK 的 ``Literal["smart", "rule"]`` 校验拒绝旧用户的 config.toml。
-    traditional 模式的语义（固定模板）已被 smart 模式的关键词预判 + LLM
-    自判断覆盖，无功能损失。
-
-    Args:
-        raw: 用户提供的配置字典（可能已经过 ``_migrate_v40_to_v41``）。
-
-    Returns:
-        (新配置字典, 是否产生了降级)。
-    """
-    if not isinstance(raw, dict):
-        return raw, False
-    inject_section = raw.get(_INJECT_SUBKEY)
-    if not isinstance(inject_section, dict):
-        return raw, False
-    if str(inject_section.get("inject_mode") or "").strip() != "traditional":
-        return raw, False
-    new_inject = dict(inject_section)
-    new_inject["inject_mode"] = "smart"
-    cfg = dict(raw)
-    cfg[_INJECT_SUBKEY] = new_inject
-    logger.warning(
-        "inject_mode='traditional' 在 v4.1.1+ 已移除（语义被 smart 模式覆盖），"
-        "已自动降级为 'smart'"
-    )
-    return cfg, True
+    return raw, changed
 
 
 class AutonomousPlanningPluginV4(MaiBotPlugin):
@@ -149,7 +118,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self._cleanup_svc: CleanupService | None = None
         self._proactive_svc: ProactiveService | None = None
         self._bg_tasks: List[asyncio.Task] = []
-        # v4 新增：bot 全局配置缓存（on_load 时一次性拉取）
+        # bot 全局配置缓存（on_load 时一次性拉取）
         self._bot_profile: Dict[str, str] = {}
 
     # ============================================================
@@ -160,22 +129,21 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self,
         config_data: Mapping[str, Any] | None,
     ) -> tuple[dict[str, Any], bool]:
-        """v4.0 → v4.1 配置迁移 + traditional 模式降级 + 委托 SDK 默认归一化。
+        """v4.5 → v4.6 配置迁移 + 委托 SDK 默认归一化。
 
         SDK 会在 config_data 与默认配置之间 merge，且 extra="ignore" 会丢弃未声明字段。
-        所以这里必须**在 super 之前**把旧 ``[autonomous_planning.schedule.*]`` 搬到顶层，
-        并把 v4.1.1 前已移除的 ``inject_mode='traditional'`` 降级到 ``smart``。
+        所以这里必须**在 super 之前**完成字段改名与失效字段清理。
         """
         raw = dict(config_data) if isinstance(config_data, Mapping) else {}
-        migrated, did_migrate = _migrate_v40_to_v41(raw) if raw else (raw, False)
+        migrated, did_migrate = _migrate_v45_to_v46(raw) if raw else (raw, False)
         if did_migrate:
-            logger.info("检测到 v4.0 旧配置，已迁移 [autonomous_planning.schedule.*] 到顶层 [schedule.*] / [inject.*]")
-
-        # 单独的内部归一化（不依赖 v4.0→4.1 迁移触发）
-        migrated, did_downgrade = _downgrade_traditional_inject_mode(migrated)
+            logger.info(
+                "检测到 v4.5 旧配置，已迁移 day_start_time/day_end_time → "
+                "sleep_time/wake_time，并清理失效字段（auto_generate / inject_mode / 次日推断）"
+            )
 
         normalized, default_changed = super().normalize_plugin_config(migrated)
-        return normalized, did_migrate or did_downgrade or default_changed
+        return normalized, did_migrate or default_changed
 
     # ============================================================
     # 生命周期
@@ -192,7 +160,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         data_dir.mkdir(exist_ok=True)
         db_path = str(data_dir / "goals.db")
 
-        # v4 新增：预拉取 bot 全局配置（personality / bot.nickname 等）一次性缓存
+        # 预拉取 bot 全局配置（personality / bot.nickname 等）一次性缓存
         # PromptBuilder 不再运行时调用 config_api.get_global_config
         self._bot_profile = await self._prefetch_bot_profile()
 
@@ -203,7 +171,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         self._cleanup_svc = CleanupService(self)
         self._proactive_svc = ProactiveService(self)
 
-        # 启动后台任务（清理循环 + 自动调度循环 + 注入缓存预热 + v4.4 主动行为循环）
+        # 启动后台任务（清理循环 + 自动调度循环 + 注入缓存预热 + 主动行为循环）
         self._bg_tasks.append(asyncio.create_task(self._cleanup_svc.run_cleanup_loop()))
         self._bg_tasks.append(asyncio.create_task(self._cleanup_svc.run_scheduler_loop()))
         self._bg_tasks.append(asyncio.create_task(self._inject_svc.preheat_cache()))
@@ -244,11 +212,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         """构建供 ``ScheduleGenerator`` 使用的 dict 配置。
 
         统一所有 ScheduleGenerator 构造入口（``ToolsService`` /
-        ``ScheduleAutoScheduler`` / ``CommandService``）的配置来源，避免出现
-        "部分入口漏带 bot_profile"等路径不一致问题（v4.4.4 修复的 bug 即源于此：
-        ``auto_scheduler`` 原本用 ``self.plugin.config.schedule.model_dump()``
-        构造 config，而 pydantic 模型里不存在 ``bot_profile`` 字段，导致 prompt
-        生成时人设缺失）。
+        ``ScheduleAutoScheduler`` / ``CommandService``）的配置来源。
 
         Returns:
             包含 schedule 段全部强类型字段，以及插件层缓存的 ``bot_profile`` 的
@@ -269,9 +233,9 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             "timezone": cfg.timezone,
             "llm_task_name": cfg.llm_task_name,
             "recent_schedule_days": cfg.recent_schedule_days,
-            # v4.5.0（issue #12）：自定义日程时间范围
-            "day_start_time": cfg.day_start_time,
-            "day_end_time": cfg.day_end_time,
+            # v4.6.0：作息锚点（起床 / 入睡）
+            "wake_time": cfg.wake_time,
+            "sleep_time": cfg.sleep_time,
             # v4.5.0：无睡眠模式
             "no_sleep_mode": cfg.no_sleep_mode,
             "bot_profile": dict(self._bot_profile) if self._bot_profile else {},
@@ -316,7 +280,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         # services 持有 plugin 引用，配置通过 self.config.xxx 动态读取，无需特殊处理
 
     # ============================================================
-    # Tool 组件（4 个，对应 v3 的 4 个 BaseTool 子类）
+    # Tool 组件（4 个）
     # ============================================================
 
     @Tool(
@@ -404,30 +368,6 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         return await self._tools_svc.get_planning_status(**kwargs)
 
     @Tool(
-        "generate_schedule_v4",
-        description="自动生成并应用全局每日/每周/每月计划，使用 LLM 根据 bot 人设智能生成",
-        parameters=[
-            ToolParameterInfo(
-                name="schedule_type",
-                param_type=ToolParamType.STRING,
-                description="日程类型: daily / weekly / monthly",
-                required=True,
-            ),
-            ToolParameterInfo(
-                name="auto_apply",
-                param_type=ToolParamType.BOOLEAN,
-                description="是否立即应用日程（默认 true）",
-                required=False,
-            ),
-        ],
-    )
-    async def handle_generate_schedule(self, **kwargs: Any) -> Dict[str, Any]:
-        """日程生成工具入口。"""
-        if self._tools_svc is None:
-            return {"type": "error", "content": "插件未启用"}
-        return await self._tools_svc.generate_schedule(**kwargs)
-
-    @Tool(
         "apply_schedule_v4",
         description="应用之前生成的日程，将日程项转换为全局可执行的目标",
         parameters=[
@@ -498,26 +438,6 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         )
 
     # ============================================================
-    # EventHandler 组件（ON_START 用作启动信号；POST_LLM 不再使用，见 POC_RESULT.md）
-    # ============================================================
-
-    @EventHandler(
-        "autonomous_planner_v4",
-        description="启动事件处理器：用于配合主程序生命周期发出启动日志",
-        event_type=EventType.ON_START,
-        intercept_message=False,
-        weight=10,
-    )
-    async def handle_on_start(self, **kwargs: Any) -> Tuple[bool, bool, Any, Any, Any]:
-        """主程序 ON_START 事件回调。
-
-        所有后台任务已在 ``on_load`` 中启动，这里仅做日志确认。
-        """
-        del kwargs
-        logger.info("[v4] 收到 ON_START 事件，后台任务运行中")
-        return True, True, None, None, None
-
-    # ============================================================
     # API 组件（对外暴露，可被其他插件通过 ctx.api.call 调用）
     # ============================================================
 
@@ -541,7 +461,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
                 chat_id="global",
             )
             if snapshot["has_activity"]:
-                print(snapshot["activity"]["name"])  # 例如 "睡前刷手机"
+                print(snapshot["activity"]["name"])  # 例如 "无所事事"
 
         Args:
             chat_id: 可选的会话 ID 过滤；默认 ``global``（与日程注入一致）。
@@ -563,7 +483,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         return await self._inject_svc.get_current_activity_snapshot(chat_id or "global")
 
     # ============================================================
-    # HookHandler 组件（v4 注入入口，替代 v3 的 POST_LLM）
+    # HookHandler 组件（注入入口）
     # ============================================================
 
     @HookHandler(
@@ -588,9 +508,6 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             **kwargs,
         )
 
-    # v4.4.0 恢复：v4.3.1 误删此 HookHandler，但主程序 5/21 已通过 commit 478256f2
-    # （feat: 支持回复器 Hook 指定模型）补上 ``maisaka.replyer.before_request`` hook。
-    # 现在该 hook 实际可用，恢复 replyer 阶段注入。
     @HookHandler(
         "maisaka.replyer.before_request",
         name="schedule_inject_replyer_v4",

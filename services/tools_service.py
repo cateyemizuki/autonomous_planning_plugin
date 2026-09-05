@@ -1,4 +1,4 @@
-"""目标管理 / 日程生成 / 状态查询 / 应用日程的工具业务实现。
+﻿"""目标管理 / 日程生成 / 状态查询 / 应用日程的工具业务实现。
 
 通过 ``self._plugin.config`` 强类型访问插件配置，通过 ``self._plugin.ctx``
 访问 SDK 能力代理；LLM 调用经 ``ctx.llm.generate`` 走主程序 model_config。
@@ -501,70 +501,7 @@ class ToolsService:
             return {"type": "error", "content": f"获取状态失败: {exc}"}
 
     # ------------------------------------------------------------
-    # Tool 3：generate_schedule
-    # ------------------------------------------------------------
-
-    async def generate_schedule(self, **function_args: Any) -> Dict[str, Any]:
-        """生成并应用日程。"""
-        try:
-            schedule_type_str = function_args.get("schedule_type", "daily")
-            auto_apply = bool(function_args.get("auto_apply", True))
-            chat_id = "global"
-            user_id = "system"
-
-            goal_manager = get_goal_manager()
-            schedule_config = self._build_schedule_config()
-            schedule_generator = ScheduleGenerator(goal_manager, config=schedule_config, plugin=self._plugin)
-            schedule_type = ScheduleType(schedule_type_str)
-
-            if schedule_type == ScheduleType.DAILY:
-                schedule = await schedule_generator.generate_daily_schedule(
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    use_llm=True,
-                )
-            elif schedule_type == ScheduleType.WEEKLY:
-                schedule = await schedule_generator.generate_weekly_schedule(
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    use_llm=True,
-                )
-            elif schedule_type == ScheduleType.MONTHLY:
-                schedule = await schedule_generator.generate_monthly_schedule(
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    use_llm=True,
-                )
-            else:
-                return {"type": "error", "content": f"未知的日程类型: {schedule_type_str}"}
-
-            summary = schedule_generator.get_schedule_summary(schedule)
-
-            if auto_apply:
-                # 若日程已存在，跳过应用
-                if schedule.metadata and schedule.metadata.get("existing"):
-                    return {
-                        "type": "schedule_generated",
-                        "content": f"✅ 今天的日程已经安排好了，一共 {len(schedule.items)} 个活动",
-                    }
-                created_ids = await schedule_generator.apply_schedule(
-                    schedule=schedule,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                )
-                return {
-                    "type": "schedule_generated",
-                    "content": f"✅ 日程生成完成！今天一共安排了 {len(created_ids)} 个活动",
-                }
-
-            return {"type": "schedule_generated", "content": summary}
-
-        except Exception as exc:
-            logger.error(f"生成日程失败: {exc}", exc_info=True)
-            return {"type": "error", "content": f"生成日程失败: {exc}"}
-
-    # ------------------------------------------------------------
-    # Tool 5：update_schedule（角色裁判式更新）
+    # Tool 3：update_schedule（角色裁判式更新）
     # ------------------------------------------------------------
 
     async def update_schedule(self, **function_args: Any) -> Dict[str, Any]:
@@ -621,7 +558,7 @@ class ToolsService:
                 # v4.5.0：角色裁判同样受 generation_timeout 约束（issue #9）
                 timeout_ms=int(float(cfg.generation_timeout) * 1000),
                 log_dir=log_dir,
-                log_enabled=cfg.llm_log_enabled,
+                log_enabled=self._plugin.config.admin.llm_log_enabled,
             )
 
             if parsed is None:

@@ -78,16 +78,12 @@ class ScheduleGeneratorConfig:
         # === 自定义Prompt ===
         self.custom_prompt = config_dict.get('custom_prompt', '').strip()
 
-        # === v4.5.0（issue #12）：自定义日程时间范围 ===
-        self.day_start_time = str(config_dict.get('day_start_time', '') or '').strip()
-        self.day_end_time = str(config_dict.get('day_end_time', '') or '').strip()
+        # === v4.6.0：作息锚点（起床 / 入睡时间） ===
+        self.wake_time = str(config_dict.get('wake_time', '') or '').strip()
+        self.sleep_time = str(config_dict.get('sleep_time', '') or '').strip()
 
         # === v4.5.0：无睡眠模式 ===
         self.no_sleep_mode = bool(config_dict.get('no_sleep_mode', False))
-
-        # === 缓存配置 ===
-        self.cache_ttl = config_dict.get('cache_ttl', 300)
-        self.cache_max_size = config_dict.get('cache_max_size', 100)
 
         # === v4 新增：LLM 任务名 + bot 全局配置（由 plugin 注入） ===
         self.llm_task_name = str(config_dict.get('llm_task_name', 'replyer')).strip() or 'replyer'
@@ -161,8 +157,8 @@ class ScheduleGeneratorConfig:
                 f"generation_timeout 必须≥10秒，当前值: {self.generation_timeout}"
             )
 
-        # v4.5.0（issue #12）：校验 day_start_time / day_end_time 格式（HH:MM）
-        for field_name, value in (("day_start_time", self.day_start_time), ("day_end_time", self.day_end_time)):
+        # v4.6.0：校验 wake_time / sleep_time 格式（HH:MM）
+        for field_name, value in (("wake_time", self.wake_time), ("sleep_time", self.sleep_time)):
             if not value:
                 continue
             try:
@@ -215,12 +211,10 @@ class ScheduleGeneratorConfig:
             'generation_timeout': self.generation_timeout,
             'custom_prompt': self.custom_prompt,
             # v4.5.0（issue #12）
-            'day_start_time': self.day_start_time,
-            'day_end_time': self.day_end_time,
+            'wake_time': self.wake_time,
+            'sleep_time': self.sleep_time,
             # v4.5.0：无睡眠模式
             'no_sleep_mode': self.no_sleep_mode,
-            'cache_ttl': self.cache_ttl,
-            'cache_max_size': self.cache_max_size,
             # v4 新增：LLM 任务名 + bot 全局配置 + 时区
             'llm_task_name': self.llm_task_name,
             'bot_profile': self.bot_profile,

@@ -1,203 +1,176 @@
-# 麦麦自主规划插件 v4 · v4.5.0
+# 麦麦自主规划插件 v4 · v4.6.0
 
-> MaiBot 自主规划插件：让麦麦像真实生活着的人一样，拥有自己的日程、当下在做的事，
-> 回复时贴合生活节奏。本页前半部分是 v4.5.0 新版说明；**后半部分为原版文档，
-> 内容逐字保留**。
-
----
-
-## Fork 溯源
-
-本分支（v4.5.0）的修改主要依据
-[xuqian13/autonomous_planning_plugin](https://github.com/xuqian13/autonomous_planning_plugin)
-的以下 issues：
-
-| Issue | 内容 | 对应改动 |
-|---|---|---|
-| [#14](https://github.com/xuqian13/autonomous_planning_plugin/issues/14) | 请求更新 host_application.max_version 以兼容 MaiBot v1.1.0 | `max_version → 1.99.99` |
-| [#13](https://github.com/xuqian13/autonomous_planning_plugin/issues/13) | MaiBot 1.1.0 兼容：max_version 需要更新 | `max_version → 1.99.99`、`min_version → 1.0.0` |
-| [#12](https://github.com/xuqian13/autonomous_planning_plugin/issues/12) | 可否添加自定义日程（时间范围） | `day_start_time` / `day_end_time` + 无睡眠模式 |
-| [#11](https://github.com/xuqian13/autonomous_planning_plugin/issues/11) | custom_prompt 在推断链路中无效 | custom_prompt 提升为日程演化主信号 |
-| [#9](https://github.com/xuqian13/autonomous_planning_plugin/issues/9) | 模型请求失败（LLM 调用超时） | `generation_timeout` 真正生效 |
-
-各变更的详细说明见 [v4.5.0 新特性](#v450-新特性) 与 [CHANGELOG.md](CHANGELOG.md)。
+> MaiBot 自主规划插件：让麦麦像真实生活着的人一样——有自己的作息、当下正在做的事，
+> 回复时贴合生活节奏，还会主动兑现和你的约定。
+>
+> 🗄️ 旧版说明（v4.5.0 及更早）已归档至 [README_v4.5_归档.md](README_v4.5_归档.md)，
+> 版本变更详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
 ## 目录
 
-- [Fork 溯源](#fork-溯源)
-- [快速上手](#快速上手)
-- [v4.5.0 新特性](#v450-新特性)
-  - [MaiBot v1.1.0 兼容](#maibot-v110-兼容)
-  - [LLM 调用超时可配置](#llm-调用超时可配置)
-  - [custom_prompt = 角色的长期状态](#custom_prompt--角色的长期状态)
-  - [自定义日程时间范围](#自定义日程时间范围)
-  - [无睡眠模式](#无睡眠模式)
-  - [/plan 命令返回合并转发](#plan-命令返回合并转发)
+- [这个插件做什么](#这个插件做什么)
+- [工作原理速览](#工作原理速览)
+- [安装](#安装)
+- [用户命令](#用户命令)
+- [和 bot 的自然语言交互](#和-bot-的自然语言交互)
+- [作息与无睡眠模式](#作息与无睡眠模式)
+- [角色裁判](#角色裁判)
 - [配置说明](#配置说明)
 - [对外 API（其他插件调用）](#对外-api其他插件调用)
+- [常见问题](#常见问题)
 - [开发与维护](#开发与维护)
 - [License](#license)
-- [附录：原版文档（保留）](#附录原版文档保留)
 
 ---
 
-## 快速上手
+## 这个插件做什么
+
+- 🌅 **有作息**：每天由 LLM 按人设自动生成一份覆盖全天、无缝衔接的日程
+  （起床 → 清醒活动 → 入睡 → 睡觉，绕时钟闭环）
+- 🧠 **知道现在在干嘛**：planner 决策和 replyer 回复前都会被注入"当前活动"，
+  语气随活动进度、时段精神状态自然变化
+- 📅 **能记下未来的事**：你说"周六一起打游戏"，角色裁判会判断接不接；
+  接了就记成约定，到那天自动排进日程、到点主动兑现
+- 🌙 **懂跨天**：23:00 入睡的活动，凌晨注入也能识别"还在睡"
+- 🤖 **可选无睡眠模式**：机器人 / AI 类角色可以完全不上床，睡眠时段改为"无所事事"
+- 📊 **一条命令看全天**：`/plan list` 以"图片 + 详细文字"合并转发返回；
+  今天还没生成日程时会自动先生成再展示
+- 📣 **主动行为（可选）**：活动切换时主动开口、睡醒后道早安，学习时少说话、休息时多说话
+
+## 工作原理速览
+
+```
+每日定时(默认 00:30) / /plan list / /plan regenerate / 角色裁判 today
+        │
+        ▼
+  LLM 生成全天日程（多轮 + 质量分，按人设/近几天日程/群聊背景/知识库拼上下文）
+        │
+        ▼
+  goals 表（SQLite）──► 定时清理：过期日程标记完成，超期旧目标删除
+        │
+        ├─► planner / replyer 注入：让 bot 每次说话都"知道自己在干嘛"
+        ├─► 主动行为：活动切换开口 + 按活动类型调节聊天频率（需白名单开启）
+        └─► 对外 API get_current_activity：其他插件读取"当前活动"
+```
+
+## 安装
 
 1. 把整个目录放到 `MaiBot/plugins/xuqian13_autonomous-planning-plugin-v4/`
-2. 确认主程序 `config/model_config.toml` 里 `[model_task_config.planner]` 段已配好
-   （MaiBot 默认自带，`model_list` 至少一个可用模型）
-3. 启动 MaiBot
+2. 确认主程序 `config/model_config.toml` 里插件使用的 LLM 任务组已配置
+   （默认用 `replyer`，可在插件配置里改 `LLM 任务名` 指向其他任务），
+   `model_list` 至少一个可用模型
+3. 启动 MaiBot，首次启动自动创建 `data/goals.db`
 
-首次启动后 `data/goals.db` 自动创建。更多细节见
-[附录：原版文档](#附录原版文档保留) 的「安装」章节。
+> **版本要求**：MaiBot ≥ v1.0.0（v1.1.0 已测试），SDK 2.x。
+> 从 v4.5 及更早版本升级：旧配置会**自动迁移**（`day_start_time/day_end_time`
+> → `sleep_time/wake_time`，失效字段自动清理），无需手动处理。
 
-> **⚠️ 版本要求**：本版本要求 MaiBot ≥ **v1.0.0**（`_manifest.json` 的
-> `host_application.min_version`，与社区其他插件一致），
-> MaiBot v1.1.0 已测试可用（`max_version: 1.99.99`）。
+启动日志里应看到：
 
----
+```
+[v4] 自主规划插件 v4 已加载, data_dir=...
+🧹 麦麦目标清理循环已启动
+📅 自动调度循环已启动
+🌟 活动驱动主动行为循环已启动
+```
 
-## v4.5.0 新特性
+## 用户命令
 
-### MaiBot v1.1.0 兼容
-
-MaiBot v1.1.0 收紧了插件 Host 版本校验：`host_application.max_version` 的
-major + minor 必须与主程序匹配，否则拒绝加载。本版本将：
-
-- `max_version` 从 `1.0.0` 放宽为 **`1.99.99`**
-- `min_version` 更新为实际测试过的最低版本 **`1.0.12`**
-
-插件使用的全部 13 项 capability 与 2 个 Hook
-（`maisaka.planner.before_request` / `maisaka.replyer.before_request`）
-在 v1.0.12 → v1.1.0 之间均无破坏性变更，功能不受影响。
-
-### LLM 调用超时可配置
-
-此前 `generation_timeout` 配置（默认 180 秒）只做了参数校验、从未真正生效：
-SDK/Host 层 RPC 默认 **30 秒**就超时，即使你在主程序模型配置里把超时设成
-60 秒，插件侧的 LLM 调用依然在 30 秒报 `[E_TIMEOUT] 请求 cap.call 超时`。
-
-v4.5.0 起，以下三条 LLM 调用链路都会把 `generation_timeout`（秒）换算为
-`timeout_ms` 传给 SDK：
-
-| 链路 | 位置 |
+| 命令 | 作用 |
 |---|---|
-| 日程生成（多轮） | `ScheduleGenerator._call_llm` |
-| 次日策略推断 | `ScheduleAutoScheduler._infer_next_day_prompt` |
-| 角色裁判（update_schedule） | `judge_schedule_request` |
+| `/plan` 或 `/规划` | 显示帮助 |
+| `/plan list` | **查看今日日程**：合并转发"日程图片 + 详细文字"两条记录；若今天还没有日程，会先提示并自动生成，完成后发送 |
+| `/plan regenerate [要求]` | 删掉今天已有日程并重新生成，可附加临时要求（如 `/plan regenerate 今天生日要庆祝`） |
+| `/plan delete <id或序号>` | 删除指定目标 |
+| `/plan clear [days]` | 清理旧日程，默认仅保留今天 |
+| `/plan help` | 显示帮助 |
 
-默认 180 秒；如需更长（如慢速模型），在插件配置里把
-`[schedule] generation_timeout` 调大即可。
+权限：`admin_users` 留空 = 所有人可用；`allowed_streams` 留空 = 所有会话可用。
+`/plan list` 是否画图、画图超时分别由 `list_draw_image` 与 `image_timeout_seconds`
+控制；绘制失败或超时会**静默**降级为纯文字，不影响使用。
 
-### custom_prompt = 角色的长期状态
+## 和 bot 的自然语言交互
 
-`custom_prompt` 的语义从"一次性要求"升级为**角色的长期生活状态 / 持续阶段**。
-如果你填了"我正在环游世界"，那么：
+bot 的 LLM 可调用 4 个工具，多数场景下直接说话即可：
 
-- **日程生成**：prompt 中的「特殊要求」改名为「当前生活阶段与今日重点」，
-  生成的活动会延续这个方向；
-- **次日推断**：`custom_prompt` 从推断 prompt 的末位提到**首位**，标注为
-  「角色的长期状态」，日程历史降级为「长期状态的具体表现」；
-- **合并而非覆盖**：推断系统生成 `next_day_prompt` 后，配置的
-  `custom_prompt` 不再被丢弃，而是合并为
-  `推断结果 + 【底层的长期状态】配置值`。
-
-这样"备考研究生"的 bot 不会在推断链路里突然"考完了"——长期状态始终是
-日程演化的主信号。
-
-> 💡 兼容性说明：旧配置里"今天想多运动"这类一次性要求现在会被当作
-> "最近想多运动"的持续阶段处理。如果你需要的是**一次性**要求，请使用
-> `/plan regenerate 今天想多运动`（临时叠加，生成后自动还原）。
-
-### 自定义日程时间范围
-
-新增 `[schedule]` 配置项：
-
-| 字段 | 默认 | 说明 |
+| 工具 | 触发说法示例 | 说明 |
 |---|---|---|
-| `day_start_time` | 留空（00:00） | 一天日程从几点开始（HH:MM） |
-| `day_end_time` | 留空（24:00） | 一天日程到几点结束（HH:MM） |
+| `get_planning_status_v4` | "今天有什么安排""你现在在干嘛" | 查询今日日程 |
+| `update_schedule_v4` | "周六一起打游戏""下午别学了" | 走**角色裁判**（见下节），决定改今天 / 记约定 / 拒绝 |
+| `manage_goal_v4` | "记一个目标：每周读完一本书" | 长期目标的增删改查 |
+| `apply_schedule_v4` | （一般不主动触发） | 把 JSON 日程数据落库 |
 
-生成日程时，所有活动的开始时间被**硬约束**在这个范围内。支持跨夜写法：
-`day_start_time = "23:00"` + `day_end_time = "07:00"` 表示 23:00 睡到次日
-07:00，一天的活动只安排在这个区间。
+## 作息与无睡眠模式
 
-**示例**：想规定睡眠时间是"23:00 到次日 07:00"：
+日程由两个**作息锚点**划定（v4.6.0 新语义）：
 
-```toml
-[schedule]
-day_start_time = "23:00"
-day_end_time = "07:00"
-```
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `wake_time` | 07:00 | **起床（睡醒）时间**——清醒活动从这一刻开始排 |
+| `sleep_time` | 23:00 | **入睡时间**——这一刻之后进入睡眠时段，直到次日起床 |
 
----
+- 清醒活动必须落在 `[起床, 入睡]` 区间内；睡眠时段正常模式下安排"睡觉"
+  （跨午夜直接用大于 24h 的累计时长表达，如 23:00 入睡 → 8 小时 → 次日 07:00）
+- 入睡时间早于起床时间（如入睡 03:00 / 起床 11:00）= 跨午夜夜猫子作息，同样支持
+- 生成的提示词示例与时间框架会按你配置的锚点**动态生成**，所见即所得
 
-### 无睡眠模式
+**无睡眠模式**（`no_sleep_mode`，默认关）：开启后全天不出现任何睡眠类活动，
+入睡到起床的时段改为**无所事事**（放空）。提示词与代码后处理双重保证——
+即使 LLM 漏网生成了"睡觉/午休/打盹"，落库前也会被强制转换为"无所事事"。
+适合机器人、AI、非人生物等不需要睡觉的角色设定。
 
-新增配置项 `[schedule] no_sleep_mode`（默认 `false`）。开启后：
+## 角色裁判
 
-- 生成日程时**不安排**"睡觉 / 睡眠 / 安睡 / 睡午觉 / 小憩"等睡眠类活动；
-- 原本属于睡眠的时段改为**无所事事**（自由活动 / 放空），
-  `goal_type` 用 `rest` / `free_time`；
-- 即使 LLM 偶尔漏网生成了睡眠类活动，也会被
-  `_apply_no_sleep_postprocess` 后处理**强制转换**为"无所事事"，
-  保证开启后日程中绝不出现睡眠活动；
-- 一天仍然无缝衔接，不会因为去掉睡眠出现大段空档。
+当用户通过自然语言提出日程请求（"明天下午一起逛街""今晚别学了"）时，
+插件把 **角色人设 + 今天日期 + 当前完整日程 + 请求原文** 交给 LLM，
+让它**扮演 bot 这个角色**判断"我接不接"，输出三选一：
 
-**典型搭配**（issue #12）：规定一天的日程范围 + 无睡眠模式：
+| 判定 | 含义 | 后续动作 |
+|---|---|---|
+| `today` | 接受，调整今天 | 自动重生成今日日程，把请求融入其中 |
+| `future` | 接受未来预约 | 写入候选清单；到了那天生成日程时自动纳入，到点主动兑现 |
+| `reject` | 角色拒绝 | 日程不变，附角色口吻的理由 |
 
-```toml
-[schedule]
-day_start_time = "23:00"
-day_end_time = "07:00"
-no_sleep_mode = true
-```
-
-这样 23:00 - 07:00 这个"本应是睡眠"的时段会被安排成无所事事 / 安静的
-休闲活动，而不是睡觉。
-
-> 💡 适合不需要睡眠的角色设定（机器人、AI、非人生物等）；需要正常作息的
-> 角色请保持默认关闭。
-
-### /plan 命令返回合并转发
-
-`/plan status`、`/plan help`、`/plan list` 降级文本等**长文本返回**不再
-直接刷屏，而是构造**单条完整消息**（内容不切割），通过
-`ctx.send.forward` **合并转发**为一条转发气泡发出。短消息
-（权限提示 / 删除 / 清理 / 错误信息等）保持普通文本发送；若平台不支持
-合并转发，自动回退为普通文本，功能不受影响。
-
----
+裁判不是有求必应——不符合人设、时间冲突太强、语气像玩笑都会被拒。
+判定失败时安全降级为"日程不变"。关闭 `role_judge_enabled` 则跳过裁判，
+所有请求一律记为未来约定。温度由 `role_judge_temperature`（默认 0.3）控制，
+越低越保守。
 
 ## 配置说明
 
-插件配置模型为 `config_models.py`（`AutonomousPlanningV4Config`），WebUI
-显示 4 个 section：
+插件配置模型为 `config_models.py`（`AutonomousPlanningV4Config`），WebUI 显示
+4 个 section，全部字段都有中文 label + 提示：
 
 | Section | 内容 |
 |---|---|
-| 插件 | 开关、配置版本（`config_version` 与插件版本同步） |
-| 后台清理 | 清理间隔、旧目标保留天数 |
-| 日程管理 | 注入开关、生成参数、自定义时间范围、定时、白名单、时区、LLM 日志（主战场） |
-| 智能注入策略 | 注入模式（已弃用）、意图分类、状态分析、冷却 |
+| 插件 | 总开关、配置版本 |
+| 后台清理 | 清理间隔（默认 1h）、旧目标保留天数（默认 30 天） |
+| 日程管理 | 作息锚点、无睡眠模式、注入开关、生成参数、定时生成、跨群上下文、LLM 任务、角色裁判、缓存、`/plan list` 绘图选项 |
+| 智能注入策略 | 意图分类、活动状态分析、注入冷却、闲聊注入概率、对话上下文 |
+| 管理与日志 | 管理员 QQ、会话白名单（注入+命令）、LLM 调用归档与保留天数 |
+| 主动行为 | 群聊/其他会话白名单、触发窗口、活动切换主动发起、早间问好、频率调控 |
 
-v4.5.0 新增/变更的配置字段：
+常用项速查：
 
-- `schedule.custom_prompt` —— label 改为「当前生活阶段 / 长期状态」
-- `schedule.day_start_time` / `schedule.day_end_time` —— 日程时间范围
-- `schedule.no_sleep_mode` —— 无睡眠模式
-- `schedule.generation_timeout` —— 现在真正生效（见上）
+| 想做什么 | 改哪里 |
+|---|---|
+| 规定作息"23 点睡 7 点起" | `sleep_time="23:00"`、`wake_time="07:00"`（默认即是） |
+| 让 bot 不睡觉 | `no_sleep_mode=true` |
+| 换生成用的模型 | `llm_task_name`（对应主程序 model_config 任务名） |
+| 慢模型总超时 | `generation_timeout`（默认 180 秒，v4.5.0 起真正生效） |
+| 只让管理员用命令 | `admin_users` 填 QQ 号（「管理与日志」段；留空 = 所有人） |
+| 只在部分群启用注入和命令 | `allowed_streams`（「管理与日志」段；留空 = 全部会话） |
+| 关闭日程图片 | `list_draw_image=false`（「日程管理」段） |
+| 睡醒后自动道早安 | `enable_morning_greeting=true`（「主动行为」段；可配 `morning_greeting_require_activation` 要求群里有人说话才发） |
+| 圈定主动行为范围 | 群聊填 `proactive_group_ids`（**留空 = 所有群聊**）；私聊/指定会话填 `proactive_other_streams`（`qq:private:789` / `session:xxx`） |
 
-旧版 `[autonomous_planning.schedule.*]` 三级嵌套配置会在加载时自动迁移到
-顶层 `[schedule.*]` / `[inject.*]`，无需手动处理。
-
----
+每个字段在 WebUI 里都有说明；完整字段逐条解释见 CHANGELOG 与项目内文档。
 
 ## 对外 API（其他插件调用）
 
-本插件向其他插件暴露的 API 严格保持兼容（v4.5.0 未做任何变更）：
+本插件向其他插件暴露一个读取接口（13 项 capability，含 `api.call` 供消费方声明）：
 
 ```python
 snapshot = await self.ctx.api.call(
@@ -205,7 +178,9 @@ snapshot = await self.ctx.api.call(
     chat_id="global",
 )
 if snapshot["has_activity"]:
-    print(snapshot["activity"]["name"])
+    print(snapshot["activity"]["name"])         # "晚餐"
+    print(snapshot["activity"]["time_window"])  # "17:30-18:15"
+    print(snapshot["next_activities"][:1])      # [{"time": "18:15", "name": "操场散步"}]
 ```
 
 返回结构：
@@ -221,249 +196,38 @@ if snapshot["has_activity"]:
   },
   "next_activities": [{"time": "18:15", "name": "操场散步"}],
   "as_of": "2026-05-25T18:00:00+08:00",
-  "timezone": "Asia/Shanghai"
+  "timezone": "Asia/Shanghai",
+  "error": null
 }
 ```
 
-完整说明见 [附录：原版文档](#附录原版文档保留) 的「给其他插件用」章节。
+没有当前活动时 `has_activity=false`、`activity=null`。
+接口兼容性分析（MaiTrace / 麦麦绘卷等消费方如何使用、如何用新插件替代本插件）
+见项目配套文档。
 
----
+## 常见问题
+
+| 现象 | 看这里 |
+|---|---|
+| 日程定时生成"未启用" | 检查 `auto_schedule_enabled = true` |
+| LLM 生成一直失败 / 报超时 | 看 `data/llm_logs/fail_schedule_generation_*.txt`（完整 prompt 与响应）；必要时调大 `generation_timeout` |
+| `/plan list` 没有图片 | 图片绘制超时（`image_timeout_seconds`）或被关闭（`list_draw_image`）时会静默降级为文字，属预期行为 |
+| 无睡眠模式下仍出现"午休" | v4.6.0 起关键词表已含午休/打盹/赖床；若仍有漏网活动名，属 LLM 偶发，后处理会在落库前转换 |
+| 麦麦回复从不提当前活动 | 正常——注入文案写了"不要主动提及"，只在被问到 / 强相关时自然带出 |
+| 升级后配置变了 | v4.5 → v4.6 自动迁移作息字段；`inject_mode`、`auto_generate` 等无效字段已移除 |
 
 ## 开发与维护
 
-- **源码结构**：`plugin.py`（组件外壳）→ `services/`（业务）→
-  `planner/`（目标/日程/推断）→ `handlers/inject/`（注入子模块）→
-  `utils/` / `cache/` / `database/` / `core/`。
-- **版本号同步**：修改版本时需同步 3 处——
-  `_manifest.json` 的 `version`、`config_models.py` 的
-  `SUPPORTED_CONFIG_VERSION`、`__init__.py` 的 `__version__`。
-- **变更记录**：每个版本变更请写入 `CHANGELOG.md`。
-- **图标**：`logo.jpg` 位于插件根目录，由 `_manifest.json` 的
-  `display.icon` 引用（`type: "local"`）。
-- **数据目录**：运行时 `data/`（goals.db / llm_logs/）已被 `.gitignore` 排除，
-  不进入版本库。
-
----
+- **源码结构**：`plugin.py`（组件外壳：4 Tool + 1 Command + 2 Hook + 1 API）→
+  `services/`（业务）→ `planner/`（目标 / 日程生成 / 定时 / 裁判）→
+  `handlers/inject/`（注入子算法）→ `utils/` `cache/` `database/` `core/`
+- **版本号同步**：修改版本时需同步 3 处——`_manifest.json` 的 `version`、
+  `config_models.py` 的 `SUPPORTED_CONFIG_VERSION`、`__init__.py` 的 `__version__`
+- **变更记录**：每个版本的变更写入 `CHANGELOG.md`
+- **数据目录**：运行时 `data/`（goals.db / llm_logs/）已被
+  `.gitignore` 排除，不进入版本库
+- **历史文档**：v4.5 及更早的说明见 [README_v4.5_归档.md](README_v4.5_归档.md)
 
 ## License
 
 AGPL-3.0（保留上游 LICENSE 全文；本项目未引入其他来源代码）
-
----
-
-## 附录：原版文档（保留）
-
-> 以下为 v4.4.5 时代的原版 README，**内容逐字保留**，未做任何修改。
-> 其中「项目结构」一节提到的 `tests/run_smoke.py` 在 v4.5.0 已移除。
-
----
-
-# 麦麦自主规划插件 v4
-
-> 让麦麦具备自主规划能力的 MaiBot 插件，通过 LLM 智能生成符合人设的日常生活日程，像真实生活着的人 —— 有自己的日程、有当下在做的事、回复时贴合生活节奏。
-
----
-
-## 这个插件做什么
-
-- 🌅 **有作息**：每天 LLM 自动生成 8-15 个活动，从睡觉、三餐到学习娱乐覆盖全天
-- 🧠 **知道现在在干嘛**：planner 决策和 replyer 回复都能感知"当前活动"
-- 🗣️ **回复贴合状态**：晚上 18 点你问"忙吗"，她会自然带出"刚吃完饭"
-- 📅 **能记下未来的事**：你说"周六一起打游戏"，那天的日程会自动加上这件事
-- ⚖️ **能拒绝离谱请求**：LLM 扮演角色判断 today / future / reject，不是无脑接受
-- 🌙 **懂跨天活动**：23:00 开始的睡眠，凌晨 1 点注入也能识别"还在睡"
-
----
-
-## 装上看到的第一件事
-
-启动 MaiBot，日志里会冒出来：
-
-```
-插件 xuqian13.autonomous-planning-plugin-v4 v4.4.3 加载成功
-[v4] bot_profile 已预拉取: {'personality': '...', 'reply_style': '...', 'bot_name': '...'}
-✅ 智能注入组件已加载 (intent=True, optimizer=True, context=3/600s)
-🧹 麦麦目标清理循环已启动
-📅 自动调度循环已启动
-🌟 活动驱动主动行为循环已启动（v4.4）
-日程定时生成已启动 - 执行时间: 00:30
-```
-
-打开 WebUI 插件配置页，看到 4 个 section：
-
-| Section | 干啥用 |
-|---|---|
-| 插件 | 开关、版本 |
-| 后台清理 | 多久清一次过期目标和日志 |
-| 日程管理 | 注入开关、生成参数、定时、白名单、时区、LLM 日志…（主战场） |
-| 智能注入策略 | 注入模式、意图分类、冷却 |
-
-每个字段都有中文 label + 提示。
-
----
-
-## 三个典型对话
-
-### 📌 让她生成今天的日程
-
-```
-你：帮我生成今天的日程
-麦麦：[generate_schedule_v4 → LLM] 生成了 12 个活动，已经记下了
-你：/plan status
-麦麦：
-  📅 今日日程 2026-05-25 周一  共 12 项活动
-  1. ⏰ 00:00-07:00  🏠 睡觉
-     📝 在温暖的被窝里睡个好觉…
-  2. ⏰ 07:00-07:45  🏠 起床洗漱
-     📝 闹钟一响就爬起来…
-  ...
-```
-
-### 📌 自然贴合当前状态
-
-```
-（18:00 晚餐时段）
-你：你忙吗？
-麦麦：嗯，刚好吃完，要做点什么吗？
-              ↑ 没说"我正在吃饭"，因为 prompt 写了"不要主动提及"
-              只在你问起时自然带出来
-```
-
-### 📌 未来约定
-
-```
-（周三）
-你：周六我们一起去吃章鱼烧
-麦麦：嗯，周六记下了
-       ↑ update_schedule_v4 → 角色裁判 → decision=future
-       → 写入 goals 表 pending_commitment
-
-（周六 00:30）
-[自动调度] 拉到今日 pending → 生成时融入 →
-  14:00 和朋友吃章鱼烧
-[完成后 consume → goal status=completed]
-```
-
----
-
-## 用户命令
-
-| 命令 | 作用 |
-|---|---|
-| `/plan` 或 `/规划` | 显示帮助 |
-| `/plan status` | 今日日程（文字详细） |
-| `/plan list` | 今日日程（图片） |
-| `/plan regenerate [额外要求]` | 重新生成今日日程（先删今天再重生，可附加临时要求） |
-| `/plan delete <id或序号>` | 删除指定目标 |
-| `/plan clear [days]` | 清理旧日程，默认仅保留今天 |
-
-`admin_users` 留空 = 所有人可用；
-`allowed_streams` 留空 = 所有群可用。
-
----
-
-## 给其他插件用
-
-如果你也在写插件、想知道"麦麦现在在做什么"，调一下：
-
-```python
-snapshot = await self.ctx.api.call(
-    "xuqian13.autonomous-planning-plugin-v4.get_current_activity",
-)
-
-if snapshot["has_activity"]:
-    print(snapshot["activity"]["name"])         # "晚餐"
-    print(snapshot["activity"]["time_window"])  # "17:30-18:15"
-    print(snapshot["next_activities"][:1])      # [{"time": "18:15", "name": "操场散步"}]
-```
-
-完整返回：
-
-```json
-{
-  "has_activity": true,
-  "activity": {
-    "name": "晚餐",
-    "description": "晚饭在食堂二楼吃了木桶饭…",
-    "goal_type": "meal",
-    "time_window": "17:30-18:15"
-  },
-  "next_activities": [{"time": "18:15", "name": "操场散步"}],
-  "as_of": "2026-05-25T18:00:00+08:00",
-  "timezone": "Asia/Shanghai"
-}
-```
-
-没有当前活动时 `has_activity=false`，`activity=null`。
-
----
-
-## 安装
-
-1. 把整个目录放到 `MaiBot/plugins/xuqian13_autonomous-planning-plugin-v4/`
-2. 确认主程序 `config/model_config.toml` 里 `[model_task_config.planner]` 段已配好（MaiBot 默认就带这段，无需新建），`model_list` 至少一个能用的模型：
-
-   ```toml
-   [model_task_config.planner]   # 规划模型配置
-   model_list = [
-       "你的模型名",
-   ]
-   max_tokens = 2048
-   temperature = 0.3
-   ```
-
-   想换别的任务名，把插件 `config.toml` 的 `[schedule] llm_task_name = "..."` 改成对应的任务名即可（例如 `replyer` / `utils` 等主程序已配置的任务）。
-3. 启动 MaiBot
-
-完事。`data/goals.db` 会在第一次启动时自动建。
-
----
-
-## 出问题了？
-
-| 现象 | 看这里 |
-|---|---|
-| 日程定时生成"未启用" | `auto_schedule_enabled = true` 改了没 |
-| LLM 生成日程一直失败 | 看 `data/llm_logs/fail_schedule_generation_*.txt`，里面有完整 prompt 和响应 |
-| 麦麦回复时不提当前活动 | 正常 —— prompt 写了"不要主动提及"；只在用户问起 / 强相关时才带出来 |
-| 麦麦每天日程都差不多 | 提高 inject 的 temperature（0.85）+ 看 prompt 里的"原则" |
-
----
-
-## 跑冒烟测试
-
-不动主程序也能验证代码层面没回归：
-
-```powershell
-cd "F:\下载\Maibot 插件开发\MaiM-with-u\MaiBot"
-.\.venv\Scripts\python.exe plugins\xuqian13_autonomous-planning-plugin-v4\tests\run_smoke.py
-```
-
-13 项全过 ✅。
-
----
-
-## 项目结构（一眼看完）
-
-```
-plugin.py             ← 入口 + 7 个组件装饰器 + v4.0→4.1 配置迁移
-config_models.py      ← 4 个顶层 PluginConfigBase（plugin / autonomous_planning / schedule / inject）
-config.toml           ← 默认配置
-
-services/             ← 4 个 service：tools / command / inject / cleanup
-planner/              ← goal_manager + schedule_generator + auto_scheduler + role_judge + generator/
-handlers/inject/      ← 智能注入子模块：意图分类、状态分析、注入优化器、上下文缓存
-utils/                ← 时区 / 时间 / 流过滤 / LLM 日志 / 图片生成
-cache/                ← 线程安全 LRU
-database/             ← SQLite 数据访问
-core/                 ← 数据模型 / 异常 / 常量
-tests/run_smoke.py    ← 13 项端到端冒烟
-
-data/                 ← 运行时（goals.db / llm_logs/）
-```
-
----
-
-## License
-
-AGPL-3.0

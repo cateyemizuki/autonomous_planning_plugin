@@ -16,6 +16,81 @@
 >
 > 各版本条目中标注了对应 issue 编号，方便溯源。
 
+## [4.6.0] - 2026-09-02
+
+### 变更（Breaking）
+
+- **作息语义重构**：`day_start_time` / `day_end_time` 更名为 **`wake_time`（起床/睡醒时间）**
+  与 **`sleep_time`（入睡时间）**。日程的两个锚点变为"几点醒、几点睡"：清醒活动排在
+  起床与入睡之间，入睡到次日起床为睡眠时段；入睡早于起床即跨午夜夜猫子作息。
+  旧配置自动迁移（`day_start_time → sleep_time`、`day_end_time → wake_time`）。
+- **移除 `generate_schedule_v4` 工具**：日程生成收敛到 定时调度 / `/plan list`（无日程时
+  自动先生成）/ `/plan regenerate` / 角色裁判 today 四条路径。
+- **移除 `/plan status` 命令**：其文字输出合并进 `/plan list`。
+
+### 新增
+
+- **`/plan list` 重构**：合并转发**两条记录**——第一条为日程图片、第二条为详细文字
+  （原 status 输出）；触发时先检查今日是否有日程，无则提示"即将生成"并代码层触发，
+  完成后自动发送。新增配置 `list_draw_image`（是否绘制图片）与
+  `image_timeout_seconds`（绘制超时，超时**静默**放弃图片、降级为纯文字）。
+
+### 新增（主动行为扩展）
+
+- **主动行为独立配置段**：原 schedule 段的主动行为项迁入新「主动行为」section；
+  管理员 QQ、会话白名单、LLM 日志控制迁入新「管理与日志」section，
+  `allowed_streams` 的描述重写为"日程注入与 /plan 命令的生效范围（两个功能共用）"。
+- **主动行为白名单拆分**：群聊独立为 `proactive_group_ids`（**直接填群号，
+  留空 = 所有群聊生效**——注意这是相对 v4.5"留空=完全禁用"的行为变更）；
+  其余会话（`qq:private:789` / `session:xxx`）保留原解析逻辑于
+  `proactive_other_streams`（留空 = 不含其他会话）。两份名单取并集。
+- **触发机制重构**：触发窗口从固定 5 分钟改为可配置 `proactive_fresh_window_minutes`
+  （默认 10 分钟），每个会话在窗口内获得**独立随机延迟**，延迟结束才真正触发
+  （错过整个窗口不补发；触发前重新校验活动未切换）。
+- **睡眠时段保护**：按配置的 `sleep_time` / `wake_time` 判定睡眠时段，
+  活动切换主动发起与早间问好在睡眠时段内一律不触发（含无睡眠模式——
+  该模式下睡眠时段被"无所事事"活动填充，但同样不主动发起）。
+- **早间问好**：新增 `enable_morning_greeting`，bot 睡醒后第一个活动开始时向
+  白名单会话道早安（触发方式同活动切换主动发起）；新增
+  `morning_greeting_require_activation`（早间问好需激活）——开启后延迟结束不立即问好，
+  从睡醒起观察会话消息，有人说话才问好；截止第一个活动结束前 10 分钟仍无人说话则放弃。
+- **活动切换主动发起不再覆盖当天睡醒后的第一个活动**（该时段由早间问好负责，
+  未启用早间问好则睡醒时段保持安静）。
+
+### 优化
+
+- **无睡眠模式与提示词框架完全兼容**：JSON 示例、无缝衔接演算、时间合理性框架均按
+  起床/入睡锚点 + 无睡眠开关动态生成，消除"示例教模型写睡觉、正文禁止睡觉"的自相矛盾；
+  时间范围块不再出现与无睡眠模式冲突的"睡眠必须安排在范围内"措辞；
+  无睡眠关键词补充 午休/打盹/赖床/安眠。
+- **配置项精简**：移除从未生效的 `auto_generate`、已弃用的 `inject_mode`；
+  角色裁判的说明补充完整机制（裁判对象、today/future/reject 三分支与降级行为）。
+
+### 移除（死代码清理）
+
+- 删除无调用模块：`handlers/inject/content_template.py`（v4.2 起未被管道调用）、
+  `cache/conversation_cache.py`、`core/constants.py`（全部常量无引用，校验器自带常量表）。
+- 删除无调用方法：`GoalManager`（get_executable_goals / mark_goal_executed / get_stats /
+  vacuum、GoalStatus.FAILED、Goal.should_execute_now / mark_executed）、
+  `GoalDatabase`（get_goals_in_time_window / count_goals / vacuum / get_stats）、
+  `IntentClassifier`（extract_time_range / get_intent_description / TimeRange）、
+  `InjectOptimizer`（cleanup_expired_cache / 统计与重置方法）、
+  `ActivityStateAnalyzer.get_progress_description`、`EnergyModel.get_time_period`、
+  `ScheduleQualityScorer.calculate_priority_score`、`LLUCache.cleanup_expired / items`、
+  `handle_exception_with_default`、`ParameterValidator` 仅保留 validate_time_window。
+- 删除无引用异常类：GoalNotFoundError / GoalAlreadyExistsError / UnauthorizedAccessError /
+  ScheduleConflictError / PermissionError；`core/models.Schedule.get_summary` 与重复的
+  constants.ScheduleType（并入 models.ScheduleType）。
+- inject_service 清理 v4.1 rule 模式遗留的时间关键词表与向后兼容别名；
+  `_manifest.json` 移除未使用的 `message.get_recent` 能力声明（14 → 13 项）。
+- 移除 ON_START `@EventHandler`（仅剩一条日志，无功能作用）。
+
+### 修复
+
+- `generate_weekly_schedule` / `generate_monthly_schedule`（随 generate_schedule_v4 移除）：
+  此前周/月语义从未真正落地（提示词恒为"今天"），避免继续误导。
+
+---
 ## [4.5.0] - 2026-07-25
 
 ### 修复
@@ -152,6 +227,7 @@
 
 ---
 
+[4.6.0]: https://github.com/xuqian13/autonomous_planning_plugin/releases/tag/v4.6.0
 [4.5.0]: https://github.com/xuqian13/autonomous_planning_plugin/releases/tag/v4.5.0
 [4.4.5]: https://github.com/xuqian13/autonomous_planning_plugin/releases/tag/v4.4.5
 [4.4.4]: https://github.com/xuqian13/autonomous_planning_plugin/releases/tag/v4.4.4

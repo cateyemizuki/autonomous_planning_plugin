@@ -6,20 +6,48 @@ Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
 v4 改造：
     - 全局配置（personality / bot.nickname 等）由 ``config`` 字典中的 ``bot_profile`` 段提供
     - ``bot_profile`` 由 ``ToolsService`` 在构造 ScheduleGenerator 前从插件 ctx 拉取
+
+v4.6.0 改造：
+    - 作息语义重构：``wake_time``（起床/睡醒时间）与 ``sleep_time``（入睡时间）成为
+      日程的两个锚点——清醒活动排在 [wake_time, sleep_time)，睡眠时段为
+      [sleep_time, 次日 wake_time)；入睡早于起床表示跨午夜夜猫子作息
+    - 无睡眠模式与提示词框架完全兼容：JSON 示例、无缝衔接演算、时间合理性框架
+      均按 wake/sleep + no_sleep_mode 动态生成，不再出现"示例教模型写睡觉、
+      正文却禁止睡觉"的自相矛盾
 """
 
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 from ...utils.timezone_manager import TimezoneManager
 
 logger = logging.getLogger(__name__)
 
-
 # bot_profile 缺失时显式报错暴露配置问题，不再用任何 fallback 默认值
 # （主程序正常情况下 bot.nickname / personality.personality 一定能拉到；
 #  拿不到说明 IPC 异常或主程序配置缺失，需要在日志里红色报警让用户立刻修）
+
+# 作息解析默认值（配置留空/非法时兜底）：07:00 起床，23:00 入睡
+_DEFAULT_WAKE_MINUTES = 7 * 60
+_DEFAULT_SLEEP_MINUTES = 23 * 60
+
+
+def _parse_hhmm(value: Any, default_minutes: int) -> int:
+    """把 HH:MM 解析为当天分钟数；非法/留空回退默认值。"""
+    try:
+        parts = str(value or "").strip().split(":")
+        hour, minute = int(parts[0]), int(parts[1])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+    except (ValueError, IndexError, TypeError):
+        pass
+    return default_minutes
+
+
+def _fmt_minutes(minutes: int) -> str:
+    """分钟数 → HH:MM（自动回绕 24 小时）。"""
+    minutes %= 24 * 60
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 class PromptBuilder:
@@ -72,6 +100,213 @@ class PromptBuilder:
             )
         return personality, reply_style, interest, bot_name
 
+    # ------------------------------------------------------------
+    # 作息解析
+    # ------------------------------------------------------------
+
+    def _resolve_schedule_bounds(self) -> Tuple[int, int]:
+        """解析 (起床分钟, 入睡分钟)。"""
+        wake_min = _parse_hhmm(self.config.get("wake_time"), _DEFAULT_WAKE_MINUTES)
+        sleep_min = _parse_hhmm(self.config.get("sleep_time"), _DEFAULT_SLEEP_MINUTES)
+        return wake_min, sleep_min
+
+    # ------------------------------------------------------------
+    # 动态 JSON 示例（按作息锚点生成，保证与正文要求自洽）
+    # ------------------------------------------------------------
+
+    def _build_example_items(
+        self,
+        wake_min: int,
+        sleep_min: int,
+        no_sleep: bool,
+        enable_detailed: bool,
+    ) -> List[Dict[str, Any]]:
+        """按起床/入睡锚点生成一份全天无缝衔接的示例日程。
+
+        - 清醒时段 [wake, sleep) 按比例铺开：起床/三餐/学习/运动/娱乐，
+          单个活动不超过 3.5 小时（超出自动拆成两条）；
+        - 睡眠时段 [sleep, 次日 wake)：正常模式为"睡觉"，无睡眠模式为"无所事事"；
+        - 所有活动首尾相接：每个活动结束时间 = 下一个活动开始时间，绕时钟闭环。
+        """
+        seg = (sleep_min - wake_min) % (24 * 60)
+        if seg == 0:
+            seg = 24 * 60
+        sleep_minutes = 24 * 60 - seg
+
+        desc = "（示例描述：按人设写一段自然叙述）" if enable_detailed else ""
+
+        # 极短清醒时段（< 8 小时）：使用极简示例，避免按比例铺开出现负时长
+        if seg < 480:
+            items: List[Dict[str, Any]] = []
+            add = None  # 占位，下方闭包内重新绑定
+            def _add(name: str, start: int, minutes: int, goal_type: str, priority: str) -> None:
+                items.append({
+                    "name": name,
+                    "description": desc,
+                    "goal_type": goal_type,
+                    "priority": priority,
+                    "time_slot": _fmt_minutes(start),
+                    "duration_hours": round(minutes / 60, 2),
+                })
+            if no_sleep:
+                _add("无所事事", sleep_min, sleep_minutes, "rest", "high")
+            else:
+                _add("睡觉", sleep_min, sleep_minutes, "daily_routine", "high")
+            _add("起床洗漱", wake_min, 30, "daily_routine", "medium")
+            _add("早餐", wake_min + 30, 30, "meal", "high")
+            flex = seg - 150
+            half1 = max(30, flex // 2)
+            _add("上午活动", wake_min + 60, half1, "study", "high")
+            _add("午餐", wake_min + 60 + half1, 30, "meal", "high")
+            half2 = max(30, flex - half1)
+            _add("下午活动", wake_min + 90 + half1, half2, "learn_topic", "medium")
+            _add("晚餐", wake_min + 90 + half1 + half2, 30, "meal", "high")
+            return items
+
+        def add(items: List[Dict[str, Any]], name: str, start: int, minutes: int,
+                goal_type: str, priority: str) -> None:
+            items.append({
+                "name": name,
+                "description": desc,
+                "goal_type": goal_type,
+                "priority": priority,
+                "time_slot": _fmt_minutes(start),
+                "duration_hours": round(minutes / 60, 2),
+            })
+
+        items: List[Dict[str, Any]] = []
+
+        # 睡眠块（锚定入睡时刻，绕时钟闭环的收尾）
+        if no_sleep:
+            add(items, "无所事事", sleep_min, sleep_minutes, "rest", "high")
+        else:
+            add(items, "睡觉", sleep_min, sleep_minutes, "daily_routine", "high")
+
+        # 清醒块（锚定起床时刻）
+        add(items, "起床洗漱", wake_min, 30, "daily_routine", "medium")
+        add(items, "早餐", wake_min + 30, 30, "meal", "high")
+
+        cursor = wake_min + 60
+        remaining = seg - 60
+
+        morning = min(210, max(60, int(remaining * 0.35)))
+        add(items, "上午学习", cursor, morning, "study", "high")
+        cursor += morning
+        remaining -= morning
+
+        add(items, "午餐", cursor, 30, "meal", "high")
+        cursor += 30
+        remaining -= 30
+
+        if remaining >= 240:
+            nap_minutes = 30
+            if no_sleep:
+                add(items, "午后放空", cursor, nap_minutes, "rest", "low")
+            else:
+                add(items, "午休", cursor, nap_minutes, "daily_routine", "medium")
+            cursor += nap_minutes
+            remaining -= nap_minutes
+
+        afternoon = min(210, max(30, int(remaining * 0.35)))
+        add(items, "下午学习", cursor, afternoon, "study", "high")
+        cursor += afternoon
+        remaining -= afternoon
+
+        exercise = min(90, max(30, int(remaining * 0.2)))
+        add(items, "运动", cursor, exercise, "exercise", "medium")
+        cursor += exercise
+        remaining -= exercise
+
+        # 晚餐固定锚定在入睡时刻前 4.5h（默认作息下落在 17-20 点区间）
+        dinner_minutes = 30
+        fun_minutes = 150
+        wind_down_minutes = 90
+        flex = remaining - dinner_minutes - fun_minutes - wind_down_minutes
+        if flex >= 60:
+            if flex > 210:
+                half = flex // 2
+                add(items, "兴趣活动", cursor, half, "learn_topic", "medium")
+                add(items, "自由活动", cursor + half, flex - half, "free_time", "low")
+            else:
+                add(items, "兴趣活动", cursor, flex, "learn_topic", "medium")
+            cursor += flex
+        else:
+            # 清醒时段太短：放弃兴趣活动，把差额从娱乐里扣掉，保持无缝
+            fun_minutes = max(60, fun_minutes + flex)
+        add(items, "晚餐", cursor, dinner_minutes, "meal", "high")
+        cursor += dinner_minutes
+        if no_sleep:
+            add(items, "夜间放松", cursor, fun_minutes, "rest", "low")
+        else:
+            add(items, "娱乐", cursor, fun_minutes, "entertainment", "low")
+        cursor += fun_minutes
+        if no_sleep:
+            add(items, "安静休闲", cursor, wind_down_minutes, "rest", "medium")
+        else:
+            add(items, "睡前准备", cursor, wind_down_minutes, "daily_routine", "medium")
+        # cursor 此时回到 sleep_min，与开头的睡眠块首尾相接
+
+        return items
+
+    def _build_example_text(
+        self,
+        wake_min: int,
+        sleep_min: int,
+        no_sleep: bool,
+        enable_detailed: bool,
+        min_activities: int,
+        max_activities: int,
+    ) -> str:
+        """把示例日程渲染成 prompt 里的 JSON 文本 + 无缝演算说明。"""
+        items = self._build_example_items(wake_min, sleep_min, no_sleep, enable_detailed)
+        lines = ["【JSON格式示例】（已按本角色作息锚点生成，展示全天无缝衔接）"]
+        lines.append("{")
+        lines.append('  "schedule_items": [')
+        for idx, item in enumerate(items):
+            comma = "," if idx < len(items) - 1 else ""
+            desc = item["description"]
+            lines.append(
+                '    {{"name":"{name}","description":{desc},"goal_type":"{gtype}",'
+                '"priority":"{prio}","time_slot":"{slot}","duration_hours":{dur}}}{comma}'.format(
+                    name=item["name"],
+                    desc=('"%s"' % desc) if enable_detailed else '""',
+                    gtype=item["goal_type"],
+                    prio=item["priority"],
+                    slot=item["time_slot"],
+                    dur=item["duration_hours"],
+                    comma=comma,
+                )
+            )
+        lines.append("  ]")
+        lines.append("}")
+        lines.append("")
+        lines.append(f"（根据实际情况生成{min_activities}-{max_activities}个活动，以上仅为衔接方式示例）")
+        lines.append("")
+        lines.append("⚠️ 重要：上面示例展示了全天无缝衔接的正确方式！")
+        # 取前三个活动做衔接演算
+        for i in range(min(3, len(items) - 1)):
+            cur, nxt = items[i], items[i + 1]
+            cur_m = int(cur['time_slot'][:2]) * 60 + int(cur['time_slot'][3:])
+            nxt_m = int(nxt['time_slot'][:2]) * 60 + int(nxt['time_slot'][3:])
+            next_label = f"次日 {nxt['time_slot']}" if nxt_m <= cur_m else nxt['time_slot']
+            lines.append(
+                f"- {cur['time_slot']} {cur['name']} + {cur['duration_hours']}h = {next_label} "
+                f"→ {nxt['name']} ✅ 无缝"
+            )
+        last = items[-1]
+        first_sleep = items[0]
+        lines.append(
+            f"- {last['time_slot']} {last['name']} + {last['duration_hours']}h = "
+            f"次日 {first_sleep['time_slot']} ✅ 回到 {first_sleep['name']}，完整闭环"
+        )
+        lines.append("")
+        lines.append("⚠️ duration_hours 是活动持续时长（小时），不是重复间隔！")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------
+    # 主入口：日程生成提示词
+    # ------------------------------------------------------------
+
     def build_schedule_prompt(
         self,
         schedule_type: str,
@@ -82,13 +317,13 @@ class PromptBuilder:
         history_context: str = "",
         knowledge_context: str = "",
     ) -> str:
-        """构建日程生成提示词（精简版）
+        """构建日程生成提示词
 
         Args:
-            schedule_type: 日程类型（daily/weekly/monthly）
+            schedule_type: 日程类型（daily/weekly/monthly；当前生成管线固定按"今天"生成）
             preferences: 用户偏好
             schema: JSON Schema（可选）
-            yesterday_context: 昨日上下文（可选）
+            yesterday_context: 最近几天日程上下文（可选）
             pending_commitments: 今日需要纳入的约定列表（可选）
             history_context: 最近聊天背景（可选；跨群拼接）
             knowledge_context: 相关记忆参考（可选）
@@ -109,12 +344,12 @@ class PromptBuilder:
         # 读取自定义prompt配置
         custom_prompt = self.config.get('custom_prompt', '').strip()
 
-        # v4.5.0（issue #12）：自定义日程时间范围（day_start_time / day_end_time）
-        day_start_time = str(self.config.get('day_start_time', '') or '').strip()
-        day_end_time = str(self.config.get('day_end_time', '') or '').strip()
-
-        # v4.5.0：无睡眠模式
+        # 作息锚点 + 无睡眠模式
+        wake_min, sleep_min = self._resolve_schedule_bounds()
         no_sleep_mode = bool(self.config.get('no_sleep_mode', False))
+        wake_text = _fmt_minutes(wake_min)
+        sleep_text = _fmt_minutes(sleep_min)
+        cross_midnight = sleep_min <= wake_min
 
         # 使用时区管理器获取时间信息
         today = self.tz_manager.get_now()
@@ -203,29 +438,65 @@ class PromptBuilder:
         else:
             desc_requirement = "2. description字段填空字符串\"\"即可（不需要描述）"
 
-        # v4.5.0（issue #12）：把自定义日程时间范围作为硬约束注入生成要求
-        time_range_requirement = ""
-        if day_start_time or day_end_time:
-            start_text = day_start_time or "00:00"
-            end_text = day_end_time or "24:00"
-            time_range_requirement = f"""
-🔴 【日程时间范围】本角色的一天日程被限定在 {start_text} - {end_text} 之间！
-   - 所有活动的开始时间（time_slot）不得早于 {start_text}，也不得晚于 {end_text}
-   - 若 {end_text} < {start_text}（跨夜），则活动允许延续到次日 {end_text}
-   - 睡眠/睡前等作息必须安排在这个范围内（例如范围 23:00-07:00 = 23:00 睡到次日 07:00）
-   - 范围外的时段不要安排任何活动
+        # ── v4.6.0：作息锚点硬约束（起床 / 入睡）────────────────
+        if cross_midnight:
+            awake_rule = (
+                f"- 清醒时段从 {wake_text} 睡醒开始，跨过午夜延续到次日 {sleep_text} 入睡为止，"
+                f"所有清醒活动必须安排在这个区间内"
+            )
+            sleep_rule = (
+                f"- {sleep_text} 到 {wake_text} 是睡眠时段"
+            )
+        else:
+            awake_rule = (
+                f"- 清醒时段为 {wake_text} - {sleep_text}，所有清醒活动必须安排在这个区间内"
+            )
+            sleep_rule = (
+                f"- {sleep_text} 到次日 {wake_text} 是睡眠时段"
+            )
+        if no_sleep_mode:
+            routine_rule = f"- {sleep_rule}：按【无睡眠模式】安排为'无所事事'（goal_type: rest）"
+        else:
+            routine_rule = (
+                f"- {sleep_rule}：安排一个从 {sleep_text} 开始、到次日 {wake_text} 结束的"
+                f"'睡觉'活动（goal_type: daily_routine；跨午夜用大于 24h 的累计时长表达，不要硬切成两条）"
+            )
+        time_range_requirement = f"""
+🔴 【作息时间】本角色 {sleep_text} 上床入睡，{wake_text} 睡醒起床（作息锚点，不可移动）！
+   {awake_rule}
+   {routine_rule}
+   - 睡眠时段首尾必须与相邻活动无缝衔接（入睡时刻 = 前一个活动的结束时间，起床时刻 = 后一个活动的开始时间）
 """
 
-        # v4.5.0：无睡眠模式 —— 不生成睡眠类活动，原睡眠时段改为"无所事事"
+        # ── v4.6.0：无睡眠模式块（与作息锚点配合）────────────────
         no_sleep_requirement = ""
         if no_sleep_mode:
             no_sleep_requirement = f"""
 🔴 【无睡眠模式】本角色**不需要睡觉**！
-   - 禁止生成"睡觉 / 睡眠 / 安睡 / 睡午觉 / 小憩补觉"等睡眠类活动（goal_type 不得用 sleep）
-   - 原本属于睡眠的时段改为**无所事事**（自由活动 / 放空 / 发呆 / 发呆放松），goal_type 用 rest / free_time
-   - 凌晨时段（如果日程范围覆盖）同样安排无所事事或安静的休闲活动，而不是睡觉
-   - 一天仍然要无缝衔接，不能因为去掉睡眠就出现大段空档
+   - 睡眠时段（{sleep_text} 到次日 {wake_text}）改为**无所事事**（goal_type: rest），整段放空发呆，时长覆盖完整
+   - 全天任何活动的 name 都不得包含"睡 / 眠 / 憩"字样（睡觉、睡眠、午休、午睡、小憩、打盹、赖床等一律禁止）
+   - 保持全天无缝衔接，时段不能出现空档
 """
+
+        # ── v4.6.0：动态 JSON 示例 + 无缝演算 ────────────────────
+        example_text = self._build_example_text(
+            wake_min, sleep_min, no_sleep_mode, enable_detailed_description,
+            min_activities, max_activities,
+        )
+
+        # ── 时间合理性框架（随作息/模式自适应）──────────────────
+        if no_sleep_mode:
+            night_row = f"   • {sleep_text} - 次日{wake_text}  无所事事（rest，睡眠时段放空，不是睡觉）"
+        else:
+            night_row = f"   • {sleep_text} - 次日{wake_text}  睡觉（睡眠时段固定不动）"
+        routine_rows = f"""   • {wake_text} 起       起床/洗漱
+   • 早餐 06:00-09:00 ← 必须在这个窗口
+   • 上午时段    学习/工作/娱乐
+   • 午餐 11:00-14:00 ← 必须在这个窗口
+   • 下午时段    可细分为2-3个不同活动，避免单个活动超过3小时
+   • 晚餐 17:00-20:00 ← 必须在这个窗口
+   • 晚间时段    娱乐/社交/兴趣
+{night_row}"""
 
         prompt += f"""
 【任务】生成今天的详细日程JSON：
@@ -233,13 +504,13 @@ class PromptBuilder:
    - 每个活动的结束时间 = 下一个活动的开始时间
    - 计算公式：结束时间 = time_slot + duration_hours
 {time_range_requirement}{no_sleep_requirement}【原则】（重要！）
-- 作息框架（睡眠 / 三餐 / 起床 / 睡前）每天稳定，是基础保留项 —— 不动这个框架
+- 作息框架（睡眠时段 / 三餐 / 起床 / 入睡）每天稳定，是基础保留项 —— 不动这个框架
 - 真实的人 ≠ 日程机器：同一作息框架下，每天的"做什么"与"心情"应有微变化
 - 例：早餐时段不变，但今天可能粥配油条，明天面包黄油；上午时段不变，但今天审稿子，明天写专栏
-- ⚠️ 不要为了"特色"突破常识作息（凌晨跑步、跳过晚餐、午餐推到 16 点都不可以）
-- ⚠️ 不要为了"和昨天不同"而把作息打乱（睡觉时间、三餐时段必须正常）
+- ⚠️ 不要为了"特色"突破常识作息（凌晨跑清醒活动、跳过晚餐、午餐推到 16 点都不可以）
+- ⚠️ 不要为了"和昨天不同"而把作息打乱（睡眠时段、三餐时段必须正常）
 
-1. {min_activities}-{max_activities}个活动，完整覆盖全天（00:00-24:00，无缝衔接）
+1. {min_activities}-{max_activities}个活动，完整覆盖全天（绕时钟闭环，无缝衔接）
 {desc_requirement}
 3. 严格遵守开头的角色人设：身份、习惯、所处世界观要贯穿全天（不要泛化成"普通女大学生"）
 4. 兴趣偏好：{interest if interest else "日常生活"}
@@ -249,7 +520,7 @@ class PromptBuilder:
    - ✅ 与【最近聊天背景】呼应（例：朋友提到的事 → 反映到 description 或 name 中）
    - ✅ description 写出今天的小心情 / 小插曲（不夸张，像日记一笔带过）
    - ❌ 不要每天叫"上午学习""下午学习""夜聊"这种通用名
-   - ❌ 不要为求新意突破作息（凌晨活动、跳过用餐、深夜跑步都不允许）
+   - ❌ 不要为求新意突破作息（清醒时段越过入睡时刻、跳过用餐都不允许）
    - ❌ "今日特色"≠ 改变作息时段，是同一时段填不同的具体内容{(
     f'''
 7. **避免与最近几天重复**：今天的活动 name 至少 30% 不要与【最近几天日程参考】里的相同
@@ -264,64 +535,24 @@ class PromptBuilder:
         if custom_prompt:
             prompt += f"6. ⚠️ 优先延续上述【当前生活阶段与今日重点】的内容\n"
 
-        prompt += """
+        prompt += f"""
 【活动类型】
-daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_maintenance(社交)|exercise(运动)|learn_topic(兴趣)|custom(其他)
+daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_maintenance(社交)|exercise(运动)|learn_topic(兴趣)|rest(休息/放空)|free_time(自由)|custom(其他)
 
 ⚠️ **重要：meal类型活动命名规范**
 - 活动名称必须直接使用：早餐、午餐、晚餐
 - 禁止使用：准备xx、零食时间、下午茶等变体
 - 时间要求：早餐06:00-09:00，午餐11:00-14:00，晚餐17:00-20:00
-
-【JSON格式示例】（完整展示全天无缝衔接）
-{
-  "schedule_items": [
-    {"name":"睡觉","description":""" + ('"蜷在被窝里睡得很香"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"high","time_slot":"00:00","duration_hours":7.5},
-    {"name":"起床洗漱","description":""" + ('"迷迷糊糊爬起来刷牙洗脸"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"medium","time_slot":"07:30","duration_hours":0.5},
-    {"name":"早餐","description":""" + ('"简单吃了点东西"' if enable_detailed_description else '""') + ""","goal_type":"meal","priority":"high","time_slot":"08:00","duration_hours":0.5},
-    {"name":"上午学习","description":""" + ('"认真看书学习新知识"' if enable_detailed_description else '""') + ""","goal_type":"study","priority":"high","time_slot":"08:30","duration_hours":3.5},
-    {"name":"午餐","description":""" + ('"吃了喜欢的菜"' if enable_detailed_description else '""') + ""","goal_type":"meal","priority":"high","time_slot":"12:00","duration_hours":0.5},
-    {"name":"午休","description":""" + ('"小憩一会儿恢复精力"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"medium","time_slot":"12:30","duration_hours":0.5},
-    {"name":"下午学习","description":""" + ('"继续努力完成学习任务"' if enable_detailed_description else '""') + ""","goal_type":"study","priority":"high","time_slot":"13:00","duration_hours":2.0},
-    {"name":"兴趣活动","description":""" + ('"做自己喜欢的事情"' if enable_detailed_description else '""') + ""","goal_type":"learn_topic","priority":"medium","time_slot":"15:00","duration_hours":2.0},
-    {"name":"运动","description":""" + ('"出去跑步锻炼身体"' if enable_detailed_description else '""') + ""","goal_type":"exercise","priority":"medium","time_slot":"17:00","duration_hours":1.0},
-    {"name":"晚餐","description":""" + ('"吃了丰盛的晚餐"' if enable_detailed_description else '""') + ""","goal_type":"meal","priority":"high","time_slot":"18:00","duration_hours":0.5},
-    {"name":"娱乐","description":""" + ('"看视频放松一下"' if enable_detailed_description else '""') + ""","goal_type":"entertainment","priority":"low","time_slot":"18:30","duration_hours":3.0},
-    {"name":"夜聊","description":""" + ('"和朋友聊天分享日常"' if enable_detailed_description else '""') + ""","goal_type":"social_maintenance","priority":"medium","time_slot":"21:30","duration_hours":1.0},
-    {"name":"睡前准备","description":""" + ('"洗澡护肤准备睡觉"' if enable_detailed_description else '""') + ""","goal_type":"daily_routine","priority":"medium","time_slot":"22:30","duration_hours":1.5}
 """
 
-        prompt += f"""（根据实际情况生成{min_activities}-{max_activities}个活动）
-  ]
-}}
+        prompt += example_text + "\n"
 
-⚠️ 重要：上面示例展示了全天无缝衔接的正确方式！
-- 睡觉 00:00 + 7.5h = 07:30 → 起床洗漱 07:30 ✅ 无缝
-- 起床洗漱 07:30 + 0.5h = 08:00 → 早餐 08:00 ✅ 无缝
-- 早餐 08:00 + 0.5h = 08:30 → 上午学习 08:30 ✅ 无缝
-... (以此类推，每个活动结束时间 = 下个活动开始时间)
-- 睡前准备 22:30 + 1.5h = 24:00 (00:00) ✅ 回到起点，完整覆盖全天
-
-⚠️ duration_hours 是活动持续时长（小时），不是重复间隔！
-
-【跨天活动支持】
-- 允许活动结束时刻越过 24:00 表示延续到次日（例如 time_slot="23:00" + duration_hours=2.5 → 次日 01:30 结束）
-- 入睡时间在凌晨附近时，睡前/睡眠活动通常会跨过午夜，请直接用大于 24h 的累计时长表达，不要硬切成两条
-- 昨天已经跨到今天凌晨的活动**不要在今天日程里重复写**，今天从它结束后的新活动（起床/洗漱）开始
-
+        prompt += f"""
 【时间合理性要求 - 重要！】
 ⚠️ 必须同时满足以下两点：
 1. 无缝覆盖全天：每个活动结束时间 = 下个活动开始时间（不允许任何空档）
-2. 遵守常识性时间安排，参考以下时间框架：
-   • 00:00-07:00  睡觉 (7-8小时)
-   • 07:00-08:00  起床/洗漱
-   • 08:00-08:30  早餐 ← 必须在 06:00-09:00
-   • 08:30-12:00  上午活动（学习/工作/娱乐）
-   • 12:00-13:00  午餐+午休 ← 午餐必须在 11:00-14:00
-   • 13:00-18:00  下午活动（可细分为2-3个不同活动，避免单个活动超过3小时）
-   • 18:00-19:00  晚餐+休息 ← 晚餐必须在 17:00-20:00
-   • 19:00-22:00  晚间活动（娱乐/社交/兴趣）
-   • 22:00-00:00  睡前准备+早睡 → 回到 00:00
+2. 遵守常识性时间安排，参考以下框架（已按本角色作息锚点适配）：
+{routine_rows}
 
 ⚠️ 注意：下午和晚间的大时段应该细分成多个活动，不要一个活动占据5小时以上！
 
@@ -331,8 +562,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 - 🔴 核心要求：必须无缝覆盖全天，不能有任何时间空档！
   * 每个活动结束时间 = 下个活动开始时间
   * 计算方式：结束时间 = time_slot + duration_hours
-  * 示例：如果活动A在15:00结束，活动B必须从15:00开始！
-- ⚠️ 关键活动时间必须合理：早餐6-9点、午餐11-14点、晚餐17-20点、睡觉从22-2点开始
+- ⚠️ 关键活动时间必须合理：早餐6-9点、午餐11-14点、晚餐17-20点
 """ + ("- description填空字符串\"\"即可\n" if not enable_detailed_description else f"- description简洁，{min_desc_len}-{max_desc_len}字\n") + f"""- 体现{weekday}特色（{"周末睡懒觉" if is_weekend else "工作日早起"}）
 """
 
@@ -370,7 +600,7 @@ Schema: {json.dumps(schema.get('properties', {}).get('schedule_items', {}), ensu
             preferences: 用户偏好
             schema: JSON Schema
             previous_issues: 上一轮的问题列表
-            yesterday_context: 昨日上下文（可选）
+            yesterday_context: 最近几天日程上下文（可选）
             pending_commitments: 今日约定（可选）
             history_context: 最近聊天背景（可选）
             knowledge_context: 相关记忆参考（可选）

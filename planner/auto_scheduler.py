@@ -1,4 +1,4 @@
-"""Automatic Schedule Scheduler.
+﻿"""Automatic Schedule Scheduler.
 
 This module provides automatic scheduling functionality that generates
 daily schedules at configured times.
@@ -12,11 +12,9 @@ Example:
     >>> await scheduler.start()  # Start background task
 """
 
-from pathlib import Path
 from typing import Optional
 import asyncio
 import datetime
-import json
 import logging
 
 from ..utils.timezone_manager import TimezoneManager
@@ -66,11 +64,6 @@ class ScheduleAutoScheduler:
         self._retry_count = 0
         self._max_retry_wait = 300  # 最大等待5分钟
         self._last_schedule_date: Optional[str] = None
-        self._last_infer_date: Optional[str] = None
-        self._inferred_prompt_cache: dict = {}
-        self._inferred_prompt_file = Path(__file__).resolve().parents[1] / "data" / "next_day_prompt.json"
-        self._load_inferred_prompt_cache()
-
         # 导入依赖（延迟导入避免循环依赖）
         from .goal_manager import get_goal_manager
         from .schedule_generator import ScheduleGenerator
@@ -151,213 +144,6 @@ class ScheduleAutoScheduler:
         next_target = target_time + datetime.timedelta(days=1)
         return max(1.0, (next_target - now).total_seconds())
 
-    @staticmethod
-    def _extract_time_window(goal) -> tuple[Optional[int], Optional[int]]:
-        time_window = None
-        if goal.parameters and "time_window" in goal.parameters:
-            time_window = goal.parameters["time_window"]
-        elif goal.conditions and "time_window" in goal.conditions:
-            time_window = goal.conditions["time_window"]
-
-        if isinstance(time_window, (list, tuple)) and len(time_window) == 2:
-            try:
-                return int(time_window[0]), int(time_window[1])
-            except Exception:
-                return None, None
-        return None, None
-
-    @staticmethod
-    def _format_minutes(value: int) -> str:
-        hours = value // 60
-        minutes = value % 60
-        return f"{hours:02d}:{minutes:02d}"
-
-    def _load_inferred_prompt_cache(self) -> None:
-        try:
-            if not self._inferred_prompt_file.exists():
-                return
-            with open(self._inferred_prompt_file, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                self._inferred_prompt_cache = loaded
-        except Exception as e:
-            self.logger.warning(f"加载次日推断缓存失败，已忽略: {e}")
-
-    def _save_inferred_prompt_cache(self) -> None:
-        try:
-            self._inferred_prompt_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._inferred_prompt_file, "w", encoding="utf-8") as f:
-                json.dump(self._inferred_prompt_cache, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.logger.warning(f"保存次日推断缓存失败，已忽略: {e}")
-
-    def _build_recent_schedule_summary(self, goal_manager, lookback_days: int, include_completion: bool) -> str:
-        now = self.tz_manager.get_now()
-        sections = []
-
-        for offset in range(lookback_days):
-            day = now - datetime.timedelta(days=offset)
-            date_str = day.strftime("%Y-%m-%d")
-            goals = goal_manager.get_schedule_goals(chat_id="global", date_str=date_str)
-            if not goals:
-                continue
-
-            def _sort_key(goal):
-                start, _ = self._extract_time_window(goal)
-                return start if start is not None else 10**9
-
-            goals = sorted(goals, key=_sort_key)
-            lines = [f"[{date_str}] 共{len(goals)}项"]
-
-            for goal in goals:
-                start, end = self._extract_time_window(goal)
-                if start is not None and end is not None:
-                    time_text = f"{self._format_minutes(start)}-{self._format_minutes(end)}"
-                else:
-                    time_text = "未知时段"
-
-                priority = goal.priority.value if hasattr(goal.priority, "value") else str(goal.priority)
-                goal_type = str(goal.goal_type or "custom")
-                item = f"- {time_text} {goal.name} ({goal_type}/{priority})"
-
-                if include_completion:
-                    # Goal 上的 status 一定存在；progress 在 core.models 中类型为 int 默认 0
-                    status = goal.status.value if hasattr(goal.status, "value") else str(goal.status)
-                    progress = int(goal.progress) if hasattr(goal, "progress") else 0
-                    item += f" 状态={status}, 进度={progress}%"
-
-                lines.append(item)
-
-            sections.append("\n".join(lines))
-
-        return "\n\n".join(sections)
-
-    async def _infer_next_day_prompt(self, schedule_config: dict) -> bool:
-        lookback_days = int(schedule_config.get("infer_lookback_days", 3) or 3)
-        lookback_days = max(1, min(7, lookback_days))
-
-        max_chars = int(schedule_config.get("infer_max_prompt_chars", 300) or 300)
-        max_chars = max(80, min(800, max_chars))
-
-        include_completion = bool(schedule_config.get("infer_use_completion_signal", True))
-
-        goal_manager = self.get_goal_manager()
-        history_summary = self._build_recent_schedule_summary(goal_manager, lookback_days, include_completion)
-        if not history_summary.strip():
-            self.logger.info("次日推断跳过：近期无可用日程历史")
-            return False
-
-        base_prompt = str(schedule_config.get("custom_prompt", "") or "").strip()
-        now = self.tz_manager.get_now()
-        tomorrow = now + datetime.timedelta(days=1)
-        target_date = tomorrow.strftime("%Y-%m-%d")
-        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        target_weekday = weekday_names[tomorrow.weekday()]
-
-        instruction = (
-            "你是日程策略设计助手。"
-            "请基于最近几天的日程与完成状态，为明天生成一段中文'策略提示词'，用于指导明日日程生成。"
-            "输出必须是单段纯文本，不要Markdown、不要列表、不要解释。"
-            f"长度控制在120到{max_chars}字之间，强调连续性与现实可执行性。"
-            "如果基础要求存在，必须兼容且优先满足。"
-        )
-
-        # v4.5.0（issue #11）：custom_prompt 是"角色的长期状态/生活阶段"，是推断的
-        # 主信号而非次要信息 —— 把它从末位提到首位并标注语义，让 LLM 清楚知道
-        # 策略必须延续这个长期状态，日程历史只是它的具体表现。
-        if base_prompt:
-            prompt = (
-                f"{instruction}\n\n"
-                f"目标日期：{target_date} {target_weekday}\n"
-                f"【角色的长期状态】这是角色正在经历的持续人生阶段，策略必须延续：\n"
-                f"{base_prompt}\n\n"
-                f"最近日程历史（长期状态的具体表现）：\n{history_summary}\n\n"
-                "请直接输出策略提示词正文："
-            )
-        else:
-            prompt = (
-                f"{instruction}\n\n"
-                f"目标日期：{target_date} {target_weekday}\n"
-                "基础固定要求（可为空）：无\n\n"
-                f"最近日程历史：\n{history_summary}\n\n"
-                "请直接输出策略提示词正文："
-            )
-
-        try:
-            model_helper = BaseScheduleGenerator(goal_manager, schedule_config)
-            task_name, max_tokens, temperature = model_helper.get_model_config()
-            infer_max_tokens = max(256, min(1024, int(max_tokens)))
-            infer_temperature = max(0.2, min(0.8, float(temperature)))
-
-            # v4：必须通过插件 ctx.llm 调用，未注入 plugin 视为编程错误
-            if self.plugin is None or not hasattr(self.plugin, "ctx"):
-                raise RuntimeError("ScheduleAutoScheduler 未注入 plugin 实例，无法调用 ctx.llm.generate")
-
-            # v4.5.0：推断链路同样把配置超时传给 SDK RPC 层（issue #9）
-            timeout_ms = int(float(schedule_config.get("generation_timeout", 180.0)) * 1000)
-
-            llm_result = await self.plugin.ctx.llm.generate(
-                prompt=prompt,
-                model=task_name,
-                max_tokens=infer_max_tokens,
-                temperature=infer_temperature,
-                timeout_ms=timeout_ms,
-            )
-            success = bool(llm_result.get("success", False))
-            response = str(llm_result.get("response", ""))
-            if not success or not response:
-                self.logger.warning(f"次日推断失败: {response}")
-                return False
-
-            inferred_prompt = str(response).strip().replace("```", "")
-            inferred_prompt = " ".join(inferred_prompt.split())
-            inferred_prompt = inferred_prompt.strip("\"' ")
-            if len(inferred_prompt) > max_chars:
-                inferred_prompt = inferred_prompt[:max_chars].rstrip()
-
-            if len(inferred_prompt) < 20:
-                self.logger.warning("次日推断结果过短，已放弃使用")
-                return False
-
-            self._inferred_prompt_cache = {
-                "target_date": target_date,
-                "prompt": inferred_prompt,
-                "generated_at": now.isoformat(),
-            }
-            self._save_inferred_prompt_cache()
-            self.logger.info(f"✅ 次日策略推断成功，目标日期: {target_date}")
-            return True
-        except Exception as e:
-            self.logger.warning(f"次日策略推断异常，已回退固定prompt: {e}", exc_info=True)
-            return False
-
-    def _get_effective_custom_prompt(self, today: str, fallback_prompt: str) -> str:
-        """合并推断结果与配置的 custom_prompt（v4.5.0，issue #11）。
-
-        此前推断结果存在时直接覆盖配置的 custom_prompt，导致用户在配置里填的
-        "长期状态"（如"我正在环游世界"）被丢弃。现在改为**合并**：
-
-        - 有当日推断结果 + 配置了 custom_prompt → ``推断结果 + 【底层的长期状态】配置值``
-        - 有当日推断结果 + 未配置 → 仅用推断结果
-        - 无推断结果 → 回退配置值
-
-        Args:
-            today: ``YYYY-MM-DD`` 今日日期。
-            fallback_prompt: 配置的 custom_prompt（可为空串）。
-
-        Returns:
-            最终生效的 custom_prompt 字符串。
-        """
-        inferred_date = str(self._inferred_prompt_cache.get("target_date", "") or "")
-        inferred_prompt = str(self._inferred_prompt_cache.get("prompt", "") or "").strip()
-        configured_prompt = str(fallback_prompt or "").strip()
-
-        if inferred_date == today and inferred_prompt:
-            if configured_prompt:
-                return f"{inferred_prompt}\n\n【底层的长期状态】{configured_prompt}"
-            return inferred_prompt
-        return configured_prompt
-
     async def _schedule_loop(self):
         """
         定时任务循环
@@ -371,37 +157,18 @@ class ScheduleAutoScheduler:
             try:
                 now = self.tz_manager.get_now()
                 schedule_time_str = self.plugin.config.schedule.auto_schedule_time
-                infer_enabled = bool(
-                    self.plugin.config.schedule.auto_infer_next_day_prompt
-                )
-                infer_time_str = self.plugin.config.schedule.infer_time
                 today_str = now.strftime("%Y-%m-%d")
-
-                ran_any_task = False
-
-                if infer_enabled and self._is_time_due(now, infer_time_str, self._last_infer_date):
-                    # v4.4.4：使用 plugin.build_schedule_config 统一构建（含 bot_profile），
-                    # 不再用 schedule.model_dump()（会漏掉 bot_profile 字段）
-                    schedule_config = self.plugin.build_schedule_config()
-                    await self._infer_next_day_prompt(schedule_config)
-                    self._last_infer_date = today_str
-                    ran_any_task = True
 
                 if self._is_time_due(now, schedule_time_str, self._last_schedule_date):
                     await self._generate_today_schedule()
                     self._last_schedule_date = today_str
                     self._retry_count = 0
-                    ran_any_task = True
-
-                if ran_any_task:
                     continue
 
-                wait_candidates = [
+                wait_seconds = max(
+                    15.0,
                     self._seconds_until_next(now, schedule_time_str, self._last_schedule_date),
-                ]
-                if infer_enabled:
-                    wait_candidates.append(self._seconds_until_next(now, infer_time_str, self._last_infer_date))
-                wait_seconds = max(15.0, min(wait_candidates))
+                )
                 await asyncio.sleep(wait_seconds)
 
             except asyncio.CancelledError:
@@ -463,15 +230,10 @@ class ScheduleAutoScheduler:
                 return
 
             # 生成日程
-            # v4.4.4：使用 plugin.build_schedule_config 统一构建（含 bot_profile），
-            # 不再用 schedule.model_dump()（会漏掉 bot_profile 字段，导致 prompt
+            # 使用 plugin.build_schedule_config 统一构建（含 bot_profile），
+            # 不用 schedule.model_dump()（会漏掉 bot_profile 字段，导致 prompt
             # 中"未配置或为空"报错）
             schedule_config = self.plugin.build_schedule_config()
-            fallback_prompt = str(schedule_config.get("custom_prompt", "") or "")
-            effective_prompt = self._get_effective_custom_prompt(today, fallback_prompt)
-            if effective_prompt != fallback_prompt:
-                schedule_config["custom_prompt"] = effective_prompt
-                self.logger.info("已应用次日推断策略到今日日程生成")
 
             schedule_generator = self.ScheduleGenerator(
                 goal_manager=goal_manager,

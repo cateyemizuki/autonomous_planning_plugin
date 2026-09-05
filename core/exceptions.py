@@ -1,4 +1,4 @@
-"""自定义异常类 - 自主规划插件
+﻿"""自定义异常类 - 自主规划插件
 
 本模块定义插件特定的异常类，用于更精确的错误处理和恢复。
 
@@ -108,32 +108,6 @@ class DatabaseError(AutonomousPlanningError):
     pass
 
 
-class GoalNotFoundError(DatabaseError):
-    """目标不存在异常
-
-    当尝试访问不存在的目标ID时抛出。
-    """
-
-    def __init__(self, goal_id: str):
-        super().__init__(f"Goal not found: {goal_id}")
-        self.goal_id = goal_id
-
-
-class GoalAlreadyExistsError(DatabaseError):
-    """目标已存在异常
-
-    当尝试创建已存在的goal_id时抛出。
-    """
-
-    def __init__(self, goal_id: str):
-        super().__init__(f"Goal already exists: {goal_id}")
-        self.goal_id = goal_id
-
-
-# ============================================================================
-# 验证相关异常
-# ============================================================================
-
 class ValidationError(AutonomousPlanningError):
     """输入验证异常的基类"""
     pass
@@ -172,35 +146,6 @@ class InvalidTimeWindowError(ValidationError):
 
 
 # ============================================================================
-# 权限相关异常
-# ============================================================================
-
-class PermissionError(AutonomousPlanningError):
-    """权限异常的基类"""
-    pass
-
-
-class UnauthorizedAccessError(PermissionError):
-    """未授权访问异常
-
-    当用户尝试访问无权访问的资源时抛出。
-
-    属性：
-        user_id: 用户ID
-        resource_type: 资源类型（如 'goal', 'schedule'）
-        resource_id: 资源ID
-    """
-
-    def __init__(self, user_id: str, resource_type: str, resource_id: str):
-        super().__init__(
-            f"User {user_id} not authorized to access {resource_type}:{resource_id}"
-        )
-        self.user_id = user_id
-        self.resource_type = resource_type
-        self.resource_id = resource_id
-
-
-# ============================================================================
 # 调度相关异常
 # ============================================================================
 
@@ -222,18 +167,3 @@ class ScheduleGenerationError(ScheduleError):
     def __init__(self, message: str, attempt_count: int = 0):
         super().__init__(message)
         self.attempt_count = attempt_count
-
-
-class ScheduleConflictError(ScheduleError):
-    """日程冲突异常
-
-    当检测到时间冲突或资源冲突时抛出。
-
-    属性：
-        message: 错误消息
-        conflicting_items: 冲突的项目列表
-    """
-
-    def __init__(self, message: str, conflicting_items: list = None):
-        super().__init__(message)
-        self.conflicting_items = conflicting_items or []

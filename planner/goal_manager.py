@@ -1,4 +1,4 @@
-"""Goal Manager Module (SQLite Version).
+﻿"""Goal Manager Module (SQLite Version).
 
 This module provides goal management functionality using SQLite database
 for improved performance and concurrency handling.
@@ -90,7 +90,6 @@ class GoalStatus(Enum):
     PAUSED = "paused"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
-    FAILED = "failed"
 
 
 class GoalPriority(Enum):
@@ -234,37 +233,6 @@ class Goal:
         except (ValueError, TypeError):
             return None
 
-    def should_execute_now(self) -> bool:
-        """Check if goal should be executed now.
-
-        Returns:
-            True if goal should be executed, False otherwise
-        """
-        if self.status != GoalStatus.ACTIVE:
-            return False
-
-        # Check time_window if present
-        time_window = self.parameters.get("time_window") if self.parameters else None
-        if time_window and isinstance(time_window, list) and len(time_window) == 2:
-            tz_manager = TimezoneManager()
-            now = tz_manager.get_now()
-            current_minutes = now.hour * 60 + now.minute
-            if not (time_window[0] <= current_minutes <= time_window[1]):
-                return False
-
-        # Check deadline
-        tz_manager = TimezoneManager()
-        if self.deadline and strip_tz(tz_manager.get_now()) > strip_tz(self.deadline):
-            return False
-
-        return True
-
-    def mark_executed(self):
-        """Mark goal as executed."""
-        tz_manager = TimezoneManager()
-        self.last_executed_at = tz_manager.get_now()
-        self.execution_count += 1
-
     def get_summary(self) -> str:
         """Get goal summary.
 
@@ -276,7 +244,6 @@ class Goal:
             GoalStatus.PAUSED: "⏸️",
             GoalStatus.COMPLETED: "✅",
             GoalStatus.CANCELLED: "❌",
-            GoalStatus.FAILED: "💔",
         }
 
         priority_emoji = {
@@ -478,15 +445,6 @@ class GoalManager:
             List of active Goal objects
         """
         return self.get_all_goals(chat_id=chat_id, status=GoalStatus.ACTIVE)
-
-    def get_executable_goals(self) -> List[Goal]:
-        """Get goals that should be executed now.
-
-        Returns:
-            List of executable Goal objects
-        """
-        active_goals = self.get_active_goals()
-        return [g for g in active_goals if g.should_execute_now()]
 
     # ============================================================
     # pending_commitments：未来约定（goal_type="pending_commitment"）
@@ -841,21 +799,6 @@ class GoalManager:
 
         return expired_count
 
-    def mark_goal_executed(self, goal_id: str):
-        """Mark goal as executed.
-
-        Args:
-            goal_id: Goal identifier
-        """
-        goal = self.get_goal(goal_id)
-        if goal:
-            goal.mark_executed()
-            self.update_goal(
-                goal_id,
-                last_executed_at=goal.last_executed_at,
-                execution_count=goal.execution_count
-            )
-
     def get_goals_summary(self, chat_id: Optional[str] = None) -> str:
         """Get goals summary.
 
@@ -894,19 +837,6 @@ class GoalManager:
             lines.append(f"\n✅ 已完成 ({len(completed)}个)")
 
         return "\n".join(lines)
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get database statistics.
-
-        Returns:
-            Dictionary with statistics
-        """
-        return self.db.get_stats()
-
-    def vacuum(self):
-        """Optimize database (should be run periodically)."""
-        self.db.vacuum()
-        logger.info("Database optimized")
 
     def close(self):
         """Close database connection."""

@@ -1,12 +1,8 @@
-"""Cache module
+﻿"""缓存模块 - 自主规划插件
 
-Provides LRU cache and conversation cache implementations.
+提供线程/协程安全的 LRU 缓存实现。
 """
 
 from .lru_cache import LRUCache
-from .conversation_cache import ConversationCache
 
-__all__ = [
-    "LRUCache",
-    "ConversationCache",
-]
+__all__ = ["LRUCache"]

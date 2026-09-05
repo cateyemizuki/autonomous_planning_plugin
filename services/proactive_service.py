@@ -1,31 +1,40 @@
-"""活动驱动的主动行为服务（v4.4 新增）。
+﻿"""活动驱动的主动行为服务（v4.6.0）。
 
-两个职责合并在一个后台循环里：
+三个职责合并在一个后台循环里：
 
-1. **活动切换瞬间主动开口** —— 通过 ``ctx.maisaka.trigger_proactive`` 触发
-   Maisaka 跑一轮主动对话；让 bot 在 12:00 切到午餐时自然在群里说一句
-   "我去吃饭啦"。
+1. **活动切换主动发起** —— 活动开始后，在触发窗口内让 bot 主动开口
+   （``ctx.maisaka.trigger_proactive``）。不覆盖当天睡醒后的第一个活动
+   （由"早间问好"负责），设定的睡眠时段内不触发。
 
-2. **按 goal_type / priority 调节聊天频率** —— 通过
-   ``ctx.frequency.set_adjust`` 把频率因子推给 heartflow，让 bot 在学习/工作时
-   少说话、休息/娱乐时多说话。
+2. **早间问好** —— bot 睡醒后第一个活动开始时，向白名单会话道早安；
+   可选"需要群内激活"：截止第一个活动结束前 10 分钟仍无人说话则放弃。
 
-两个能力都需要主程序提供（SDK v2.4+），如果 ctx 不可用会优雅降级。
+3. **按 goal_type / priority 调节聊天频率** —— 通过
+   ``ctx.frequency.set_adjust`` 把频率因子推给 heartflow。
+
+v4.6.0 变更：
+    - 白名单拆分为"群聊（直接填群号，留空=所有群聊）"与"其他会话
+      （qq:private:xxx / session:xxx）"两份，取并集生效；
+    - 触发窗口从固定 5 分钟改为可配置（默认 10 分钟），每个会话在窗口内
+      获得一个独立随机延迟，延迟结束才真正触发（触发即去重，错过窗口放弃）；
+    - 睡眠时段（按配置的 sleep_time / wake_time 判定，含无睡眠模式）不触发
+      活动切换发起与早间问好；
+    - 新增早间问好及其"需要群内激活"开关。
 
 设计要点：
-    - 单独的 ``proactive_streams`` 白名单（默认空 = 完全禁用），避免误打扰
-    - 每个 ``(stream_id, activity_name, date)`` 组合只主动触发一次
-    - 频率因子按 goal_type 静态表映射，更新时记录避免重复 set_adjust
-    - 后台循环 60 秒一次，启动延迟 15 秒等其他组件就绪
+    - 每个 ``(stream_id, activity_name, date)`` 组合只主动触发一次；
+    - 触发时机 = 活动开始 + 独立随机延迟（窗口内），由 60 秒轮询落实；
+    - 后台循环 60 秒一次，启动延迟 15 秒等其他组件就绪。
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import asyncio
 import logging
+import random
 import time
 
 from ..planner.goal_manager import get_goal_manager
-from ..utils.time_utils import parse_time_window
+from ..utils.time_utils import parse_time_slot, parse_time_window
 from ..utils.timezone_manager import TimezoneManager
 
 if TYPE_CHECKING:
@@ -64,6 +73,12 @@ _PROACTIVE_INTENT_TEMPLATES: Dict[str, str] = {
 }
 _DEFAULT_PROACTIVE_INTENT = "Bot 切换到新活动了，可以自然地在群里说一两句近况"
 
+# 早间问好 intent 模板
+_MORNING_GREETING_INTENT = (
+    "Bot 刚睡醒，新的一天开始了，请自然地向大家道一声早安；"
+    "可以顺口提一句今天的第一个安排（{activity_name}），语气符合人设，简短随意"
+)
+
 # v4.4.5：约定（pending_commitment）来源的活动用强指令模板，让 Maisaka 不要陷入
 # "自行决定是否回复"的工具调用循环。占位符会在 _trigger_proactive 中填充。
 _COMMITMENT_INTENT_TEMPLATE = (
@@ -73,19 +88,38 @@ _COMMITMENT_INTENT_TEMPLATE = (
     "活动名：{activity_name}"
 )
 
+# 早间问好观察截止：第一个活动结束前 N 分钟
+_MORNING_DEADLINE_MARGIN_MINUTES = 10
+
+# 作息解析默认值：07:00 起床 / 23:00 入睡
+_DEFAULT_WAKE_MINUTES = 7 * 60
+_DEFAULT_SLEEP_MINUTES = 23 * 60
+
+
+def _parse_hhmm_minutes(value: Any, default: int) -> int:
+    """把 HH:MM 解析为当天分钟数；非法/留空回退默认值。"""
+    try:
+        parts = str(value or "").strip().split(":")
+        hour, minute = int(parts[0]), int(parts[1])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+    except (ValueError, IndexError, TypeError):
+        pass
+    return default
+
 
 class ProactiveService:
-    """活动驱动的主动行为服务（v4.4 新增）。"""
+    """活动驱动的主动行为服务。"""
 
-    # 活动开始后 ≤ 此分钟内才考虑触发主动发起（避免半天后突然冒一句）
-    PROACTIVE_FRESH_WINDOW_MINUTES = 5
     # 后台循环周期（秒）
     LOOP_INTERVAL_SECONDS = 60.0
     # 启动延迟（秒），等其他组件就绪
     STARTUP_DELAY_SECONDS = 15.0
-    # v4.4.1：proactive_streams 解析缓存有效期
+    # proactive_streams 解析缓存有效期
     RESOLVE_CACHE_TTL_SUCCESS = 600.0  # 解析成功缓存 10 分钟
     RESOLVE_CACHE_TTL_FAILURE = 60.0   # 解析失败缓存 60 秒（短期避免反复查 + 允许群恢复重试）
+    # 独立随机延迟的下限（秒），避免活动刚切换就瞬间开口
+    RANDOM_DELAY_MIN_SECONDS = 30.0
 
     def __init__(self, plugin: "AutonomousPlanningPluginV4") -> None:
         """初始化 ProactiveService。
@@ -98,19 +132,28 @@ class ProactiveService:
         # 时区管理器（与 InjectService 用同一个时区）
         self._tz_manager: TimezoneManager = TimezoneManager(plugin.config.schedule.timezone)
         # 已触发的主动发起记录：{(stream_id, activity_name, date_str): trigger_time}
-        # 同一个活动在同一天同一个 stream 只主动触发一次
+        # 同一个活动在同一天同一个会话只主动触发一次
         self._proactive_history: Dict[Tuple[str, str, str], float] = {}
+        # 待触发的主动发起：{(stream_id, activity_name, date_str): fire_at_epoch}
+        # v4.6.0：活动切换后先安排独立随机延迟，到点再真正触发
+        self._pending_triggers: Dict[Tuple[str, str, str], float] = {}
+        # 早间问好状态：{(stream_id, date_str): "fired" / "abandoned"}
+        self._morning_history: Dict[Tuple[str, str], str] = {}
+        # 早间问好待触发：{(stream_id, date_str): fire_at_epoch}
+        self._morning_pending: Dict[Tuple[str, str], float] = {}
         # 已应用的频率因子缓存：{stream_id: factor}（避免重复 set_adjust）
         self._current_factor: Dict[str, float] = {}
-        # v4.4.1 新增：proactive_streams 解析缓存
-        # 结构：{raw_entry: (session_id 或 None, expire_at)}
-        # 解析成功缓存 10 分钟；失败缓存 60 秒（短期避免反复查 + 允许群恢复重试）
+        # 白名单解析缓存：{raw_entry: (session_id 或 None, expire_at)}
         self._resolved_cache: Dict[str, Tuple[Optional[str], float]] = {}
-        logger.debug("ProactiveService 初始化（v4.4）")
+        logger.debug("ProactiveService 初始化（v4.6.0）")
+
+    # ------------------------------------------------------------
+    # 循环骨架
+    # ------------------------------------------------------------
 
     async def run_loop(self) -> None:
-        """后台循环：60 秒检查一次活动状态，触发主动发起 + 频率调控。"""
-        logger.info("🌟 活动驱动主动行为循环已启动（v4.4）")
+        """后台循环：60 秒检查一次活动状态，处理触发 / 频率调控 / 早间问好。"""
+        logger.info("🌟 活动驱动主动行为循环已启动")
         try:
             # 启动延迟：等待 InjectService 缓存预热 / chat_manager 就绪
             await asyncio.sleep(self.STARTUP_DELAY_SECONDS)
@@ -138,77 +181,118 @@ class ProactiveService:
         self._stop_event.set()
 
     # ------------------------------------------------------------
-    # 主循环逻辑
+    # 白名单解析（群聊 + 其他会话，取并集）
     # ------------------------------------------------------------
 
-    async def _check_and_act(self) -> None:
-        """读当前活动 → 决定是否触发主动发起 / 调整频率。"""
-        cfg = self._plugin.config.schedule
-        # v4.4.1：兼容旧 ScheduleConfig 实例（hot-reload 过渡态）
-        if not hasattr(cfg, "proactive_streams"):
-            logger.debug("当前 config 无 proactive_streams 字段（hot-reload 过渡），跳过本轮")
-            return
-        raw_streams = cfg.proactive_streams
-        if not raw_streams:
-            # 白名单为空 = 主动行为完全禁用（默认安全）
-            return
+    async def _resolve_target_streams(self) -> List[str]:
+        """解析主动行为生效的会话列表（群聊白名单 ∪ 其他会话白名单）。
 
-        # v4.4.1：把 qq:group:xxx / qq:private:xxx 等格式解析为真实 session_id
-        proactive_streams = await self._resolve_proactive_streams(raw_streams)
-        if not proactive_streams:
-            # 所有条目都解析失败 → 跳过本轮
-            return
-
-        # 找当前正在进行的活动
-        activity_info = await self._find_current_activity()
-        if activity_info is None:
-            return
-        activity_name, goal_type, start_minutes, _end_minutes, activity_params = activity_info
-
-        now = self._tz_manager.get_now()
-        current_min = now.hour * 60 + now.minute
-        date_str = now.strftime("%Y-%m-%d")
-
-        # 1. 频率调控（每个 stream 独立）
-        if cfg.enable_frequency_modulation:
-            await self._apply_frequency(proactive_streams, goal_type)
-
-        # 2. 主动发起判定（只在活动刚切换的前 5 分钟内才尝试）
-        if not cfg.enable_proactive_trigger:
-            return
-        if (current_min - start_minutes) > self.PROACTIVE_FRESH_WINDOW_MINUTES:
-            return  # 错过新鲜窗口
-
-        for stream_id in proactive_streams:
-            key = (stream_id, activity_name, date_str)
-            if key in self._proactive_history:
-                continue  # 同一天同一活动只触发一次
-            await self._trigger_proactive(stream_id, activity_name, goal_type, activity_params)
-            self._proactive_history[key] = time.time()
-
-    # ------------------------------------------------------------
-    # v4.4.1 新增：proactive_streams 格式解析
-    # ------------------------------------------------------------
-
-    async def _resolve_proactive_streams(self, raw_entries: list[str]) -> list[str]:
-        """把 ``proactive_streams`` 配置项解析为真实 session_id 列表。
-
-        支持三种格式（与 ``allowed_streams`` 一致）：
-            - ``session:<id>``       → 直接取 ``<id>``
-            - ``qq:group:<gid>``     → ``ctx.chat.get_stream_by_group_id`` 解析
-            - ``qq:private:<uid>``   → ``ctx.chat.get_stream_by_user_id`` 解析
-            - ``<id>``               → 当作 session_id 直接用（向后兼容）
-
-        遵守 CLAUDE.md 会话 ID 规范：**不自行计算 session_id**，解析失败的条目直接
-        跳过 + warn，不写入任何 fallback hash。
-
-        Args:
-            raw_entries: 配置文件中原始的 ``proactive_streams`` 列表。
-
-        Returns:
-            解析成功的 session_id 列表（按输入顺序，去重）。
+        - 群聊：``proactive_group_ids`` 直接填群号；**留空 = 所有群聊生效**；
+        - 其他会话：``proactive_other_streams`` 支持 ``session:<id>`` /
+          ``qq:private:<uid>`` 等原格式；留空 = 不包含其他会话。
         """
-        resolved: list[str] = []
+        cfg = self._plugin.config.proactive
+        streams: List[str] = []
+        seen: set[str] = set()
+
+        group_ids = [str(g).strip() for g in (cfg.proactive_group_ids or []) if str(g).strip()]
+        if group_ids:
+            for gid in group_ids:
+                sid = await self._resolve_group_id(gid)
+                if sid and sid not in seen:
+                    streams.append(sid)
+                    seen.add(sid)
+        else:
+            # 留空 = 所有群聊生效
+            for sid in await self._enumerate_group_streams():
+                if sid not in seen:
+                    streams.append(sid)
+                    seen.add(sid)
+
+        for sid in await self._resolve_proactive_streams(cfg.proactive_other_streams or []):
+            if sid not in seen:
+                streams.append(sid)
+                seen.add(sid)
+
+        return streams
+
+    async def _resolve_group_id(self, group_id: str) -> Optional[str]:
+        """把群号解析为 session_id（带解析缓存）。"""
+        entry = f"group:{group_id}"
+        now = time.time()
+        cached = self._resolved_cache.get(entry)
+        if cached is not None and now < cached[1]:
+            return cached[0]
+
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        session_id: Optional[str] = None
+        if ctx_obj is None or not hasattr(ctx_obj, "chat"):
+            logger.warning("无法解析群 %s：ctx.chat 能力不可用", group_id)
+        else:
+            try:
+                result = await ctx_obj.chat.get_stream_by_group_id(group_id, "qq")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"解析群 {group_id} 异常: {exc}")
+                result = None
+            session_id = self._extract_session_id(entry, result)
+
+        ttl = self.RESOLVE_CACHE_TTL_SUCCESS if session_id else self.RESOLVE_CACHE_TTL_FAILURE
+        self._resolved_cache[entry] = (session_id, now + ttl)
+        if session_id:
+            logger.info(f"解析群 {group_id} → session_id={session_id}")
+        return session_id
+
+    async def _enumerate_group_streams(self) -> List[str]:
+        """枚举所有群聊的 session_id（群白名单留空时使用）。"""
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        if ctx_obj is None or not hasattr(ctx_obj, "chat"):
+            return []
+        try:
+            streams_raw = await ctx_obj.chat.get_all_streams(platform="qq")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"获取聊天流列表失败: {exc}")
+            return []
+        if not isinstance(streams_raw, list):
+            return []
+
+        result: List[str] = []
+        for stream in streams_raw:
+            if not isinstance(stream, dict):
+                continue
+            group_id = str(stream.get("group_id") or "").strip()
+            session_id = str(stream.get("session_id") or stream.get("stream_id") or "").strip()
+            if group_id and session_id:
+                result.append(session_id)
+        return result
+
+    @staticmethod
+    def _extract_session_id(entry: str, result: Any) -> Optional[str]:
+        """从 chat 能力返回值中提取 session_id（遵守 SDK 解包顺序）。
+
+        SDK 的 _normalize_capability_result 对 chat.get_stream_by_xxx 自动解包：
+        先看是否 success=False，再看是否 None，最后才取 session_id。
+        """
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning(f"解析 {entry} 失败: {result.get('error', '主程序拒绝')}")
+            return None
+        if result is None:
+            logger.warning(f"解析 {entry} 失败：主程序未找到对应聊天流")
+            return None
+        if not isinstance(result, dict):
+            logger.warning(f"解析 {entry} 失败：SDK 返回类型异常 {type(result).__name__}")
+            return None
+        session_id = str(result.get("session_id") or "").strip()
+        if not session_id:
+            logger.warning(f"解析 {entry} 失败：返回 stream 无 session_id 字段")
+            return None
+        return session_id
+
+    async def _resolve_proactive_streams(self, raw_entries: List[str]) -> List[str]:
+        """解析其他会话白名单（session:<id> / qq:private:<uid> / 裸 id）。
+
+        遵守会话 ID 规范：不自行计算 session_id，解析失败的条目直接跳过 + warn。
+        """
+        resolved: List[str] = []
         seen: set[str] = set()
         now = time.time()
         ctx_obj = getattr(self._plugin, "ctx", None)
@@ -218,7 +302,6 @@ class ProactiveService:
             if not entry:
                 continue
 
-            # 命中缓存（含失败缓存）
             cached = self._resolved_cache.get(entry)
             if cached is not None and now < cached[1]:
                 resolved_sid = cached[0]
@@ -227,26 +310,16 @@ class ProactiveService:
                     seen.add(resolved_sid)
                 continue
 
-            # 解析逻辑：按格式分支
             session_id: Optional[str] = None
             if entry.startswith("session:"):
-                # session:<id> → 直接取
                 session_id = entry[len("session:"):].strip() or None
             elif ":group:" in entry:
-                # qq:group:<gid> → 用 chat_manager 解析
-                session_id = await self._resolve_via_chat_capability(
-                    entry, kind="group", ctx_obj=ctx_obj,
-                )
+                session_id = await self._resolve_via_chat_capability(entry, kind="group", ctx_obj=ctx_obj)
             elif ":private:" in entry:
-                # qq:private:<uid> → 用 chat_manager 解析
-                session_id = await self._resolve_via_chat_capability(
-                    entry, kind="private", ctx_obj=ctx_obj,
-                )
+                session_id = await self._resolve_via_chat_capability(entry, kind="private", ctx_obj=ctx_obj)
             else:
-                # 兜底：纯字符串直接当 session_id（向后兼容旧配置）
                 session_id = entry
 
-            # 写缓存
             ttl = self.RESOLVE_CACHE_TTL_SUCCESS if session_id else self.RESOLVE_CACHE_TTL_FAILURE
             self._resolved_cache[entry] = (session_id, now + ttl)
 
@@ -262,18 +335,9 @@ class ProactiveService:
         kind: str,
         ctx_obj: Any,
     ) -> Optional[str]:
-        """通过 ``ctx.chat`` 把 ``qq:group:<gid>`` / ``qq:private:<uid>`` 解析为 session_id。
-
-        Args:
-            entry: 原始配置条目（如 ``"qq:group:123456"``）。
-            kind: ``"group"`` 或 ``"private"``。
-            ctx_obj: ``self._plugin.ctx``，可能为 ``None``（SDK 不可用时）。
-
-        Returns:
-            真实 session_id；解析失败返回 ``None`` 并 warn。
-        """
+        """通过 ``ctx.chat`` 把 ``qq:group:<gid>`` / ``qq:private:<uid>`` 解析为 session_id。"""
         if ctx_obj is None or not hasattr(ctx_obj, "chat"):
-            logger.warning(f"无法解析 {entry}：ctx.chat 能力不可用（SDK < 2.4？）")
+            logger.warning(f"无法解析 {entry}：ctx.chat 能力不可用")
             return None
 
         parts = entry.split(":", 2)
@@ -296,38 +360,232 @@ class ProactiveService:
             logger.warning(f"解析 {entry} 异常: {exc}")
             return None
 
-        # SDK 的 _normalize_capability_result 对 chat.get_stream_by_xxx 自动解包：
-        # - Host 原始 `{"success": True, "stream": <dict>}` 被剥出 → 直接拿到 stream dict
-        # - Host 找不到对应聊天流时 stream 字段为 None → SDK 透传 None 给我们
-        # - 真正失败（capability_denied 等）返回原始 `{"success": False, "error": "..."}`
-        #   （没有 stream key 时不被剥包）
-        # 所以判断顺序必须是：先看是否含 success=False，再看是否 None，最后才取 session_id
-        if isinstance(result, dict) and result.get("success") is False:
-            logger.warning(f"解析 {entry} 失败: {result.get('error', '主程序拒绝')}")
-            return None
-        if result is None:
-            logger.warning(f"解析 {entry} 失败：主程序未找到对应聊天流（可能 bot 与该 QQ 未建立过私聊 / 已退群）")
-            return None
-        if not isinstance(result, dict):
-            logger.warning(f"解析 {entry} 失败：SDK 返回类型异常 {type(result).__name__}={result!r}")
-            return None
-        session_id = str(result.get("session_id") or "").strip()
-        if not session_id:
-            logger.warning(f"解析 {entry} 失败：返回 stream 无 session_id 字段（result={result!r}）")
-            return None
-        logger.info(f"解析成功 {entry} → session_id={session_id}")
+        session_id = self._extract_session_id(entry, result)
+        if session_id:
+            logger.info(f"解析成功 {entry} → session_id={session_id}")
         return session_id
 
-    async def _find_current_activity(
+    # ------------------------------------------------------------
+    # 主循环逻辑
+    # ------------------------------------------------------------
+
+    async def _check_and_act(self) -> None:
+        """读当前活动 → 安排/落实 主动发起、早间问好、频率调控。"""
+        cfg_p = self._plugin.config.proactive
+        if not (
+            cfg_p.enable_proactive_trigger
+            or cfg_p.enable_frequency_modulation
+            or cfg_p.enable_morning_greeting
+        ):
+            return
+
+        streams = await self._resolve_target_streams()
+        now = self._tz_manager.get_now()
+        now_ts = time.time()
+        current_min = now.hour * 60 + now.minute
+        date_str = now.strftime("%Y-%m-%d")
+        in_sleep = self._in_sleep_window(current_min)
+
+        activity_info = self._find_current_activity()
+        first_activity = self._find_first_activity_today()
+
+        # 1. 频率调控（每个 stream 独立，因子不变则跳过）
+        if cfg_p.enable_frequency_modulation and activity_info is not None:
+            _, goal_type, _, _, _ = activity_info
+            await self._apply_frequency(streams, goal_type)
+
+        # 睡眠时段（按配置的入睡/起床时间判定，含无睡眠模式）：不安排新的主动发起；
+        # 已排期的延迟到点后也会在落实阶段因处于睡眠时段被放弃
+        if not in_sleep:
+            # 2. 活动切换主动发起：安排独立随机延迟（不覆盖当天第一个活动）
+            if cfg_p.enable_proactive_trigger and activity_info is not None:
+                activity_name, _goal_type, start_minutes, _end, _params = activity_info
+                is_first_activity = (
+                    first_activity is not None
+                    and first_activity[0] == activity_name
+                    and first_activity[1] == start_minutes
+                )
+                elapsed = current_min - start_minutes
+                if elapsed < 0:
+                    elapsed += 24 * 60  # 跨午夜延续：按真实经过时间计算
+                if elapsed * 60 <= self._fresh_window_seconds() and not is_first_activity:
+                    for stream_id in streams:
+                        key = (stream_id, activity_name, date_str)
+                        if key in self._proactive_history or key in self._pending_triggers:
+                            continue
+                        self._pending_triggers[key] = now_ts + self._random_delay_seconds()
+                        logger.info(
+                            f"⏳ 安排主动发起: stream={stream_id}, activity={activity_name}, "
+                            f"延迟 {int(self._pending_triggers[key] - now_ts)}s"
+                        )
+
+            # 3. 早间问好：仅当天第一个活动进行中时安排
+            if cfg_p.enable_morning_greeting and activity_info is not None and first_activity is not None:
+                activity_name, _goal_type, start_minutes, _end, _params = activity_info
+                if activity_name == first_activity[0] and start_minutes == first_activity[1]:
+                    for stream_id in streams:
+                        mkey = (stream_id, date_str)
+                        if mkey in self._morning_history or mkey in self._morning_pending:
+                            continue
+                        self._morning_pending[mkey] = now_ts + self._random_delay_seconds()
+                        logger.info(f"🌅 安排早间问好: stream={stream_id}")
+
+        # 4. 清理跨天的残留排期
+        for key in [k for k in self._pending_triggers if k[2] != date_str]:
+            self._pending_triggers.pop(key, None)
+        for mkey in [k for k in self._morning_pending if k[1] != date_str]:
+            self._morning_pending.pop(mkey, None)
+
+        # 5. 落实到点的主动发起（重新校验：活动未切换、未进入睡眠时段）
+        due_keys = [k for k, fire_at in self._pending_triggers.items() if now_ts >= fire_at]
+        for key in due_keys:
+            self._pending_triggers.pop(key, None)
+            stream_id, activity_name, key_date = key
+            if key_date != date_str:
+                continue
+            if self._in_sleep_window(current_min):
+                logger.info(f"主动发起放弃（已进入睡眠时段）: stream={stream_id}, activity={activity_name}")
+                continue
+            current = self._find_current_activity()
+            if current is None or current[0] != activity_name:
+                logger.info(f"主动发起放弃（活动已切换）: stream={stream_id}, activity={activity_name}")
+                continue
+            await self._trigger_proactive(stream_id, activity_name, current[1], current[4])
+            self._proactive_history[key] = time.time()
+
+        # 6. 落实早间问好（含"需要激活"判定）
+        if cfg_p.enable_morning_greeting and first_activity is not None:
+            await self._process_morning_pending(streams, first_activity, date_str, now_ts, in_sleep)
+
+    # ------------------------------------------------------------
+    # 早间问好
+    # ------------------------------------------------------------
+
+    async def _process_morning_pending(
         self,
-    ) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
+        streams: List[str],
+        first_activity: Tuple[str, int, int],
+        date_str: str,
+        now_ts: float,
+        in_sleep: bool,
+    ) -> None:
+        """处理早间问好的待触发队列（含"需要激活"的观察与放弃）。"""
+        cfg_p = self._plugin.config.proactive
+        deadline_ts = self._morning_deadline_ts(first_activity)
+
+        for mkey in list(self._morning_pending.keys()):
+            stream_id, key_date = mkey
+            if key_date != date_str:
+                self._morning_pending.pop(mkey, None)  # 跨天残留，清理
+                continue
+            fire_at = self._morning_pending.get(mkey)
+            if fire_at is None or now_ts < fire_at:
+                continue
+            self._morning_pending.pop(mkey, None)
+
+            if in_sleep:
+                logger.info(f"🌅 早间问好放弃（已进入睡眠时段）: stream={stream_id}")
+                self._morning_history[mkey] = "abandoned"
+                continue
+
+            if cfg_p.morning_greeting_require_activation:
+                # 需要激活：有人说话 → 问好；截止（第一个活动结束前 10 分钟）仍无人 → 放弃
+                activated = await self._stream_activated_since_wake(stream_id, first_activity)
+                if not activated:
+                    if deadline_ts is None or now_ts >= deadline_ts:
+                        self._morning_history[mkey] = "abandoned"
+                        logger.info(
+                            f"🌅 早间问好放弃（截止仍无人说话）: stream={stream_id}, "
+                            f"deadline={'不可用' if deadline_ts is None else '已过'}"
+                        )
+                        continue
+                    # 重新排队：下一个节拍继续观察，直到截止时刻
+                    self._morning_pending[mkey] = now_ts + self.LOOP_INTERVAL_SECONDS
+                    continue
+
+            await self._trigger_morning_greeting(stream_id, first_activity[0])
+            self._morning_history[mkey] = "fired"
+
+    def _morning_deadline_ts(self, first_activity: Tuple[str, int, int]) -> Optional[float]:
+        """计算早间问好的观察截止时间戳（第一个活动结束前 10 分钟）。"""
+        now = self._tz_manager.get_now()
+        try:
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            base = midnight.timestamp()
+        except Exception:  # noqa: BLE001
+            return None
+        end_minutes = max(1, first_activity[2] - _MORNING_DEADLINE_MARGIN_MINUTES)
+        return base + end_minutes * 60
+
+    async def _stream_activated_since_wake(
+        self,
+        stream_id: str,
+        first_activity: Tuple[str, int, int],
+    ) -> bool:
+        """检查会话自 bot 睡醒（第一个活动开始）起是否有人发过消息。"""
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        if ctx_obj is None or not hasattr(ctx_obj, "message"):
+            return False
+        try:
+            now = self._tz_manager.get_now()
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            wake_ts = midnight.timestamp() + first_activity[1] * 60
+            msgs = await ctx_obj.message.get_by_time_in_chat(
+                stream_id, str(wake_ts), str(time.time()), limit=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"查询会话消息失败: {exc}")
+            return False
+        if isinstance(msgs, dict):
+            msgs = msgs.get("messages") or msgs.get("data") or []
+        return bool(msgs)
+
+    async def _trigger_morning_greeting(self, stream_id: str, activity_name: str) -> None:
+        """对一个会话触发早间问好。"""
+        ctx_obj = getattr(self._plugin, "ctx", None)
+        if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
+            return
+        intent_prompt = _MORNING_GREETING_INTENT.format(activity_name=activity_name)
+        try:
+            result = await ctx_obj.maisaka.trigger_proactive(
+                stream_id=stream_id,
+                intent=intent_prompt,
+                reason="autonomous_planning_v4: 早间问好",
+                priority="normal",
+            )
+            if isinstance(result, dict) and not result.get("success", False):
+                logger.warning(f"早间问好被拒: stream={stream_id}, reason={result.get('error')}")
+                return
+            logger.info(f"🌅 早间问好触发: stream={stream_id}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"早间问好异常: stream={stream_id}, {exc}")
+
+    # ------------------------------------------------------------
+    # 查询辅助
+    # ------------------------------------------------------------
+
+    def _in_sleep_window(self, current_min: int) -> bool:
+        """判断当前分钟是否处于设定的睡眠时段（入睡 → 次日起床）。
+
+        按配置的 ``sleep_time`` / ``wake_time`` 判定，与是否开启无睡眠模式无关——
+        只要是设定的睡眠时间，主动行为都不触发。
+        """
+        cfg = self._plugin.config.schedule
+        wake_min = _parse_hhmm_minutes(cfg.wake_time, _DEFAULT_WAKE_MINUTES)
+        sleep_min = _parse_hhmm_minutes(cfg.sleep_time, _DEFAULT_SLEEP_MINUTES)
+        if wake_min == sleep_min:
+            return False
+        if wake_min < sleep_min:
+            # 清醒 [wake, sleep) 同日；睡眠 [sleep, 24:00) ∪ [0, wake)
+            return not (wake_min <= current_min < sleep_min)
+        # 跨午夜夜猫子：清醒 [wake, 24:00) ∪ [0, sleep)；睡眠 [sleep, wake) 同日
+        return sleep_min <= current_min < wake_min
+
+    def _find_current_activity(self) -> Optional[Tuple[str, str, int, int, Dict[str, Any]]]:
         """从 GoalManager 找当前正在进行的活动。
 
         Returns:
-            ``(name, goal_type, start_minutes, end_minutes, parameters)`` —— 多返回的
-            ``parameters`` dict 透传 goal.parameters 原始内容，供下游识别
-            ``is_commitment`` / ``commitment_*`` 等 v4.4.5 新增字段。
-            没找到时为 ``None``。
+            ``(name, goal_type, start_minutes, end_minutes, parameters)``；没找到时为 None。
         """
         try:
             gm = get_goal_manager()
@@ -366,22 +624,63 @@ class ProactiveService:
             logger.debug(f"查找当前活动失败: {exc}")
         return None
 
+    def _find_first_activity_today(self) -> Optional[Tuple[str, int, int]]:
+        """找今天日程中开始时间最早的活动（即睡醒后的第一个活动）。
+
+        Returns:
+            ``(name, start_minutes, end_minutes)``；今天没有日程时为 None。
+        """
+        try:
+            goals = get_goal_manager().get_schedule_goals(chat_id="global")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"查找今日日程失败: {exc}")
+            return None
+        best: Optional[Tuple[str, int, int]] = None
+        for goal in goals:
+            tw = None
+            if goal.parameters and "time_window" in goal.parameters:
+                tw = goal.parameters.get("time_window")
+            elif goal.conditions:
+                tw = goal.conditions.get("time_window")
+            if not tw:
+                continue
+            start, end = parse_time_window(tw)
+            if start is None or end is None:
+                continue
+            if best is None or start < best[1]:
+                best = (goal.name, start, end)
+        return best
+
+    def _fresh_window_seconds(self) -> float:
+        """触发窗口（秒），来自配置 ``proactive_fresh_window_minutes``。"""
+        try:
+            minutes = int(self._plugin.config.proactive.proactive_fresh_window_minutes)
+        except (TypeError, ValueError):
+            minutes = 10
+        return max(1, minutes) * 60.0
+
+    def _random_delay_seconds(self) -> float:
+        """生成独立随机延迟：窗口内随机，预留轮询粒度，保证窗口内必然触发。"""
+        upper = max(self.RANDOM_DELAY_MIN_SECONDS + 1.0, self._fresh_window_seconds() - self.LOOP_INTERVAL_SECONDS)
+        return random.uniform(self.RANDOM_DELAY_MIN_SECONDS, upper)
+
     # ------------------------------------------------------------
     # 频率调控
     # ------------------------------------------------------------
 
-    async def _apply_frequency(self, streams: list[str], goal_type: str) -> None:
+    async def _apply_frequency(self, streams: List[str], goal_type: str) -> None:
         """按 goal_type 映射频率因子并对每个 stream 应用。
 
-        Args:
-            streams: 目标聊天流 ID 列表
-            goal_type: 当前活动类型
+        日志策略：整个批次最多输出一条 DEBUG 汇总（成功 / 失败各一条），
+        因子未变化的 stream 直接跳过——避免多会话 / 插件重载场景下逐条刷屏。
         """
         target_factor = _FREQUENCY_FACTOR_BY_GOAL_TYPE.get(goal_type, 1.0)
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "frequency"):
             return  # SDK 未提供（v2.4 以下版本兼容）
 
+        applied: List[str] = []
+        failed: List[Tuple[str, str]] = []
         for stream_id in streams:
             # 同一 stream 因子不变则跳过，避免反复 set_adjust 刷日志
             if self._current_factor.get(stream_id) == target_factor:
@@ -390,18 +689,24 @@ class ProactiveService:
                 result = await ctx_obj.frequency.set_adjust(stream_id, target_factor)
                 # SDK 返回 {"success": bool, ...}
                 if isinstance(result, dict) and not result.get("success", False):
-                    logger.debug(
-                        f"频率调控失败: stream={stream_id}, factor={target_factor}, "
-                        f"reason={result.get('error')}"
-                    )
+                    failed.append((stream_id, str(result.get("error") or "未知原因")))
                     continue
                 self._current_factor[stream_id] = target_factor
-                logger.info(
-                    f"🎚️ 频率调控: stream={stream_id}, "
-                    f"goal_type={goal_type}, factor={target_factor}"
-                )
+                applied.append(stream_id)
             except Exception as exc:  # noqa: BLE001
-                logger.debug(f"频率调控异常: stream={stream_id}, {exc}")
+                failed.append((stream_id, str(exc)))
+
+        if applied:
+            logger.debug(
+                f"🎚️ 频率调控: goal_type={goal_type}, factor={target_factor}, "
+                f"已应用到 {len(applied)} 个会话: {', '.join(applied)}"
+            )
+        if failed:
+            logger.debug(
+                f"频率调控失败: goal_type={goal_type}, factor={target_factor}, "
+                f"共 {len(failed)} 个: "
+                + ", ".join(f"{sid}({reason})" for sid, reason in failed)
+            )
 
     # ------------------------------------------------------------
     # 主动发起
@@ -414,16 +719,7 @@ class ProactiveService:
         goal_type: str,
         activity_params: Dict[str, Any],
     ) -> None:
-        """对单个聊天流触发一次主动开口。
-
-        Args:
-            stream_id: 目标聊天流 ID
-            activity_name: 当前活动名（用于注入 intent prompt）
-            goal_type: 当前活动类型（决定 intent 模板）
-            activity_params: 当前活动的 goal.parameters。若含 ``is_commitment=True``
-                则切换到强指令模板（v4.4.5）—— 普通模板里"自行决定是否回复"会让 LLM
-                陷入工具调用循环不发消息，约定来源的活动必须强制发出。
-        """
+        """对一个聊天流触发一次主动开口。"""
         ctx_obj = getattr(self._plugin, "ctx", None)
         if ctx_obj is None or not hasattr(ctx_obj, "maisaka"):
             return

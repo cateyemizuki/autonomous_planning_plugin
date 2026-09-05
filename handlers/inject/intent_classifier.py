@@ -1,26 +1,15 @@
-"""用户意图分类器模块
+﻿"""用户意图分类器模块
 
 基于规则的轻量级意图分类，用于判断用户消息的意图类型。
 通过关键词匹配和权重评分，准确识别用户是否在询问当前状态、未来计划等。
 """
 
 from enum import Enum
-from typing import Tuple, Optional
+from typing import Tuple
 import logging
 import re
 
-from dataclasses import dataclass
-
-
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TimeRange:
-    """时间范围数据类"""
-    name: str           # 时间段名称（如"下午"）
-    start_hour: int     # 开始小时
-    end_hour: int       # 结束小时
 
 
 class UserIntent(Enum):
@@ -104,18 +93,6 @@ class IntentClassifier:
             "哈哈", "呵呵", "嘿嘿",
             "好的", "ok", "嗯", "嗯嗯",
             "谢谢", "多谢", "感谢",
-        }
-
-        # 🆕 时间段映射表
-        self.time_ranges = {
-            "凌晨": TimeRange("凌晨", 0, 6),
-            "早上": TimeRange("早上", 6, 9),
-            "上午": TimeRange("上午", 9, 12),
-            "中午": TimeRange("中午", 11, 14),
-            "下午": TimeRange("下午", 14, 18),
-            "傍晚": TimeRange("傍晚", 17, 19),
-            "晚上": TimeRange("晚上", 18, 23),
-            "深夜": TimeRange("深夜", 22, 24),
         }
 
         # 预编译正则表达式（性能优化）
@@ -257,53 +234,3 @@ class IntentClassifier:
         final_score = min(1.0, base_score + weight_bonus)
 
         return final_score
-
-    def get_intent_description(self, intent: UserIntent) -> str:
-        """获取意图的中文描述
-
-        Args:
-            intent: 意图类型
-
-        Returns:
-            中文描述字符串
-        """
-        descriptions = {
-            UserIntent.QUERY_CURRENT: "询问当前状态",
-            UserIntent.QUERY_FUTURE: "询问未来计划",
-            UserIntent.CASUAL_CHAT: "闲聊寒暄",
-            UserIntent.TECH_QUESTION: "技术问答",
-            UserIntent.COMMAND_EXECUTION: "命令执行",
-            UserIntent.UNKNOWN: "未知意图",
-        }
-        return descriptions.get(intent, "未知")
-
-    def extract_time_range(self, message: str) -> Optional[TimeRange]:
-        """🆕 从用户消息中提取时间段
-
-        识别用户询问的时间段（如"下午"、"晚上"），用于过滤活动列表。
-
-        Args:
-            message: 用户消息文本
-
-        Returns:
-            TimeRange对象，如果未识别到时间段则返回None
-
-        Examples:
-            >>> classifier.extract_time_range("下午有什么安排")
-            TimeRange(name='下午', start_hour=14, end_hour=18)
-
-            >>> classifier.extract_time_range("晚上呢")
-            TimeRange(name='晚上', start_hour=18, end_hour=23)
-        """
-        if not message:
-            return None
-
-        message_lower = message.lower().strip()
-
-        # 按优先级匹配时间段（从长到短，避免误匹配）
-        for time_word, time_range in self.time_ranges.items():
-            if time_word in message_lower:
-                logger.debug(f"识别到时间段: {time_word} ({time_range.start_hour}-{time_range.end_hour}时)")
-                return time_range
-
-        return None

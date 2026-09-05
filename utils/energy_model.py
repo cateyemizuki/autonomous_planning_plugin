@@ -1,4 +1,4 @@
-"""时段能量基线模型。
+﻿"""时段能量基线模型。
 
 按 24 小时时段映射能量值（0-100），用于注入时提示 LLM 当前 bot 的精神状态。
 参考真实人类作息：凌晨低 / 上午高峰 / 午后微疲 / 下午次高峰 / 晚间放松 / 深夜撑不住。
@@ -78,23 +78,3 @@ def describe_energy(energy: int) -> str:
     if energy >= 10:
         return "困了"
     return "快撑不住"
-
-
-def get_time_period(hour: int) -> str:
-    """根据小时返回时段标签（用于碎碎念语料）。"""
-    clamped = max(0, min(23, int(hour)))
-    if clamped < 6:
-        return "凌晨"
-    if clamped < 9:
-        return "早晨"
-    if clamped < 12:
-        return "上午"
-    if clamped < 14:
-        return "中午"
-    if clamped < 18:
-        return "下午"
-    if clamped < 21:
-        return "傍晚"
-    if clamped < 23:
-        return "晚上"
-    return "深夜"

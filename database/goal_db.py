@@ -1,4 +1,4 @@
-"""数据库模块 - 自主规划插件
+﻿"""数据库模块 - 自主规划插件
 
 本模块提供基于SQLite的目标管理数据库操作，取代之前基于JSON文件的存储方式。
 
@@ -21,7 +21,7 @@
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import json
 import logging
 import sqlite3
@@ -349,46 +349,6 @@ class GoalDatabase:
         cursor = conn.execute(query, params)
         return [self._row_to_dict(row) for row in cursor.fetchall()]
 
-    def get_goals_in_time_window(
-        self,
-        chat_id: str,
-        start_minutes: int,
-        end_minutes: int,
-        status: str = "active"
-    ) -> List[Dict[str, Any]]:
-        """获取指定时间窗口内的目标（数据库层过滤）
-
-        使用JSON函数直接在数据库层过滤，避免返回所有目标后在Python层过滤。
-
-        Args:
-            chat_id: 聊天ID
-            start_minutes: 时间窗口起始（从午夜开始的分钟数）
-            end_minutes: 时间窗口结束（从午夜开始的分钟数）
-            status: 目标状态（默认：active）
-
-        Returns:
-            符合时间窗口的目标列表
-
-        性能提升：
-            - 使用复合索引 idx_goals_chat_status_time
-            - 数据库层过滤减少网络传输
-            - 预期性能提升70%（50ms → 8ms）
-        """
-        conn = self._get_connection()
-
-        # 使用JSON函数在数据库层过滤时间窗口
-        query = """
-            SELECT * FROM goals
-            WHERE chat_id = ? AND status = ?
-            AND json_extract(parameters, '$.time_window[0]') IS NOT NULL
-            AND json_extract(parameters, '$.time_window[0]') <= ?
-            AND json_extract(parameters, '$.time_window[1]') >= ?
-            ORDER BY created_at DESC
-        """
-
-        cursor = conn.execute(query, (chat_id, status, end_minutes, start_minutes))
-        return [self._row_to_dict(row) for row in cursor.fetchall()]
-
     def update_goal(self, goal_id: str, **kwargs) -> bool:
         """Update goal fields.
 
@@ -483,32 +443,6 @@ class GoalDatabase:
 
         return deleted_count
 
-    def count_goals(self, chat_id: Optional[str] = None, status: Optional[str] = None) -> int:
-        """Count goals with optional filtering.
-
-        Args:
-            chat_id: Filter by chat ID
-            status: Filter by status
-
-        Returns:
-            Number of goals matching filters
-        """
-        conn = self._get_connection()
-
-        query = "SELECT COUNT(*) FROM goals WHERE 1=1"
-        params = []
-
-        if chat_id:
-            query += " AND chat_id = ?"
-            params.append(chat_id)
-
-        if status:
-            query += " AND status = ?"
-            params.append(status)
-
-        cursor = conn.execute(query, params)
-        return cursor.fetchone()[0]
-
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """Convert SQLite row to dictionary.
 
@@ -537,41 +471,3 @@ class GoalDatabase:
             self._local.connection.close()
             delattr(self._local, 'connection')
             logger.debug("Closed database connection")
-
-    def vacuum(self) -> None:
-        """Optimize database by running VACUUM.
-
-        This reclaims unused space and optimizes the database file.
-        Should be run periodically (e.g., weekly).
-        """
-        conn = self._get_connection()
-        conn.execute("VACUUM")
-        logger.info("Database optimized with VACUUM")
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get database statistics.
-
-        Returns:
-            Dictionary with database stats
-        """
-        conn = self._get_connection()
-
-        stats = {}
-
-        # Total goals
-        cursor = conn.execute("SELECT COUNT(*) FROM goals")
-        stats['total_goals'] = cursor.fetchone()[0]
-
-        # Goals by status
-        cursor = conn.execute("""
-            SELECT status, COUNT(*) as count
-            FROM goals
-            GROUP BY status
-        """)
-        stats['by_status'] = {row['status']: row['count'] for row in cursor.fetchall()}
-
-        # Database file size
-        stats['db_size_bytes'] = self.db_path.stat().st_size if self.db_path.exists() else 0
-        stats['db_size_mb'] = round(stats['db_size_bytes'] / 1024 / 1024, 2)
-
-        return stats

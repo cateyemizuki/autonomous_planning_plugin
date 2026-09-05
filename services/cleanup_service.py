@@ -1,4 +1,4 @@
-"""目标清理 / 自动调度 后台任务的业务实现。
+﻿"""目标清理 / 自动调度 后台任务的业务实现。
 
 对应旧版 ``handlers/handlers.py:AutonomousPlannerEventHandler`` 与
 ``planner/auto_scheduler.py:ScheduleAutoScheduler``。
@@ -82,7 +82,7 @@ class CleanupService:
             logger.info(f"🧹 清理了 {cleaned_count} 个旧目标（{cleanup_days} 天前）")
 
         # 3. 清理过期的 LLM 调用日志
-        cfg = self._plugin.config.schedule
+        cfg = self._plugin.config.admin
         if cfg.llm_log_enabled:
             try:
                 from ..utils.llm_logger import cleanup_old_logs

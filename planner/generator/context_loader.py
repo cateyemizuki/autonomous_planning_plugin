@@ -1,4 +1,4 @@
-"""Context Loader Module.
+﻿"""Context Loader Module.
 
 This module provides historical context loading functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
@@ -58,14 +58,6 @@ class ScheduleContextLoader:
         elif goal.conditions and "time_window" in goal.conditions:
             return goal.conditions["time_window"]
         return None
-
-    def load_yesterday_schedule_summary(self) -> Optional[str]:
-        """加载昨日日程摘要（向后兼容，等价于 load_recent_schedule_summary(days=1)）。
-
-        Returns:
-            昨日日程摘要字符串，如果加载失败则返回默认文本
-        """
-        return self.load_recent_schedule_summary(days=1)
 
     def load_recent_schedule_summary(self, days: int = 3) -> Optional[str]:
         """加载最近 N 天的日程摘要，用于让 LLM 在生成新日程时避免重复。

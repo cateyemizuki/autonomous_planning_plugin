@@ -14,7 +14,6 @@
 5. 保持向后兼容的公开API
 """
 
-from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 import asyncio
@@ -247,120 +246,6 @@ class ScheduleGenerator:
         )
 
         logger.info(f"✅ 每日计划生成完成: {len(schedule_items)}个活动")
-        return schedule
-
-    async def generate_weekly_schedule(
-        self,
-        user_id: str,
-        chat_id: str,
-        preferences: Optional[Dict[str, Any]] = None,
-        use_llm: bool = True,
-        use_multi_round: Optional[bool] = None
-    ) -> Schedule:
-        """生成每周计划
-
-        Args:
-            user_id: 用户ID
-            chat_id: 聊天ID
-            preferences: 用户偏好设置
-            use_llm: 是否使用LLM生成（保留参数兼容性）
-            use_multi_round: 是否使用多轮生成（None=从配置读取）
-
-        Returns:
-            Schedule对象
-        """
-        logger.debug(f"生成每周计划: user={user_id}, chat={chat_id}")
-
-        # 从配置读取多轮生成设置
-        if use_multi_round is None:
-            use_multi_round = self.config.use_multi_round
-
-        preferences = preferences or {}
-
-        # 生成日程项
-        if use_multi_round:
-            schedule_items = await self._generate_with_multi_round(
-                schedule_type=ScheduleType.WEEKLY,
-                user_id=user_id,
-                chat_id=chat_id,
-                preferences=preferences
-            )
-        else:
-            schedule_items = await self._generate_single_round(
-                schedule_type=ScheduleType.WEEKLY,
-                user_id=user_id,
-                chat_id=chat_id,
-                preferences=preferences
-            )
-
-        # 获取本周日期范围
-        today = self.tz_manager.get_now()
-        start_of_week = today - timedelta(days=today.weekday())
-        end_of_week = start_of_week + timedelta(days=6)
-
-        schedule = Schedule(
-            schedule_type=ScheduleType.WEEKLY,
-            name=f"每周计划 - {start_of_week.strftime('%m/%d')} 至 {end_of_week.strftime('%m/%d')}",
-            items=schedule_items,
-            metadata={"preferences": preferences}
-        )
-
-        logger.info(f"✅ 每周计划生成完成: {len(schedule_items)}个活动")
-        return schedule
-
-    async def generate_monthly_schedule(
-        self,
-        user_id: str,
-        chat_id: str,
-        preferences: Optional[Dict[str, Any]] = None,
-        use_llm: bool = True,
-        use_multi_round: Optional[bool] = None
-    ) -> Schedule:
-        """生成每月计划
-
-        Args:
-            user_id: 用户ID
-            chat_id: 聊天ID
-            preferences: 用户偏好设置
-            use_llm: 是否使用LLM生成（保留参数兼容性）
-            use_multi_round: 是否使用多轮生成（None=从配置读取）
-
-        Returns:
-            Schedule对象
-        """
-        logger.debug(f"生成每月计划: user={user_id}, chat={chat_id}")
-
-        # 从配置读取多轮生成设置
-        if use_multi_round is None:
-            use_multi_round = self.config.use_multi_round
-
-        preferences = preferences or {}
-
-        # 生成日程项
-        if use_multi_round:
-            schedule_items = await self._generate_with_multi_round(
-                schedule_type=ScheduleType.MONTHLY,
-                user_id=user_id,
-                chat_id=chat_id,
-                preferences=preferences
-            )
-        else:
-            schedule_items = await self._generate_single_round(
-                schedule_type=ScheduleType.MONTHLY,
-                user_id=user_id,
-                chat_id=chat_id,
-                preferences=preferences
-            )
-
-        today = self.tz_manager.get_now()
-        schedule = Schedule(
-            schedule_type=ScheduleType.MONTHLY,
-            name=f"每月计划 - {today.strftime('%Y年%m月')}",
-            items=schedule_items,
-            metadata={"preferences": preferences}
-        )
-
-        logger.info(f"✅ 每月计划生成完成: {len(schedule_items)}个活动")
         return schedule
 
     async def apply_schedule(
@@ -793,7 +678,10 @@ class ScheduleGenerator:
         if not bool(getattr(self.config, "no_sleep_mode", False)):
             return items, []
 
-        sleep_keywords = ("睡觉", "睡眠", "安睡", "睡午觉", "小憩", "补觉", "入睡", "瞌睡", "就寝", "夜间睡眠")
+        sleep_keywords = (
+            "睡觉", "睡眠", "安睡", "睡午觉", "午睡", "小憩", "补觉", "入睡",
+            "瞌睡", "就寝", "夜间睡眠", "安眠", "午休", "打盹", "赖床",
+        )
         converted = 0
         for item in items:
             name = str(item.get("name", "") or "")

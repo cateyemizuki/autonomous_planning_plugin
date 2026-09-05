@@ -1,4 +1,4 @@
-"""活动状态分析器模块
+﻿"""活动状态分析器模块
 
 分析当前活动的进度状态，并生成符合人设的情感化描述。
 根据活动类型和进度，动态生成自然的状态文本。
@@ -293,58 +293,3 @@ class ActivityStateAnalyzer:
         # 随机选择一个描述（增加多样性）
         selected = random.choice(descriptions)
         return selected
-
-    def get_progress_description(
-        self,
-        start_minutes: int,
-        end_minutes: int,
-        current_minutes: int
-    ) -> str:
-        """获取活动进度的文字描述
-
-        Args:
-            start_minutes: 开始时间（分钟）
-            end_minutes: 结束时间（分钟）
-            current_minutes: 当前时间（分钟）
-
-        Returns:
-            进度描述文字
-
-        Examples:
-            >>> analyzer = ActivityStateAnalyzer()
-            >>> analyzer.get_progress_description(540, 660, 600)
-            "已进行1小时，还剩1小时"
-        """
-        total_duration = end_minutes - start_minutes
-        elapsed = current_minutes - start_minutes
-        remaining = end_minutes - current_minutes
-
-        if elapsed <= 0:
-            return "刚开始"
-        elif remaining <= 0:
-            return "即将结束"
-
-        # 转换为小时和分钟
-        elapsed_hours = elapsed // 60
-        elapsed_mins = elapsed % 60
-        remaining_hours = remaining // 60
-        remaining_mins = remaining % 60
-
-        # 构建描述
-        parts = []
-
-        if elapsed_hours > 0:
-            parts.append(f"已进行{elapsed_hours}小时")
-            if elapsed_mins > 0:
-                parts[-1] += f"{elapsed_mins}分钟"
-        elif elapsed_mins > 0:
-            parts.append(f"已进行{elapsed_mins}分钟")
-
-        if remaining_hours > 0:
-            parts.append(f"还剩{remaining_hours}小时")
-            if remaining_mins > 0:
-                parts[-1] += f"{remaining_mins}分钟"
-        elif remaining_mins > 0:
-            parts.append(f"还剩{remaining_mins}分钟")
-
-        return "，".join(parts)

@@ -1,14 +1,14 @@
-"""日程注入业务实现（HookHandler 入口：``maisaka.planner.before_request``）。
+﻿"""日程注入业务实现（HookHandler 入口：``maisaka.planner.before_request``）。
 
 业务子模块（IntentClassifier / ActivityStateAnalyzer / InjectOptimizer /
-ContentTemplateEngine / ConversationContextCache）实现于 ``handlers/inject/``。
+ConversationContextCache）实现于 ``handlers/inject/``。
 
 向 LLM 请求注入：在 ``messages: list[PromptMessage]`` 的第一条 system 消息
 之后插入一条新的 system 消息，承载当前日程信息。
 
 v4.2 改造点：
     - 删除 smart/rule 双模式，合并为单管道（IntentClassifier → InjectOptimizer →
-      _render_unified_prompt）。``inject_mode`` 配置字段保留仅为向后兼容
+      _render_unified_prompt）。旧 ``inject_mode`` 字段已移除。
     - 按 intent 路由模板复杂度：QUERY_CURRENT ~70 token / QUERY_FUTURE ~90 token /
       CASUAL_CHAT ~25 token，相比 v4.1 smart 平均省 50% 注入 token
     - 当前活动剩余 0~15 分钟时附"约还剩 X 分钟"时间衰减提示
@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from ..handlers.inject import (
         ActivityState,
         ActivityStateAnalyzer,
-        ContentTemplateEngine,
         ConversationContextCache,
         InjectOptimizer,
         IntentClassifier,
@@ -56,23 +55,6 @@ if TYPE_CHECKING:
     from ..plugin import AutonomousPlanningPluginV4
 
 logger = logging.getLogger(__name__)
-
-
-# 时间相关关键词（用于传统模式判断是否需要注入日程）
-_TIME_KEYWORDS = {
-    "现在", "当前", "正在", "在做", "在干",
-    "今天", "今日", "今早", "今晚",
-    "明天", "昨天", "后天", "前天",
-    "几点", "什么时候", "多久", "时间",
-    "安排", "计划", "日程", "行程",
-    "接下来", "等下", "稍后", "之后",
-    "早上", "中午", "下午", "晚上", "夜里",
-    "忙", "空闲", "有空", "在忙",
-    "做什么", "干什么", "要做",
-}
-
-# 预编译正则（一次匹配所有时间关键词）
-_TIME_KEYWORDS_PATTERN = re.compile("|".join(_TIME_KEYWORDS))
 
 
 class InjectService:
@@ -96,10 +78,8 @@ class InjectService:
         # 智能注入组件
         self._intent_classifier: Optional[Any] = None
         self._state_analyzer: Optional[Any] = None
-        self._content_engine: Optional[Any] = None
         self._inject_optimizer: Optional[Any] = None
         self._context_cache: Optional[Any] = None
-        self._activity_state_cls: Optional[Any] = None
 
         self._load_smart_components()
 
@@ -113,17 +93,15 @@ class InjectService:
         """加载智能注入子模块（IntentClassifier / InjectOptimizer / ContextCache）。
 
         v4.2 起统一管道：smart/rule 双模式合并为单管道，模板路由直接在
-        ``_render_unified_prompt`` 内完成，不再走 ``ContentTemplateEngine``。
-        ``inject_mode`` 配置字段保留仅为向后兼容，运行时已忽略。
+        ``_render_unified_prompt`` 内完成。
+        旧 ``inject_mode`` 配置字段已在 v4.6.0 移除。
         """
         inj = self._plugin.config.inject
         cfg = self._plugin.config.schedule
 
         try:
             from ..handlers.inject import (
-                ActivityState,
                 ActivityStateAnalyzer,
-                ContentTemplateEngine,
                 ConversationContextCache,
                 InjectOptimizer,
                 IntentClassifier,
@@ -131,10 +109,6 @@ class InjectService:
 
             self._intent_classifier = IntentClassifier() if inj.enable_intent_classification else None
             self._state_analyzer = ActivityStateAnalyzer() if inj.enable_state_analysis else None
-            # v4.2: 保留 content_engine 加载（向后兼容），但 _build_inject_text 已不再调用
-            self._content_engine = (
-                ContentTemplateEngine(self._state_analyzer) if inj.enable_state_analysis else None
-            )
             self._inject_optimizer = (
                 InjectOptimizer(
                     cache_ttl=cfg.cache_ttl,
@@ -147,7 +121,6 @@ class InjectService:
                 max_turns=inj.context_max_turns,
                 ttl=inj.context_ttl,
             )
-            self._activity_state_cls = ActivityState
 
             logger.debug(
                 "✅ 智能注入组件已加载 (intent=%s, optimizer=%s, context=%d/%ds)",
@@ -160,10 +133,8 @@ class InjectService:
             logger.warning(f"智能注入组件加载失败，退化为兜底管道（仅 tech/command 过滤）: {exc}")
             self._intent_classifier = None
             self._state_analyzer = None
-            self._content_engine = None
             self._inject_optimizer = None
             self._context_cache = None
-            self._activity_state_cls = None
 
     # ------------------------------------------------------------
     # 后台缓存预热
@@ -220,7 +191,7 @@ class InjectService:
             return {"action": "continue"}
 
         # 白名单过滤（与 planner 一致）
-        if not is_stream_allowed(session_id, cfg.allowed_streams):
+        if not is_stream_allowed(session_id, self._plugin.config.admin.allowed_streams):
             return {"action": "continue"}
 
         try:
@@ -349,7 +320,7 @@ class InjectService:
             return {"action": "continue"}
 
         # 白名单过滤（留空 = 全部允许，向后兼容）
-        if not is_stream_allowed(session_id, cfg.allowed_streams):
+        if not is_stream_allowed(session_id, self._plugin.config.admin.allowed_streams):
             logger.debug(f"会话 {session_id} 不在白名单，跳过注入")
             return {"action": "continue"}
 
@@ -450,9 +421,6 @@ class InjectService:
     # user="...">\n真实文本`` 前缀。意图分类前必须剥除前缀，否则会把"msg_id/time/user"
     # 等元数据当成关键词。
     _PLANNER_PREFIX_PATTERN: re.Pattern = re.compile(r"^<message\s+[^>]*>\s*\n?")
-
-    # 向后兼容：v4.3.2 单 pattern 别名（其他代码若引用此名仍可用）
-    _CURRENT_TIME_PREFIX_PATTERN = _METADATA_USER_MESSAGE_PATTERNS[0]
 
     @staticmethod
     def _strip_planner_prefix(text: str) -> str:
@@ -767,21 +735,6 @@ class InjectService:
         lines.extend(["", "---", ""])
         return "\n".join(lines)
 
-    def _compute_remaining_minutes(self, activity_name: str) -> Optional[int]:
-        """估算当前活动剩余多少分钟。
-
-        从 GoalManager 反查活动的 ``time_window``，结合当前时间计算剩余分钟。
-        跨夜活动（``end_minutes > 1440``）做归一化。
-
-        Args:
-            activity_name: 当前活动名称。
-
-        Returns:
-            剩余分钟数；查不到时间窗 / 已结束 / 解析失败时返回 ``None``。
-        """
-        remaining, _state_hint = self._compute_activity_aux(activity_name, goal_type=None)
-        return remaining
-
     def _compute_activity_aux(
         self,
         activity_name: str,
@@ -789,7 +742,7 @@ class InjectService:
     ) -> Tuple[Optional[int], Optional[str]]:
         """一次查询返回（剩余分钟，状态情绪文本）。
 
-        组合 ``_compute_remaining_minutes`` 与 ``ActivityStateAnalyzer``，
+        组合剩余分钟计算与 ``ActivityStateAnalyzer``，
         避免两次 goal_manager 查询。
 
         Args:

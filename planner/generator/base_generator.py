@@ -1,4 +1,4 @@
-"""Base Generator Module.
+﻿"""Base Generator Module.
 
 职责：
     - 模型任务名解析（供 ScheduleGenerator 在调 ``ctx.llm.generate`` 时使用）
@@ -90,16 +90,6 @@ class BaseScheduleGenerator:
             JSON Schema 字典
         """
         return self.schema_builder.build_json_schema()
-
-    def load_yesterday_schedule_summary(self) -> Optional[str]:
-        """加载昨日日程摘要（委托给 ContextLoader）。
-
-        Returns:
-            昨日日程摘要字符串
-        """
-        summary = self.context_loader.load_yesterday_schedule_summary()
-        self.yesterday_schedule_summary = summary  # 缓存到实例
-        return summary
 
     def build_schedule_prompt(
         self,

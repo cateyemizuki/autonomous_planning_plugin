@@ -1,4 +1,4 @@
-"""异常处理装饰器模块
+﻿"""异常处理装饰器模块
 
 提供统一的异常处理装饰器,消除handlers.py中的重复try-except代码。
 遵循DRY原则,减少样板代码,提高可维护性。
@@ -92,36 +92,6 @@ def handle_exception(
             return sync_wrapper
 
     return decorator
-
-
-def handle_exception_with_default(
-    error_message: str,
-    default: Any = None
-):
-    """简化版异常处理装饰器 - 使用默认配置
-
-    适用于大多数场景:
-    - log_level="error"
-    - exc_info=True
-    - 返回指定的默认值
-
-    Args:
-        error_message: 错误日志消息模板
-        default: 异常发生时的默认返回值
-
-    Example:
-        >>> @handle_exception_with_default("清理失败: {e}", default=False)
-        ... async def cleanup(self):
-        ...     # 业务逻辑
-        ...     pass
-    """
-    return handle_exception(
-        error_message=error_message,
-        log_level="error",
-        exc_info=True,
-        default_return=default,
-        reraise=False
-    )
 
 
 def handle_exception_silent(

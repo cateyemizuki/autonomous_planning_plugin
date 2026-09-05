@@ -1,10 +1,9 @@
-"""LRU 缓存实现 - 自主规划插件
+﻿"""LRU 缓存实现 - 自主规划插件
 
 线程/协程安全的 LRU 缓存，支持异步与同步接口。
 
 性能特性：
     - 自动 TTL 被动过期（访问时检查）
-    - 主动批量过期清理（cleanup_expired）
     - LRU 淘汰
     - 单线程异步环境下基于 GIL 的轻量锁
 
@@ -16,7 +15,7 @@
 """
 
 from collections import OrderedDict
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 import logging
 import threading
 import time
@@ -85,31 +84,10 @@ class LRUCache:
     # 主动批量清理（供后台任务调用）
     # ------------------------------------------------------------
 
-    def cleanup_expired(self) -> int:
-        """主动清理所有已过期的缓存项，返回清理数量。"""
-        with self._lock:
-            now = time.time()
-            expired_keys = [key for key, (_, expire_time) in self._store.items() if now >= expire_time]
-            for key in expired_keys:
-                self._store.pop(key, None)
-            if expired_keys:
-                logger.debug(f"主动清理了 {len(expired_keys)} 个过期缓存项")
-            return len(expired_keys)
-
     def clear(self) -> None:
         """清空全部缓存。"""
         with self._lock:
             self._store.clear()
-
-    def items(self) -> List[Tuple[Any, Any]]:
-        """返回所有未过期键值对（快照拷贝）。"""
-        with self._lock:
-            now = time.time()
-            return [
-                (key, value)
-                for key, (value, expire_time) in self._store.items()
-                if now < expire_time
-            ]
 
     def __len__(self) -> int:
         """当前缓存项数量（包含已过期但尚未被清理的项）。"""

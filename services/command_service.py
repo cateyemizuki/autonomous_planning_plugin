@@ -1,14 +1,19 @@
-"""``/plan`` 命令的业务实现。
+﻿"""``/plan`` 命令的业务实现。
 
 通过 ``self._plugin.ctx.send.text(...) / ctx.send.image(...)`` 发送消息，
 通过 host 注入的 ``user_id`` / ``stream_id`` 解析上下文，无须再访问 ``self.message``。
 
-v4.5.0：长文本返回（status / help / list 降级）构造**单条完整消息**并通过
-``ctx.send.forward`` 合并转发发出，避免长文本刷屏；短消息保持普通文本。
+v4.6.0：
+    - 移除 ``/plan status`` 子命令，其文字版输出合并进 ``/plan list``
+    - ``/plan list`` 重构：先检查今日是否有日程 → 无日程则提示"即将生成"并
+      代码层触发生成，完成后发送；有日程则直接发送
+    - 发送形态：合并转发**两条记录**——第一条为日程图片（若绘制成功），
+      第二条为详细文字；绘制失败/超时**静默**降级为纯文字（不提示失败）
+    - 新增配置：``list_draw_image``（是否绘制）、``image_timeout_seconds``（绘制超时）
 """
 
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import asyncio
 import logging
 
@@ -102,7 +107,7 @@ class CommandService:
             return True, "没有权限", True
 
         # 白名单过滤（留空 = 全部允许）
-        allowed_streams = self._plugin.config.schedule.allowed_streams
+        allowed_streams = self._plugin.config.admin.allowed_streams
         if not is_stream_allowed(stream_id, allowed_streams):
             await self._send(stream_id, "💤 当前会话未启用日程功能")
             return True, "会话未启用", True
@@ -113,9 +118,7 @@ class CommandService:
 
         subcommand = parts[1] if len(parts) > 1 else ""
 
-        if subcommand == "status":
-            await self._handle_status(stream_id)
-        elif subcommand == "list":
+        if subcommand == "list":
             await self._handle_list(stream_id)
         elif subcommand == "regenerate":
             await self._handle_regenerate(stream_id, parts)
@@ -143,7 +146,7 @@ class CommandService:
         Returns:
             是否有权限
         """
-        admin_users = self._plugin.config.schedule.admin_users
+        admin_users = self._plugin.config.admin.admin_users
         # 留空时所有人都有权限
         if not admin_users:
             return True
@@ -160,40 +163,6 @@ class CommandService:
             return
         await self._plugin.ctx.send.text(text, stream_id)
 
-    async def _send_forward(self, stream_id: str, text: str) -> None:
-        """把完整长文本作为**单条消息**合并转发，避免长文本刷屏。
-
-        v4.5.0 重构：/plan 系列命令的长文本返回（status / help / list 降级等）
-        不再直接以单条普通文本发送，而是构造**一条**完整消息（含全部内容），
-        通过 ``ctx.send.forward`` 以合并转发气泡发出。与早期"头部/正文两条
-        拆分"方案不同：消息内容保持原样不切割，只借助合并转发的形态
-        收敛为一条转发气泡，避免返回结果刷屏。
-
-        若转发失败（平台不支持 / RPC 异常）则回退为普通文本发送，保证功能可用。
-
-        Args:
-            stream_id: 目标消息流 ID。
-            text: 完整长文本（不切割）。
-        """
-        if not stream_id:
-            logger.warning("无 stream_id，跳过合并转发")
-            return
-
-        # 单条完整消息（兼容 cateye_skland_sign 已验证的消息格式）
-        messages: List[Dict[str, Any]] = [
-            {
-                "user_id": "0",
-                "nickname": "日程规划",
-                "segments": [{"type": "text", "content": text}],
-            },
-        ]
-        try:
-            await self._plugin.ctx.send.forward(messages, stream_id)
-            logger.info("✅ 已合并转发 %s 字符", len(text))
-        except Exception as exc:
-            logger.warning(f"合并转发失败，回退为普通文本: {exc}")
-            await self._send(stream_id, text)
-
     def _get_today_schedule_goals(self, goal_manager: Any) -> List[Any]:
         """获取今天的日程目标（沿用 v3 统一方法）。"""
         return goal_manager.get_schedule_goals(chat_id="global")
@@ -209,26 +178,14 @@ class CommandService:
 
         return sorted(goals, key=_get_start)
 
-    # ------------------------------------------------------------
-    # 子命令实现
-    # ------------------------------------------------------------
-
-    async def _handle_status(self, stream_id: str) -> None:
-        """``/plan status``：详细文字格式显示今日日程。"""
-        goal_manager = get_goal_manager()
-        schedule_goals = self._get_today_schedule_goals(goal_manager)
-
-        if not schedule_goals:
-            await self._send(stream_id, "📋 今天还没有日程安排\n\n💡 提示：对我说\"帮我生成今天的日程\"来自动创建")
-            return
-
+    def _build_status_text(self, schedule_goals: List[Any]) -> str:
+        """构建今日日程的详细文字版（原 /plan status 的输出）。"""
         schedule_goals = self._sort_schedule_goals(schedule_goals)
         tz_manager = self._make_tz_manager()
         now = tz_manager.get_now()
         today = now.strftime("%Y-%m-%d")
         weekday = _WEEKDAY_NAMES[now.weekday()]
 
-        # v4.5.0：构造完整文本（含头部 + 明细），作为单条消息合并转发，不切割
         lines: List[str] = [f"📅 今日日程 {today} {weekday}", f"共 {len(schedule_goals)} 项活动", ""]
 
         for idx, goal in enumerate(schedule_goals, 1):
@@ -242,20 +199,19 @@ class CommandService:
                 lines.append(f"   📝 {goal.description}")
             lines.append("")  # 空行分隔
 
-        await self._send_forward(stream_id, "\n".join(lines).rstrip())
+        return "\n".join(lines).rstrip()
 
-    async def _handle_list(self, stream_id: str) -> None:
-        """``/plan list``：图片格式显示今日日程。"""
-        goal_manager = get_goal_manager()
-        schedule_goals = self._get_today_schedule_goals(goal_manager)
+    async def _draw_schedule_image(self, schedule_goals: List[Any]) -> Optional[str]:
+        """绘制日程图片，返回 base64；失败/超时**静默**返回 None。
 
-        if not schedule_goals:
-            await self._send(stream_id, "📋 今天还没有日程安排\n\n💡 提示：对我说\"帮我生成今天的日程\"来自动创建")
-            return
+        超时由 ``image_timeout_seconds`` 配置控制；PIL 是同步阻塞操作，
+        统一丢给默认线程池执行，避免阻塞事件循环。
+        """
+        cfg = self._plugin.config.schedule
+        if not cfg.list_draw_image:
+            return None
 
         schedule_goals = self._sort_schedule_goals(schedule_goals)
-
-        # 准备图片数据
         schedule_items: List[Dict[str, Any]] = []
         for goal in schedule_goals:
             start_minutes, end_minutes = get_time_window_from_goal(goal)
@@ -273,32 +229,88 @@ class CommandService:
         weekday = _WEEKDAY_NAMES[now.weekday()]
         title = f"今日日程 {today} {weekday}"
 
-        # 生成图片：PIL 是同步阻塞操作（渲染 + 字体加载可能耗时 100ms~1s），
-        # 必须丢给默认线程池，避免阻塞事件循环上的其它协程
         try:
-            _img_path, img_base64 = await asyncio.to_thread(
-                ScheduleImageGenerator.generate_schedule_image,
-                title=title,
-                schedule_items=schedule_items,
+            _img_path, img_base64 = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ScheduleImageGenerator.generate_schedule_image,
+                    title=title,
+                    schedule_items=schedule_items,
+                ),
+                timeout=max(1.0, float(cfg.image_timeout_seconds)),
             )
-            if not stream_id:
-                logger.warning("无 stream_id，跳过图片发送")
-                return
-            await self._plugin.ctx.send.image(img_base64, stream_id)
-            logger.info("✅ 日程图片已发送（base64）")
+            return img_base64
         except Exception as exc:
-            logger.error(f"发送图片失败: {exc}，降级为文本输出", exc_info=True)
-            # 降级方案：文本输出（v4.5.0：完整文本作为单条消息合并转发）
+            # 静默降级：不提示失败、不发图片，仅记录日志供排查
+            logger.info(f"/plan list 图片绘制放弃（静默降级为文本）: {exc}")
+            return None
+
+    # ------------------------------------------------------------
+    # 子命令实现
+    # ------------------------------------------------------------
+
+    async def _handle_list(self, stream_id: str) -> None:
+        """``/plan list``：今日日程（图片 + 详细文字，合并转发）。
+
+        流程：
+            1. 先检查今日是否有日程；
+            2. 无 → 立刻提示"日程还未生成，即将生成"，代码层触发今日生成，
+               完成后继续；生成失败则明确告知；
+            3. 有 → 直接发送。
+            4. 发送形态：合并转发两条记录（第一条图片（若绘制成功），
+               第二条详细文字）；绘制失败/超时静默降级为纯文字。
+        """
+        goal_manager = get_goal_manager()
+        schedule_goals = self._get_today_schedule_goals(goal_manager)
+
+        if not schedule_goals:
+            tools_svc = self._plugin._tools_svc
+            if tools_svc is None:
+                await self._send(stream_id, "❌ 插件未完成初始化，无法生成日程")
+                return
+            await self._send(
+                stream_id,
+                "📋 今天还没有日程，正在为你生成（约 30s ~ 2min），完成后会自动发送…",
+            )
             try:
-                lines: List[str] = ["📅 今日日程详情", ""]
-                for item in schedule_items:
-                    lines.append(f"  ⏰ {item['time']}  {item['name']}")
-                    if self._enable_detailed_description and item["description"]:
-                        lines.append(f"     {item['description']}")
-                    lines.append("")
-                await self._send_forward(stream_id, "\n".join(lines).rstrip())
-            except Exception as exc2:
-                logger.error(f"文本输出也失败: {exc2}", exc_info=True)
+                # 代码层触发今日生成（无日程时 delete 为空操作，等价于生成 + 应用）
+                await tools_svc.regenerate_today_schedule_now()
+            except Exception as exc:
+                logger.error(f"/plan list 触发生成日程失败: {exc}", exc_info=True)
+                await self._send(stream_id, f"❌ 日程生成失败: {exc}")
+                return
+            schedule_goals = self._get_today_schedule_goals(goal_manager)
+            if not schedule_goals:
+                await self._send(stream_id, "⚠️ 日程生成完成但没有产生有效活动，请稍后用 /plan list 重试")
+                return
+
+        text = self._build_status_text(schedule_goals)
+        image_base64 = await self._draw_schedule_image(schedule_goals)
+
+        # 合并转发：第一条为图片（若绘制成功），第二条为文字
+        records: List[Dict[str, Any]] = []
+        if image_base64:
+            records.append({
+                "user_id": "0",
+                "nickname": "日程规划",
+                "segments": [{"type": "image", "content": image_base64}],
+            })
+        records.append({
+            "user_id": "0",
+            "nickname": "日程规划",
+            "segments": [{"type": "text", "content": text}],
+        })
+
+        try:
+            await self._plugin.ctx.send.forward(records, stream_id)
+            logger.info("✅ /plan list 已合并转发（图片=%s，文字 %s 字符）", "有" if image_base64 else "无", len(text))
+        except Exception as exc:
+            logger.warning(f"合并转发失败，回退为普通发送: {exc}")
+            try:
+                if image_base64:
+                    await self._plugin.ctx.send.image(image_base64, stream_id)
+            except Exception as img_exc:
+                logger.warning(f"回退发送图片失败: {img_exc}")
+            await self._send(stream_id, text)
 
     async def _handle_regenerate(self, stream_id: str, parts: List[str]) -> None:
         """``/plan regenerate [额外要求...]``：立即重新生成今日日程。
@@ -332,7 +344,7 @@ class CommandService:
             await self._send(stream_id, f"❌ 重新生成失败: {exc}")
             return
 
-        msg = f"✅ 已重新生成今日日程，共 {len(schedule.items)} 项活动\n\n💡 使用 /plan list 查看图片，或 /plan status 查看文字详情"
+        msg = f"✅ 已重新生成今日日程，共 {len(schedule.items)} 项活动\n\n💡 使用 /plan list 查看（图片+文字详情）"
         await self._send(stream_id, msg)
 
     async def _handle_delete(self, stream_id: str, parts: List[str]) -> Tuple[bool, str, bool]:
@@ -432,23 +444,20 @@ class CommandService:
             await self._send(stream_id, "❌ 清理失败")
 
     async def _show_help(self, stream_id: str) -> None:
-        """显示帮助（v4.5.0：完整帮助文本作为单条消息合并转发）。"""
+        """显示帮助（完整帮助文本作为单条消息合并转发）。"""
         help_text = """🤖 日程规划系统
 
 📋 命令列表:
-/plan status - 查看今日日程（详细文字格式，含描述）
-/plan list - 查看今日日程（美观图片格式）
+/plan list - 查看今日日程（图片+详细文字合并转发；无日程时自动先生成）
 /plan regenerate [额外要求] - 重新生成今日日程（先删今天再重生，可附加临时要求）
 /plan delete <goal_id或序号> - 删除指定目标
 /plan clear - 清理昨天及更早的旧日程
 /plan help - 显示此帮助
 
 💡 使用方式:
-1. 对我说 "帮我生成今天的日程" 我会自动创建
-2. 对我说 "今天有什么安排" 我会查看并告诉你
-3. 使用 status 查看详细文字信息，list 查看美观图片
-4. 使用 regenerate 在不满意当前日程时立即重新生成
-5. 使用 clear 清理旧日程，保持目标列表整洁
+1. 对我说 "帮我生成今天的日程" / 直接 /plan list，没有日程时会自动创建
+2. 使用 regenerate 在不满意当前日程时立即重新生成
+3. 使用 clear 清理旧日程，保持目标列表整洁
 
 ✨ 示例对话:
 "帮我生成今天的日程"
@@ -468,8 +477,36 @@ class CommandService:
 
 📌 注意:
 - 日程每天自动生成，无需手动创建
-- status/list 命令只显示今天的日程
+- /plan list 在今日无日程时会先自动生成再展示
 - regenerate 会丢弃今天已有日程并重新生成，操作不可逆
 - clear 命令会自动保留今天的日程
 """
         await self._send_forward(stream_id, help_text.rstrip())
+
+    async def _send_forward(self, stream_id: str, text: str) -> None:
+        """把完整长文本作为**单条消息**合并转发，避免长文本刷屏。
+
+        若转发失败（平台不支持 / RPC 异常）则回退为普通文本发送，保证功能可用。
+
+        Args:
+            stream_id: 目标消息流 ID。
+            text: 完整长文本（不切割）。
+        """
+        if not stream_id:
+            logger.warning("无 stream_id，跳过合并转发")
+            return
+
+        # 单条完整消息（兼容 cateye_skland_sign 已验证的消息格式）
+        messages: List[Dict[str, Any]] = [
+            {
+                "user_id": "0",
+                "nickname": "日程规划",
+                "segments": [{"type": "text", "content": text}],
+            },
+        ]
+        try:
+            await self._plugin.ctx.send.forward(messages, stream_id)
+            logger.info("✅ 已合并转发 %s 字符", len(text))
+        except Exception as exc:
+            logger.warning(f"合并转发失败，回退为普通文本: {exc}")
+            await self._send(stream_id, text)

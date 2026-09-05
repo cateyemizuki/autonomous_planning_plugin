@@ -1,4 +1,4 @@
-"""Schedule Quality Scorer Module.
+﻿"""Schedule Quality Scorer Module.
 
 This module provides quality scoring for generated schedules,
 evaluating factors like activity count, description length, and time coverage.
@@ -261,46 +261,3 @@ class ScheduleQualityScorer:
         coverage_ratio = len(covered_hours) / expected_hours
 
         return min(1.0, coverage_ratio)
-
-    def calculate_priority_score(self, item: Dict[str, Any]) -> float:
-        """计算单个活动的优先级分数（用于冲突解决）
-
-        评分标准：
-        - priority=high: +3
-        - priority=medium: +2
-        - priority=low: +1
-        - 描述长度 > 50字: +1
-        - 描述长度 > 80字: +2
-
-        Args:
-            item: 活动字典
-
-        Returns:
-            优先级分数（越高越优先）
-
-        Examples:
-            >>> scorer = ScheduleQualityScorer({})
-            >>> item = {"priority": "high", "description": "这是一个很长的描述" * 10}
-            >>> score = scorer.calculate_priority_score(item)
-            >>> score >= 3.0
-            True
-        """
-        score = 0.0
-
-        # 优先级分数
-        priority = item.get("priority", "medium")
-        if priority == "high":
-            score += 3
-        elif priority == "medium":
-            score += 2
-        else:  # low
-            score += 1
-
-        # 描述详细度分数
-        desc_len = len(item.get("description", ""))
-        if desc_len > 80:
-            score += 2
-        elif desc_len > 50:
-            score += 1
-
-        return score
