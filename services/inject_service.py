@@ -3,8 +3,19 @@
 业务子模块（IntentClassifier / ActivityStateAnalyzer / InjectOptimizer /
 ConversationContextCache）实现于 ``handlers/inject/``。
 
-向 LLM 请求注入：在 ``messages: list[PromptMessage]`` 的第一条 system 消息
-之后插入一条新的 system 消息，承载当前日程信息。
+向 LLM 请求注入：在消息列表的第一条 system 消息之后插入一条新的 system
+消息，承载当前日程信息。兼容两种宿主投影：ContextItem 快照
+（``items``，MaiBot 1.2.x+，``item_type``/``meta``/``parts``）与旧
+role/content 字典（``messages``，更早版本）。
+
+v4.6.1 hotfix：
+    - 修复 planner 注入在 MaiBot 1.2.x 上静默失效：宿主 commit 2678269dd
+      把 payload 字段 ``messages`` 改名为 ``items``、消息格式改为 ContextItem
+      快照，本模块此前仍按旧字段/旧格式读写，导致 ``inject_schedule`` 完全不生效
+    - ``_extract_last_user_text`` / ``_inject_system_message`` 改为双投影兼容
+    - Hook 返回改为全量回传 kwargs（宿主对 modified_kwargs 整体替换，
+      单键返回会丢 tool_definitions 等字段）
+    - replyer 注入改为协作式：保留上游 ``extra_prompt``，自身文本追加在后方
 
 v4.2 改造点：
     - 删除 smart/rule 双模式，合并为单管道（IntentClassifier → InjectOptimizer →
@@ -33,7 +44,8 @@ import asyncio
 import logging
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
+from uuid import uuid4
 
 from ..cache.lru_cache import LRUCache
 from ..handlers.exception_handler import handle_exception, handle_exception_silent
@@ -158,13 +170,20 @@ class InjectService:
         self,
         session_id: str = "",
         attempt: int = 1,
+        extra_prompt: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """``maisaka.replyer.before_request`` Hook 入口。
 
         在 replyer 向 LLM 发起回复请求前，把当前活动作为 ``extra_prompt``
-        注入。主程序会把 ``extra_prompt`` 拼接到 ``reference_info``，让
+        注入。主程序会把它包装为 ``【额外回复要求】`` 块拼进回复要求，让
         回复模型自然贴合当前状态语气。
+
+        v4.6.1 修复（协作式注入）：宿主对 Hook 返回的 ``modified_kwargs``
+        做**整体替换**，此前单键返回会 (1) 覆盖掉上游插件已写入的
+        ``extra_prompt``，(2) 丢掉 ``task_name`` / ``model_name`` /
+        ``reply_tool_args`` 等字段。现在读取上游 ``extra_prompt`` 并**追加**
+        自身文本在后方，其余 kwargs 全量原样回传。
 
         活人感策略：
             - 重试请求（``attempt > 1``）直接跳过，避免重复加压力
@@ -175,13 +194,14 @@ class InjectService:
         Args:
             session_id: 当前会话 ID。
             attempt: 当前回复尝试序号（从 1 开始）；> 1 表示重试。
-            **kwargs: 其它 hook 参数（task_name / reference_info / ...），未使用。
+            extra_prompt: 上游（其他 Hook 插件或宿主）已写入的 extra_prompt，
+                协作式保留。
+            **kwargs: 其它 hook 参数（task_name / reply_tool_args / ...），全量回传。
 
         Returns:
-            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs": {"extra_prompt": "..."}}``。
+            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs":
+            {"extra_prompt": "合并后文本", ...原 kwargs}}``。
         """
-        del kwargs
-
         cfg = self._plugin.config.schedule
         if not self._plugin.config.plugin.enabled or not cfg.inject_into_replyer:
             return {"action": "continue"}
@@ -217,7 +237,7 @@ class InjectService:
 
             # v4.3：一次查询拿到 剩余分钟 + 状态情绪短语
             remaining_minutes, state_hint = self._compute_activity_aux(current_activity, activity_type)
-            extra_prompt = self._build_replyer_extra_prompt(
+            activity_prompt = self._build_replyer_extra_prompt(
                 current_activity=current_activity,
                 description=current_description or "",
                 future_activities=future_activities,
@@ -227,13 +247,21 @@ class InjectService:
 
             if self._inject_optimizer is not None and self._intent_classifier is not None:
                 self._inject_optimizer.record_injection(
-                    user_id, current_activity, extra_prompt, UserIntent.CASUAL_CHAT,
+                    user_id, current_activity, activity_prompt, UserIntent.CASUAL_CHAT,
                 )
+
+            # v4.6.1：协作式追加——保留上游 extra_prompt，自身文本追加在后方
+            upstream_prompt = str(extra_prompt or "").strip()
+            merged_prompt = f"{upstream_prompt}\n\n{activity_prompt}" if upstream_prompt else activity_prompt
 
             logger.info(f"✅ replyer 注入: {current_activity}")
             return {
                 "action": "continue",
-                "modified_kwargs": {"extra_prompt": extra_prompt},
+                "modified_kwargs": {
+                    **kwargs,
+                    "session_id": session_id,
+                    "extra_prompt": merged_prompt,
+                },
             }
 
         except Exception as exc:
@@ -293,26 +321,43 @@ class InjectService:
 
     async def inject_into_planner_messages(
         self,
-        messages: List[Dict[str, Any]],
-        session_id: str,
+        items: Optional[List[Dict[str, Any]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        item_schema_version: Any = None,
+        session_id: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """``maisaka.planner.before_request`` Hook 入口。
 
         在 Maisaka 向 LLM 发起规划请求前调用，按当前日程信息构造 system 消息
-        并插入到 messages 列表，达到 v3 等价的 prompt 注入效果。
+        并插入到消息列表，达到 v3 等价的 prompt 注入效果。
+
+        v4.6.1 适配：MaiBot 1.2.x 起 payload 字段为 ``items``（ContextItem
+        快照投影，``item_type``/``meta``/``parts``），更早版本为 ``messages``
+        （role/content 字典）。两种投影都支持：注入项按入参格式构造，结果
+        回写到入参实际使用的键；其余 kwargs（tool_definitions 等）全量回传。
 
         Args:
-            messages: 序列化后的 PromptMessage dict 列表
-            session_id: 当前会话 ID
-            **kwargs: 其余 hook 参数（tool_definitions / selected_history_count 等）
+            items: 宿主 1.2.x 的 ContextItem 快照列表。
+            messages: 旧版宿主的 role/content 字典列表。
+            item_schema_version: 快照 schema 版本，原样透传。
+            session_id: 当前会话 ID。
+            **kwargs: 其余 hook 参数（tool_definitions / selected_history_count 等），
+                全量回传。
 
         Returns:
-            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs": {"messages": [...]}}``
+            ``{"action": "continue"}`` 或 ``{"action": "continue", "modified_kwargs":
+            {<items|messages>: [...], ...原 kwargs}}``。
         """
-        del kwargs
+        # 兼容新旧 payload 字段：优先 items，回退 messages
+        if items is not None and isinstance(items, list):
+            payload_key, payload = "items", items
+        elif messages is not None and isinstance(messages, list):
+            payload_key, payload = "messages", messages
+        else:
+            return {"action": "continue"}
 
-        if not messages or not isinstance(messages, list):
+        if not payload:
             return {"action": "continue"}
 
         cfg = self._plugin.config.schedule
@@ -328,7 +373,7 @@ class InjectService:
             chat_id = session_id or "global"
 
             # 提取最后一条 user 消息用于意图分析
-            user_message = self._extract_last_user_text(messages)
+            user_message = self._extract_last_user_text(payload)
             user_id = session_id or "unknown"
 
             # 检查对话上下文：判断是否在连续讨论日程话题
@@ -385,11 +430,18 @@ class InjectService:
             if not inject_content:
                 return {"action": "continue"}
 
-            # 把注入文本作为 system 消息插入 messages 列表
-            modified_messages = self._inject_system_message(messages, inject_content)
+            # 把注入文本作为 system 消息插入消息列表
+            modified_payload = self._inject_system_message(payload, inject_content)
+            modified_kwargs: Dict[str, Any] = {
+                **kwargs,
+                "session_id": session_id,
+                payload_key: modified_payload,
+            }
+            if item_schema_version is not None:
+                modified_kwargs["item_schema_version"] = item_schema_version
             return {
                 "action": "continue",
-                "modified_kwargs": {"messages": modified_messages},
+                "modified_kwargs": modified_kwargs,
             }
 
         except Exception as exc:
@@ -447,8 +499,57 @@ class InjectService:
         return False
 
     @staticmethod
+    def _message_role(msg: Dict[str, Any]) -> str:
+        """读取消息角色；兼容 ContextItem 快照投影（item_type）与旧 role/content。
+
+        MaiBot 1.2.x 起 Hook payload 中的消息为 ContextItem 快照
+        （``item_type``/``meta``/``parts``），不再携带 ``role``/``content``。
+        """
+        item_type = msg.get("item_type")
+        if isinstance(item_type, str) and item_type:
+            if item_type == "UserMessageItem":
+                return "user"
+            if item_type == "SystemMessageItem":
+                return "system"
+            if item_type == "AssistantMessageItem":
+                return "assistant"
+            return item_type
+        role = msg.get("role")
+        return role if isinstance(role, str) else ""
+
+    @staticmethod
+    def _message_text_candidates(msg: Dict[str, Any]) -> List[str]:
+        """提取消息里的候选文本；兼容快照 parts 与旧 role/content 投影。"""
+        if isinstance(msg.get("item_type"), str) and msg.get("item_type"):
+            parts = msg.get("parts")
+            if not isinstance(parts, list):
+                return []
+            return [
+                part["text"]
+                for part in parts
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ]
+        content = msg.get("content")
+        if isinstance(content, str):
+            return [content]
+        if isinstance(content, list):
+            candidates: List[str] = []
+            for part in content:
+                if isinstance(part, str) and part.strip():
+                    candidates.append(part)
+                elif isinstance(part, dict) and "text" in part:
+                    candidates.append(str(part["text"]))
+            return candidates
+        return []
+
+    @staticmethod
     def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
-        """从 PromptMessage 列表里提取最新一条 **含真实文本** 的 user 消息。
+        """从消息列表里提取最新一条 **含真实文本** 的 user 消息。
+
+        兼容两种投影：ContextItem 快照（item_type/parts，MaiBot 1.2.x+）与
+        旧 role/content 字典（更早版本）。
 
         跳过四类污染：
             1. 纯图片（无 text part）的 user 消息
@@ -462,7 +563,7 @@ class InjectService:
               本方法返回前剥除前缀
 
         Args:
-            messages: 序列化后的 PromptMessage dict 列表
+            messages: 序列化后的消息 dict 列表（两种投影均可）
 
         Returns:
             最近一条含真实文本的 user 消息内容（找不到时返回空串）
@@ -470,70 +571,96 @@ class InjectService:
         for msg in reversed(messages):
             if not isinstance(msg, dict):
                 continue
-            if msg.get("role") != "user":
+            if InjectService._message_role(msg) != "user":
                 continue
-            content = msg.get("content")
-            if isinstance(content, str):
-                text = content.strip()
+            for candidate in InjectService._message_text_candidates(msg):
+                text = candidate.strip()
                 if not text:
                     continue  # 空文本 → 找上一条 user
                 if InjectService._is_metadata_user_message(text):
-                    continue  # 元数据消息 → 跳过，找上一条 user
+                    continue  # 元数据消息/part → 跳过，找上一条 user
                 # v4.4.3：剥除 build_planner_prefix 的 <message ...>\n 包装
-                stripped = InjectService._strip_planner_prefix(content)
+                stripped = InjectService._strip_planner_prefix(text)
                 if InjectService._is_metadata_user_message(stripped.strip()):
                     continue  # 剥除前缀后还是元数据（极少见）也跳过
                 if not stripped.strip():
                     continue  # 剥除后空白 → 继续找
                 return stripped
-            if isinstance(content, list):
-                for part in content:
-                    candidate = ""
-                    if isinstance(part, str) and part.strip():
-                        candidate = part.strip()
-                    elif isinstance(part, dict) and "text" in part:
-                        candidate = str(part["text"]).strip()
-                    if not candidate:
-                        continue
-                    if InjectService._is_metadata_user_message(candidate):
-                        continue  # 元数据 part → 跳过
-                    stripped = InjectService._strip_planner_prefix(candidate)
-                    if InjectService._is_metadata_user_message(stripped.strip()):
-                        continue
-                    if not stripped.strip():
-                        continue
-                    return stripped
-                # 当前 user 消息无可用文本 part → 继续找前一条 user
-                continue
-            # content 是其他类型 → 继续找
+            # 当前 user 消息无可用文本 → 继续找前一条 user
         return ""
+
+    @staticmethod
+    def _is_snapshot_payload(messages: List[Dict[str, Any]]) -> bool:
+        """判断 payload 是否为宿主 1.2.x 的 ContextItem 快照投影。"""
+        return any(
+            isinstance(msg, dict) and isinstance(msg.get("item_type"), str) and msg.get("item_type")
+            for msg in messages
+        )
+
+    @staticmethod
+    def _build_snapshot_system_item(
+        inject_content: str,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """构造可被宿主反序列化的 SystemMessageItem 快照（1.2.x payload 契约）。
+
+        - ``item_id`` 必须全局唯一（宿主 ``validate_context_items`` 硬性要求）
+        - ``logical_turn_id`` 继承首条消息以保持回合分组；可为 null
+        - ``timestamp`` 必须是合法 ISO 时间
+        """
+        logical_turn_id: Optional[str] = None
+        for msg in messages:
+            meta = msg.get("meta") if isinstance(msg, dict) else None
+            if isinstance(meta, dict):
+                candidate = meta.get("logical_turn_id")
+                if isinstance(candidate, str) and candidate.strip():
+                    logical_turn_id = candidate
+                    break
+        return {
+            "item_type": "SystemMessageItem",
+            "meta": {
+                "item_id": f"app-schedule-{uuid4().hex}",
+                "logical_turn_id": logical_turn_id,
+                "timestamp": datetime.now().astimezone().isoformat(),
+            },
+            "parts": [{"type": "text", "text": inject_content}],
+        }
 
     @staticmethod
     def _inject_system_message(
         messages: List[Dict[str, Any]],
         inject_content: str,
     ) -> List[Dict[str, Any]]:
-        """把注入文本作为一条 system 消息插入到 messages 列表。
+        """把注入文本作为一条 system 消息插入到消息列表。
 
         策略：紧跟在第一条 system 消息之后插入（不破坏原始人设 prompt）；
         若没有 system 消息，则插到列表开头。
 
+        兼容两种投影：ContextItem 快照（MaiBot 1.2.x+，注入项构造为合法的
+        SystemMessageItem 快照，否则宿主反序列化失败会丢弃整个 items 修改）
+        与旧 role/content 字典。
+
         Args:
-            messages: 原始消息列表
+            messages: 原始消息列表（两种投影均可）
             inject_content: 要注入的文本
 
         Returns:
-            新的消息列表（深拷贝级别的副本，避免污染调用方）
+            新的消息列表（浅拷贝副本，避免污染调用方）
         """
-        injection: Dict[str, Any] = {
-            "role": "system",
-            "content": inject_content,
-        }
+        if InjectService._is_snapshot_payload(messages):
+            injection: Dict[str, Any] = InjectService._build_snapshot_system_item(
+                inject_content, messages
+            )
+        else:
+            injection = {
+                "role": "system",
+                "content": inject_content,
+            }
 
-        # 找到第一个 system 消息的位置
+        # 找到第一个 system 消息的位置（兼容两种投影）
         first_system_idx: Optional[int] = None
         for idx, msg in enumerate(messages):
-            if isinstance(msg, dict) and msg.get("role") == "system":
+            if isinstance(msg, dict) and InjectService._message_role(msg) == "system":
                 first_system_idx = idx
                 break
 

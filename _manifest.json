@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.6.0",
+  "version": "4.6.1",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.6.0: 作息语义重构（起床/入睡时间锚点）+ 无睡眠模式与提示词框架完全兼容 + /plan list 合并图片与文字（无日程自动先生成）+ 移除 generate_schedule_v4 工具与 /plan status 命令 + 配置项精简合并 + 清理无引用的死代码。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.6.1: 修复 MaiBot 1.2.x 上 planner 注入静默失效（兼容 items/ContextItem 快照 payload）+ Hook 返回全量回传 kwargs + replyer 注入改为协作式追加（不覆盖其他插件的 extra_prompt）。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"

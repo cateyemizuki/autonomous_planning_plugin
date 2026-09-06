@@ -16,6 +16,37 @@
 >
 > 各版本条目中标注了对应 issue 编号，方便溯源。
 
+## [4.6.1] - 2026-09-06
+
+### 修复（Fixed）
+
+- **修复 planner 注入在 MaiBot 1.2.x 上静默失效**（`services/inject_service.py` + `plugin.py`）：
+  宿主 commit `2678269dd`（"重构maisaka底层，从基于chat message改为基于 response item"，
+  2026-08-05）把 `maisaka.planner.before_request` 的 payload 字段从 `messages`（role/content
+  字典）更名为 `items`（ContextItem 快照，`item_type`/`meta`/`parts`）。本插件此前仍按旧
+  字段读写，导致 `handle_inject_schedule` 永远收到空列表、`inject_schedule = true` 完全不生效
+  且无任何报错。现同时兼容两种投影：
+  - 处理器优先读 `items`，回退 `messages`；注入结果回写到入参实际使用的键；
+  - `_extract_last_user_text` / `_inject_system_message` 按消息内投影自动适配，
+    快照模式下注入项构造为合法的 `SystemMessageItem` 快照（`item_id` 全局唯一、
+    `logical_turn_id` 继承首条消息、ISO `timestamp`），否则宿主反序列化失败会丢弃
+    整个 items 修改。
+- **修复 Hook 返回丢失其他 kwargs 字段**：宿主派发器对 blocking 处理器返回的
+  `modified_kwargs` 做**整体替换**，此前 planner/replyer 两个处理器均单键返回，会连带丢掉
+  `tool_definitions` / `item_schema_version` / `task_name` / `reply_tool_args` /
+  `session_id` 等字段（并抹掉上游插件在同一 Hook 上的修改）。现改为**全量回传**
+  `{**kwargs, ...覆盖键...}`。
+- **replyer 注入改为协作式追加**：`inject_into_replyer_extra_prompt` 现读取上游已写入的
+  `extra_prompt`，把自身"角色当前状态"文本**追加**在后方，而不是整体覆盖——与
+  persona_style_injector 等同样占用 `maisaka.replyer.before_request` 的注入类插件可共存。
+
+### 验证（Tests）
+
+- 回归测试 `test9.6/test_planning_fix.py`（不启动 bot）：新旧两种 payload 注入、
+  全量 kwargs 回传、协作式合并、重试跳过、与 persona_style_injector 的链式组合，
+  以及用宿主真实 `deserialize_context_item_snapshot` + `validate_context_items`
+  校验注入快照——全部通过。
+
 ## [4.6.0] - 2026-09-02
 
 ### 变更（Breaking）

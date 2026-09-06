@@ -495,15 +495,26 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
     )
     async def handle_inject_schedule(
         self,
+        items: List[Dict[str, Any]] | None = None,
         messages: List[Dict[str, Any]] | None = None,
+        item_schema_version: Any = None,
         session_id: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """日程注入 Hook 入口，转发给 InjectService。"""
+        """日程注入 Hook 入口，转发给 InjectService。
+
+        MaiBot 1.2.x（commit 2678269dd 起）payload 字段为 ``items``（ContextItem
+        快照投影），更早版本为 ``messages``（role/content 字典）。此处两者兼容：
+        优先 ``items``，回退 ``messages``；注入结果回写到入参实际使用的键，
+        其余 kwargs（tool_definitions / item_schema_version 等）全量回传——
+        宿主对 Hook 返回的 modified_kwargs 做整体替换，单键返回会丢字段。
+        """
         if self._inject_svc is None or not self.config.schedule.inject_schedule:
             return {"action": "continue"}
         return await self._inject_svc.inject_into_planner_messages(
-            messages=messages or [],
+            items=items,
+            messages=messages,
+            item_schema_version=item_schema_version,
             session_id=session_id,
             **kwargs,
         )
