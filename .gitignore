@@ -35,3 +35,11 @@ POC_RESULT.md
 *.swp
 .DS_Store
 Thumbs.db
+
+# ── 测试代码（只保留在开发工作区，不进仓库）──────────────────
+test_*.py
+*_test.py
+test/
+tests/
+.pytest_cache/
+.coverage

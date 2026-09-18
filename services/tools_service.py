@@ -1,4 +1,4 @@
-﻿"""目标管理 / 日程生成 / 状态查询 / 应用日程的工具业务实现。
+"""目标管理 / 日程生成 / 状态查询 / 应用日程的工具业务实现。
 
 通过 ``self._plugin.config`` 强类型访问插件配置，通过 ``self._plugin.ctx``
 访问 SDK 能力代理；LLM 调用经 ``ctx.llm.generate`` 走主程序 model_config。
@@ -544,7 +544,7 @@ class ToolsService:
                 current_activities.append({"time": time_label, "name": goal.name})
             persona = str(getattr(self._plugin, "_bot_profile", {}).get("personality", "")) or ""
 
-            log_dir = self._plugin._plugin_root / "data" / "llm_logs"
+            log_dir = self._plugin.llm_log_dir
             parsed = await judge_schedule_request(
                 self._plugin,
                 description=description,

@@ -34,7 +34,7 @@
 - 📅 **能记下未来的事**：你说"周六一起打游戏"，角色裁判会判断接不接；
   接了就记成约定，到那天自动排进日程、到点主动兑现
 - 🌙 **懂跨天**：23:00 入睡的活动，凌晨注入也能识别"还在睡"
-- 🤖 **可选无睡眠模式**：机器人 / AI 类角色可以完全不上床，睡眠时段改为"无所事事"
+- 🤖 **可选无睡眠模式**：机器人 / AI 类角色可以完全不上床，睡眠时段不生成任何日程（生成后自动销毁）
 - 📊 **一条命令看全天**：`/plan list` 以"图片 + 详细文字"合并转发返回；
   今天还没生成日程时会自动先生成再展示
 - 📣 **主动行为（可选）**：活动切换时主动开口、睡醒后道早安，学习时少说话、休息时多说话
@@ -61,9 +61,13 @@
 2. 确认主程序 `config/model_config.toml` 里插件使用的 LLM 任务组已配置
    （默认用 `replyer`，可在插件配置里改 `LLM 任务名` 指向其他任务），
    `model_list` 至少一个可用模型
-3. 启动 MaiBot，首次启动自动创建 `data/goals.db`
+3. 启动 MaiBot，首次启动自动在宿主数据目录创建 `goals.db`
+   （v4.9.0 起：`data/plugins/xuqian13.autonomous-planning-plugin-v4/`；
+   旧版写在插件目录 `data/` 下的数据会在首次加载时**自动迁移**过去）
 
-> **版本要求**：MaiBot ≥ v1.0.0（v1.1.0 已测试），SDK 2.x。
+> **版本要求**：MaiBot ≥ v1.2.3（1.2.3 / 1.2.5 已验证），SDK 2.x。
+> 本插件依赖 `maisaka.*` Hook 与 `maisaka.proactive.trigger`，其 payload 契约
+> 以 1.2.3 为首个文档化基线，更低版本上这些功能会静默失效。
 > 从 v4.5 及更早版本升级：旧配置会**自动迁移**（`day_start_time/day_end_time`
 > → `sleep_time/wake_time`，失效字段自动清理），无需手动处理。
 
@@ -90,6 +94,9 @@
 权限：`admin_users` 留空 = 所有人可用；`allowed_streams` 留空 = 所有会话可用。
 `/plan list` 是否画图、画图超时分别由 `list_draw_image` 与 `image_timeout_seconds`
 控制；绘制失败或超时会**静默**降级为纯文字，不影响使用。
+日程图片展示**全天全部条目**（动态高度清单：进行中高亮、已完成淡化、
+未来活动常规显示），使用插件自带的 [Noto Sans SC 字体](assets/fonts/README.md)
+渲染，不依赖宿主机是否安装了中文字体。
 
 ## 和 bot 的自然语言交互
 
@@ -116,10 +123,10 @@ bot 的 LLM 可调用 4 个工具，多数场景下直接说话即可：
 - 入睡时间早于起床时间（如入睡 03:00 / 起床 11:00）= 跨午夜夜猫子作息，同样支持
 - 生成的提示词示例与时间框架会按你配置的锚点**动态生成**，所见即所得
 
-**无睡眠模式**（`no_sleep_mode`，默认关）：开启后全天不出现任何睡眠类活动，
-入睡到起床的时段改为**无所事事**（放空）。提示词与代码后处理双重保证——
-即使 LLM 漏网生成了"睡觉/午休/打盹"，落库前也会被强制转换为"无所事事"。
-适合机器人、AI、非人生物等不需要睡觉的角色设定。
+**无睡眠模式**（`no_sleep_mode`，默认关）：开启后入睡到起床的时段**不生成任何日程**——
+提示词要求 LLM 不在该时段安排活动，LLM 生成后代码再销毁该时段内残留的日程
+（与时段边界部分重叠的活动会截断到入睡/起床时刻，保证清醒时段的日程不被误删）。
+清醒时段内部的日程照常无缝衔接。适合机器人、AI、非人生物等不需要睡觉的角色设定。
 
 ## 角色裁判
 
@@ -210,9 +217,9 @@ if snapshot["has_activity"]:
 | 现象 | 看这里 |
 |---|---|
 | 日程定时生成"未启用" | 检查 `auto_schedule_enabled = true` |
-| LLM 生成一直失败 / 报超时 | 看 `data/llm_logs/fail_schedule_generation_*.txt`（完整 prompt 与响应）；必要时调大 `generation_timeout` |
+| LLM 生成一直失败 / 报超时 | 看 `data/plugins/xuqian13.autonomous-planning-plugin-v4/llm_logs/fail_schedule_generation_*.txt`（完整 prompt 与响应）；必要时调大 `generation_timeout` |
 | `/plan list` 没有图片 | 图片绘制超时（`image_timeout_seconds`）或被关闭（`list_draw_image`）时会静默降级为文字，属预期行为 |
-| 无睡眠模式下仍出现"午休" | v4.6.0 起关键词表已含午休/打盹/赖床；若仍有漏网活动名，属 LLM 偶发，后处理会在落库前转换 |
+| 睡眠时段仍出现日程条目 | 无睡眠模式下后处理会在落库前销毁该时段日程；若刚重生成完仍看到，用 `/plan regenerate` 强制重建 |
 | 麦麦回复从不提当前活动 | 正常——注入文案写了"不要主动提及"，只在被问到 / 强相关时自然带出 |
 | 升级后配置变了 | v4.5 → v4.6 自动迁移作息字段；`inject_mode`、`auto_generate` 等无效字段已移除 |
 
@@ -224,8 +231,9 @@ if snapshot["has_activity"]:
 - **版本号同步**：修改版本时需同步 3 处——`_manifest.json` 的 `version`、
   `config_models.py` 的 `SUPPORTED_CONFIG_VERSION`、`__init__.py` 的 `__version__`
 - **变更记录**：每个版本的变更写入 `CHANGELOG.md`
-- **数据目录**：运行时 `data/`（goals.db / llm_logs/）已被
-  `.gitignore` 排除，不进入版本库
+- **数据目录**：v4.9.0 起使用宿主隔离目录 `ctx.paths.data_dir`
+  （`data/plugins/<plugin_id>/`，goals.db / llm_logs/ 等）；旧版插件目录下的
+  `data/` 仅作迁移源保留，两者均被 `.gitignore` 排除，不进入版本库
 - **历史文档**：v4.5 及更早的说明见 [README_v4.5_归档.md](README_v4.5_归档.md)
 
 ## License

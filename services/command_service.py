@@ -1,4 +1,4 @@
-﻿"""``/plan`` 命令的业务实现。
+"""``/plan`` 命令的业务实现。
 
 通过 ``self._plugin.ctx.send.text(...) / ctx.send.image(...)`` 发送消息，
 通过 host 注入的 ``user_id`` / ``stream_id`` 解析上下文，无须再访问 ``self.message``。
@@ -82,6 +82,7 @@ class CommandService:
         platform: str = "",
         group_id: str = "",
         matched_groups: Dict[str, str] | None = None,
+        is_local_operator: bool = False,
     ) -> Tuple[bool, str, bool]:
         """命令执行入口，按子命令分发。
 
@@ -92,6 +93,7 @@ class CommandService:
             platform: 平台标识
             group_id: 群组 ID
             matched_groups: 命令正则命名捕获
+            is_local_operator: 是否本机控制台操作员（天然放行）
 
         Returns:
             (success, response_text, intercept_message) 三元组
@@ -101,9 +103,16 @@ class CommandService:
         command_text = str(groups.get("planning_cmd", text) or "").strip()
         parts = command_text.split()
 
-        # 权限检查：所有命令都需要管理员权限（admin_users 留空时所有人可用）
-        if not self._check_permission(user_id):
-            await self._send(stream_id, "🚫 你不是管理员哦~只有管理员才能查看和管理日程呢")
+        # 权限检查：v4.9.0 起默认拒绝——admin_users 未配置时仅本机控制台可用
+        if not self._check_permission(user_id, is_local_operator):
+            if not self._plugin.config.admin.admin_users:
+                await self._send(
+                    stream_id,
+                    "🚫 尚未配置管理员：请在插件配置 [管理与日志] 的 admin_users 中"
+                    "添加你的用户 ID 后再使用 /plan（本机控制台不受限）",
+                )
+            else:
+                await self._send(stream_id, "🚫 你不是管理员哦~只有管理员才能查看和管理日程呢")
             return True, "没有权限", True
 
         # 白名单过滤（留空 = 全部允许）
@@ -137,20 +146,32 @@ class CommandService:
     # 权限检查
     # ------------------------------------------------------------
 
-    def _check_permission(self, user_id: str) -> bool:
+    def _check_permission(self, user_id: str, is_local_operator: bool = False) -> bool:
         """检查用户权限。
+
+        v4.9.0 起：本机控制台操作员天然放行；``admin_users`` 未配置时拒绝所有
+        QQ 侧用户（默认拒绝，避免任意用户执行 regenerate/delete/clear 等写操作）；
+        配置后仅列表内用户可用。兼容 ``["123456789"]``（纯 ID）与
+        ``["qq:123456789"]``（平台前缀）两种写法，比较 ID 部分。
 
         Args:
             user_id: 当前触发命令的用户 ID
+            is_local_operator: 是否本机控制台操作员
 
         Returns:
             是否有权限
         """
-        admin_users = self._plugin.config.admin.admin_users
-        # 留空时所有人都有权限
-        if not admin_users:
+        if is_local_operator:
             return True
-        return str(user_id) in admin_users
+
+        def _id_part(raw: str) -> str:
+            return raw.strip().rsplit(":", 1)[-1]
+
+        candidate = _id_part(str(user_id or ""))
+        if not candidate:
+            return False
+        admin_users = self._plugin.config.admin.admin_users
+        return any(_id_part(str(entry)) == candidate for entry in admin_users)
 
     # ------------------------------------------------------------
     # 内部工具
@@ -235,6 +256,7 @@ class CommandService:
                     ScheduleImageGenerator.generate_schedule_image,
                     title=title,
                     schedule_items=schedule_items,
+                    tz_name=cfg.timezone,
                 ),
                 timeout=max(1.0, float(cfg.image_timeout_seconds)),
             )

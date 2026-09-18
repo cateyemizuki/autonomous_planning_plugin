@@ -1,4 +1,4 @@
-﻿"""Core module - fundamental components
+"""Core module - fundamental components
 
 This module contains core models, exceptions, and parameter validation.
     - models: data models

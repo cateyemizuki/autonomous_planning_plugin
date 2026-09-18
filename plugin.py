@@ -1,4 +1,4 @@
-﻿"""麦麦自主规划插件 v4 - 主入口（v4.6.0）
+"""麦麦自主规划插件 v4 - 主入口（v4.6.0）
 
 完整 7 个组件外壳，业务逻辑下沉到 ``services/``。
 
@@ -112,6 +112,8 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         """初始化插件基础字段，service 实例延迟到 ``on_load`` 创建。"""
         super().__init__()
         self._plugin_root: Path = Path(__file__).resolve().parent
+        # 宿主按插件 ID 注入的隔离数据目录（on_load 时赋值）
+        self._data_dir: Path | None = None
         self._tools_svc: ToolsService | None = None
         self._cmd_svc: CommandService | None = None
         self._inject_svc: InjectService | None = None
@@ -151,14 +153,27 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """插件加载完成：建立数据目录、初始化 services、启动后台任务。"""
+        # 数据目录：宿主按插件 ID 注入的隔离持久化目录（data/plugins/<plugin_id>/）。
+        # v4.9.0 起不再写插件安装目录下的 data/（插件中心评审阻断项：数据目录绕出）。
+        data_dir = self.ctx.paths.data_dir
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self._data_dir = data_dir
+        self._migrate_legacy_data_dir(data_dir)
+
+        # 日程图片输出目录同样迁到宿主隔离数据目录
+        from .utils.schedule_image_generator import ScheduleImageGenerator
+        ScheduleImageGenerator.configure_output_dir(data_dir / "images")
+
         # 仅当插件被启用时才初始化 service 与启动后台任务
         if not self.config.plugin.enabled:
             logger.warning("[v4] 插件已禁用（plugin.enabled=False），跳过初始化")
             return
 
-        data_dir = self._plugin_root / "data"
-        data_dir.mkdir(exist_ok=True)
         db_path = str(data_dir / "goals.db")
+
+        # 数据库单例先按正确数据目录初始化，后续 get_goal_manager() 复用
+        from .planner.goal_manager import get_goal_manager
+        get_goal_manager(str(data_dir))
 
         # 预拉取 bot 全局配置（personality / bot.nickname 等）一次性缓存
         # PromptBuilder 不再运行时调用 config_api.get_global_config
@@ -203,6 +218,61 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[v4] 预拉取 bot_profile 失败，使用空值: %s", exc)
         return profile
+
+    # ------------------------------------------------------------
+    # 数据目录辅助
+    # ------------------------------------------------------------
+
+    @property
+    def llm_log_dir(self) -> Path:
+        """LLM 调用归档目录（宿主隔离数据目录下的 ``llm_logs/``）。
+
+        服务层统一通过该属性取路径；``_data_dir`` 未就绪时回退旧路径，
+        避免测试或异常时序下抛错。
+        """
+        data_dir = self._data_dir or (self._plugin_root / "data")
+        return data_dir / "llm_logs"
+
+    def _migrate_legacy_data_dir(self, new_data_dir: Path) -> None:
+        """把旧版写在插件安装目录下的 ``data/``（v4.8 及更早）迁移到宿主隔离目录。
+
+        首次迁移时按文件复制（不覆盖已存在文件），目录结构原样保留：
+        ``goals.db``（含 -wal/-shm/.bak）、``llm_logs/``、``images/``。
+        旧目录保留不删除，作为回退快照。
+        """
+        old_data_dir = self._plugin_root / "data"
+        if not old_data_dir.is_dir():
+            return
+        if old_data_dir.resolve() == new_data_dir.resolve():
+            return
+
+        migrated: List[str] = []
+
+        def _copy_file(src: Path, dst: Path) -> None:
+            if not src.is_file() or dst.exists():
+                return
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src.read_bytes())
+                migrated.append(str(src.relative_to(old_data_dir)))
+            except OSError as exc:
+                logger.warning("[v4] 迁移文件失败 %s: %s", src, exc)
+
+        for name in ("goals.db", "goals.db-wal", "goals.db-shm", "goals.db.bak"):
+            _copy_file(old_data_dir / name, new_data_dir / name)
+        for sub in ("llm_logs", "images"):
+            old_sub = old_data_dir / sub
+            if not old_sub.is_dir():
+                continue
+            for src in old_sub.rglob("*"):
+                if src.is_file():
+                    _copy_file(src, new_data_dir / sub / src.relative_to(old_sub))
+
+        if migrated:
+            logger.info(
+                "[v4] 已从插件目录迁移 %d 个数据文件到宿主数据目录: %s -> %s",
+                len(migrated), old_data_dir, new_data_dir,
+            )
 
     # ============================================================
     # 对外暴露：ScheduleGenerator 配置构建（单一来源）
@@ -410,7 +480,9 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
     @Command(
         "planning_v4",
         description="日程规划系统管理命令（支持 /plan 与 /规划）",
-        pattern=r"(?P<planning_cmd>^/(plan|规划).*$)",
+        # v4.9.0：用负向前瞻代替 ^ 锚点——回复引用场景下命令不在文本开头，
+        # ^/（plan|规划）会失配（文档 §13-7）；(?<!\S) 同时避免命中行中片段。
+        pattern=r"(?P<planning_cmd>(?<!\S)/(?:plan|规划)(?:\s.*)?)$",
     )
     async def handle_planning_command(
         self,
@@ -420,6 +492,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
         platform: str = "",
         group_id: str = "",
         matched_groups: Any = None,
+        is_local_operator: bool = False,
         **kwargs: Any,
     ) -> Tuple[bool, str, bool]:
         """``/plan`` 命令入口，转发给 CommandService。"""
@@ -435,6 +508,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
             platform=platform,
             group_id=group_id,
             matched_groups=matched_groups if isinstance(matched_groups, dict) else {},
+            is_local_operator=bool(is_local_operator),
         )
 
     # ============================================================
@@ -461,7 +535,7 @@ class AutonomousPlanningPluginV4(MaiBotPlugin):
                 chat_id="global",
             )
             if snapshot["has_activity"]:
-                print(snapshot["activity"]["name"])  # 例如 "无所事事"
+                print(snapshot["activity"]["name"])  # 例如 "上午学习"
 
         Args:
             chat_id: 可选的会话 ID 过滤；默认 ``global``（与日程注入一致）。

@@ -1,4 +1,4 @@
-﻿"""Goal Manager Module (SQLite Version).
+"""Goal Manager Module (SQLite Version).
 
 This module provides goal management functionality using SQLite database
 for improved performance and concurrency handling.
@@ -847,15 +847,20 @@ class GoalManager:
 _goal_manager: Optional[GoalManager] = None
 
 
-def get_goal_manager() -> GoalManager:
+def get_goal_manager(data_dir: Optional[str] = None) -> GoalManager:
     """Get global goal manager instance.
+
+    Args:
+        data_dir: 数据目录；仅首次创建单例时生效。插件 ``on_load`` 会传入
+            宿主隔离数据目录（``ctx.paths.data_dir``），后续调用省略该参数
+            复用同一实例。为 None 时回退插件目录下的 ``data/``（仅测试场景）。
 
     Returns:
         GoalManager singleton instance
     """
     global _goal_manager
     if _goal_manager is None:
-        _goal_manager = GoalManager()
+        _goal_manager = GoalManager(data_dir=data_dir)
     return _goal_manager
 
 

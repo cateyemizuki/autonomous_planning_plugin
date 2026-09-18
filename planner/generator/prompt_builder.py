@@ -1,4 +1,4 @@
-﻿"""Prompt Builder Module.
+"""Prompt Builder Module.
 
 This module provides prompt building functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
@@ -14,6 +14,11 @@ v4.6.0 改造：
     - 无睡眠模式与提示词框架完全兼容：JSON 示例、无缝衔接演算、时间合理性框架
       均按 wake/sleep + no_sleep_mode 动态生成，不再出现"示例教模型写睡觉、
       正文却禁止睡觉"的自相矛盾
+
+v4.7.0 改造：
+    - 无睡眠模式语义变更：睡眠时段不再是"无所事事"，而是**不生成任何日程条目**
+      （LLM 生成后由 ScheduleGenerator 后处理销毁该时段日程）。示例、无缝演算、
+      时间框架均只覆盖清醒时段 [wake_time, sleep_time)
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -121,12 +126,13 @@ class PromptBuilder:
         no_sleep: bool,
         enable_detailed: bool,
     ) -> List[Dict[str, Any]]:
-        """按起床/入睡锚点生成一份全天无缝衔接的示例日程。
+        """按起床/入睡锚点生成一份示例日程。
 
         - 清醒时段 [wake, sleep) 按比例铺开：起床/三餐/学习/运动/娱乐，
           单个活动不超过 3.5 小时（超出自动拆成两条）；
-        - 睡眠时段 [sleep, 次日 wake)：正常模式为"睡觉"，无睡眠模式为"无所事事"；
-        - 所有活动首尾相接：每个活动结束时间 = 下一个活动开始时间，绕时钟闭环。
+        - 睡眠时段 [sleep, 次日 wake)：正常模式为"睡觉"收尾闭环；
+          无睡眠模式**不生成任何条目**（该时段留空，日程止于入睡时刻）；
+        - 所有清醒活动首尾相接：每个活动结束时间 = 下一个活动开始时间。
         """
         seg = (sleep_min - wake_min) % (24 * 60)
         if seg == 0:
@@ -148,9 +154,7 @@ class PromptBuilder:
                     "time_slot": _fmt_minutes(start),
                     "duration_hours": round(minutes / 60, 2),
                 })
-            if no_sleep:
-                _add("无所事事", sleep_min, sleep_minutes, "rest", "high")
-            else:
+            if not no_sleep:
                 _add("睡觉", sleep_min, sleep_minutes, "daily_routine", "high")
             _add("起床洗漱", wake_min, 30, "daily_routine", "medium")
             _add("早餐", wake_min + 30, 30, "meal", "high")
@@ -176,10 +180,8 @@ class PromptBuilder:
 
         items: List[Dict[str, Any]] = []
 
-        # 睡眠块（锚定入睡时刻，绕时钟闭环的收尾）
-        if no_sleep:
-            add(items, "无所事事", sleep_min, sleep_minutes, "rest", "high")
-        else:
+        # 睡眠块（锚定入睡时刻，绕时钟闭环的收尾）；无睡眠模式不生成该块
+        if not no_sleep:
             add(items, "睡觉", sleep_min, sleep_minutes, "daily_routine", "high")
 
         # 清醒块（锚定起床时刻）
@@ -259,7 +261,8 @@ class PromptBuilder:
     ) -> str:
         """把示例日程渲染成 prompt 里的 JSON 文本 + 无缝演算说明。"""
         items = self._build_example_items(wake_min, sleep_min, no_sleep, enable_detailed)
-        lines = ["【JSON格式示例】（已按本角色作息锚点生成，展示全天无缝衔接）"]
+        scope_text = "清醒时段无缝衔接" if no_sleep else "全天无缝衔接"
+        lines = [f"【JSON格式示例】（已按本角色作息锚点生成，展示{scope_text}）"]
         lines.append("{")
         lines.append('  "schedule_items": [')
         for idx, item in enumerate(items):
@@ -282,7 +285,10 @@ class PromptBuilder:
         lines.append("")
         lines.append(f"（根据实际情况生成{min_activities}-{max_activities}个活动，以上仅为衔接方式示例）")
         lines.append("")
-        lines.append("⚠️ 重要：上面示例展示了全天无缝衔接的正确方式！")
+        if no_sleep:
+            lines.append("⚠️ 重要：上面示例展示了清醒时段无缝衔接的正确方式！（睡眠时段不生成条目）")
+        else:
+            lines.append("⚠️ 重要：上面示例展示了全天无缝衔接的正确方式！")
         # 取前三个活动做衔接演算
         for i in range(min(3, len(items) - 1)):
             cur, nxt = items[i], items[i + 1]
@@ -294,11 +300,24 @@ class PromptBuilder:
                 f"→ {nxt['name']} ✅ 无缝"
             )
         last = items[-1]
-        first_sleep = items[0]
-        lines.append(
-            f"- {last['time_slot']} {last['name']} + {last['duration_hours']}h = "
-            f"次日 {first_sleep['time_slot']} ✅ 回到 {first_sleep['name']}，完整闭环"
-        )
+        if no_sleep:
+            # 无睡眠模式：日程止于入睡时刻，睡眠时段留空，次日起床开新一天
+            sleep_text_ex = _fmt_minutes(sleep_min)
+            wake_text_ex = _fmt_minutes(wake_min)
+            lines.append(
+                f"- {last['time_slot']} {last['name']} + {last['duration_hours']}h = {sleep_text_ex} "
+                f"✅ 恰好到入睡时刻收尾"
+            )
+            lines.append(
+                f"- 睡眠时段（{sleep_text_ex} → 次日 {wake_text_ex}）不生成任何日程条目，"
+                f"次日 {wake_text_ex} 直接开始新一天 ✅ 完整闭环"
+            )
+        else:
+            first_sleep = items[0]
+            lines.append(
+                f"- {last['time_slot']} {last['name']} + {last['duration_hours']}h = "
+                f"次日 {first_sleep['time_slot']} ✅ 回到 {first_sleep['name']}，完整闭环"
+            )
         lines.append("")
         lines.append("⚠️ duration_hours 是活动持续时长（小时），不是重复间隔！")
         return "\n".join(lines)
@@ -455,27 +474,39 @@ class PromptBuilder:
                 f"- {sleep_text} 到次日 {wake_text} 是睡眠时段"
             )
         if no_sleep_mode:
-            routine_rule = f"- {sleep_rule}：按【无睡眠模式】安排为'无所事事'（goal_type: rest）"
+            routine_rule = (
+                f"{sleep_rule}：按【无睡眠模式】**不安排任何日程**（该时段整体留空，不生成条目）"
+            )
         else:
             routine_rule = (
-                f"- {sleep_rule}：安排一个从 {sleep_text} 开始、到次日 {wake_text} 结束的"
+                f"{sleep_rule}：安排一个从 {sleep_text} 开始、到次日 {wake_text} 结束的"
                 f"'睡觉'活动（goal_type: daily_routine；跨午夜用大于 24h 的累计时长表达，不要硬切成两条）"
+            )
+        if no_sleep_mode:
+            seam_rule = (
+                f"- 最后一个活动的结束时间必须恰好是 {sleep_text}，"
+                f"第一个活动从次日 {wake_text} 开始；两者之间的睡眠时段不生成条目"
+            )
+        else:
+            seam_rule = (
+                f"- 睡眠时段首尾必须与相邻活动无缝衔接"
+                f"（入睡时刻 = 前一个活动的结束时间，起床时刻 = 后一个活动的开始时间）"
             )
         time_range_requirement = f"""
 🔴 【作息时间】本角色 {sleep_text} 上床入睡，{wake_text} 睡醒起床（作息锚点，不可移动）！
    {awake_rule}
    {routine_rule}
-   - 睡眠时段首尾必须与相邻活动无缝衔接（入睡时刻 = 前一个活动的结束时间，起床时刻 = 后一个活动的开始时间）
+   {seam_rule}
 """
 
-        # ── v4.6.0：无睡眠模式块（与作息锚点配合）────────────────
+        # ── v4.7.0：无睡眠模式块（睡眠时段不生成日程）────────────
         no_sleep_requirement = ""
         if no_sleep_mode:
             no_sleep_requirement = f"""
 🔴 【无睡眠模式】本角色**不需要睡觉**！
-   - 睡眠时段（{sleep_text} 到次日 {wake_text}）改为**无所事事**（goal_type: rest），整段放空发呆，时长覆盖完整
+   - 睡眠时段（{sleep_text} 到次日 {wake_text}）**不生成任何日程条目**——该时段整体留空
+   - 日程只覆盖清醒时段（{wake_text} 到 {sleep_text}），时段内部保持无缝衔接、无空档
    - 全天任何活动的 name 都不得包含"睡 / 眠 / 憩"字样（睡觉、睡眠、午休、午睡、小憩、打盹、赖床等一律禁止）
-   - 保持全天无缝衔接，时段不能出现空档
 """
 
         # ── v4.6.0：动态 JSON 示例 + 无缝演算 ────────────────────
@@ -486,7 +517,7 @@ class PromptBuilder:
 
         # ── 时间合理性框架（随作息/模式自适应）──────────────────
         if no_sleep_mode:
-            night_row = f"   • {sleep_text} - 次日{wake_text}  无所事事（rest，睡眠时段放空，不是睡觉）"
+            night_row = f"   • {sleep_text} - 次日{wake_text}  （不生成日程条目，睡眠时段整体留空）"
         else:
             night_row = f"   • {sleep_text} - 次日{wake_text}  睡觉（睡眠时段固定不动）"
         routine_rows = f"""   • {wake_text} 起       起床/洗漱
@@ -498,9 +529,21 @@ class PromptBuilder:
    • 晚间时段    娱乐/社交/兴趣
 {night_row}"""
 
+        # ── 覆盖口径（随模式自适应）：正常模式要求全天闭环，无睡眠模式只要求清醒时段 ──
+        if no_sleep_mode:
+            coverage_core = "🔴 核心要求：清醒时段内日程必须无缝衔接，不允许任何时间空档！（睡眠时段整体留空，不计入）"
+            coverage_rule = f"1. {min_activities}-{max_activities}个活动，完整覆盖清醒时段（无缝衔接；睡眠时段不生成条目）"
+            coverage_seam = "1. 无缝覆盖清醒时段：每个活动结束时间 = 下个活动开始时间（睡眠时段留空，不算空档）"
+            coverage_final = "🔴 核心要求：必须无缝覆盖清醒时段（睡眠时段不生成条目，不算空档）！"
+        else:
+            coverage_core = "🔴 核心要求：日程必须全天无缝衔接，不允许任何时间空档！"
+            coverage_rule = f"1. {min_activities}-{max_activities}个活动，完整覆盖全天（绕时钟闭环，无缝衔接）"
+            coverage_seam = "1. 无缝覆盖全天：每个活动结束时间 = 下个活动开始时间（不允许任何空档）"
+            coverage_final = "🔴 核心要求：必须无缝覆盖全天，不能有任何时间空档！"
+
         prompt += f"""
 【任务】生成今天的详细日程JSON：
-🔴 核心要求：日程必须全天无缝衔接，不允许任何时间空档！
+{coverage_core}
    - 每个活动的结束时间 = 下一个活动的开始时间
    - 计算公式：结束时间 = time_slot + duration_hours
 {time_range_requirement}{no_sleep_requirement}【原则】（重要！）
@@ -510,7 +553,7 @@ class PromptBuilder:
 - ⚠️ 不要为了"特色"突破常识作息（凌晨跑清醒活动、跳过晚餐、午餐推到 16 点都不可以）
 - ⚠️ 不要为了"和昨天不同"而把作息打乱（睡眠时段、三餐时段必须正常）
 
-1. {min_activities}-{max_activities}个活动，完整覆盖全天（绕时钟闭环，无缝衔接）
+{coverage_rule}
 {desc_requirement}
 3. 严格遵守开头的角色人设：身份、习惯、所处世界观要贯穿全天（不要泛化成"普通女大学生"）
 4. 兴趣偏好：{interest if interest else "日常生活"}
@@ -550,7 +593,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
         prompt += f"""
 【时间合理性要求 - 重要！】
 ⚠️ 必须同时满足以下两点：
-1. 无缝覆盖全天：每个活动结束时间 = 下个活动开始时间（不允许任何空档）
+{coverage_seam}
 2. 遵守常识性时间安排，参考以下框架（已按本角色作息锚点适配）：
 {routine_rows}
 
@@ -559,7 +602,7 @@ daily_routine(作息)|meal(吃饭)|study(学习)|entertainment(娱乐)|social_ma
 【要求】
 - 严格JSON格式，无注释
 - time_slot按时间递增（HH:MM格式）
-- 🔴 核心要求：必须无缝覆盖全天，不能有任何时间空档！
+- {coverage_final}
   * 每个活动结束时间 = 下个活动开始时间
   * 计算方式：结束时间 = time_slot + duration_hours
 - ⚠️ 关键活动时间必须合理：早餐6-9点、午餐11-14点、晚餐17-20点

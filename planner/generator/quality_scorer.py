@@ -1,4 +1,4 @@
-﻿"""Schedule Quality Scorer Module.
+"""Schedule Quality Scorer Module.
 
 This module provides quality scoring for generated schedules,
 evaluating factors like activity count, description length, and time coverage.

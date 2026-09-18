@@ -1,4 +1,4 @@
-﻿"""自主规划插件 v4 - Service 层
+"""自主规划插件 v4 - Service 层
 
 业务实现层，与组件装饰器外壳解耦：
 - plugin.py 的 ``@Tool / @Command / @HookHandler / @API`` 装饰器

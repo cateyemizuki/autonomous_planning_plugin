@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "4.6.1",
+  "version": "4.9.0",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.6.1: 修复 MaiBot 1.2.x 上 planner 注入静默失效（兼容 items/ContextItem 快照 payload）+ Hook 返回全量回传 kwargs + replyer 注入改为协作式追加（不覆盖其他插件的 extra_prompt）。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.9.0: 数据目录迁移至宿主隔离目录 ctx.paths.data_dir（首次加载自动迁移旧数据，修复评审阻断项'数据目录绕出'）；/plan 命令默认拒绝（admin_users 留空时仅本机控制台可用）；命令正则兼容引用回复场景；声明 Pillow 依赖。",
   "author": {
     "name": "靓仔",
     "url": "https://github.com/xuqian13"
@@ -12,14 +12,20 @@
     "repository": "https://github.com/xuqian13/autonomous_planning_plugin"
   },
   "host_application": {
-    "min_version": "1.0.0",
+    "min_version": "1.2.3",
     "max_version": "1.99.99"
   },
   "sdk": {
     "min_version": "2.0.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "pillow",
+      "version_spec": ">=9.0.0"
+    }
+  ],
   "display": {
     "icon": {
       "type": "local",
@@ -33,7 +39,6 @@
     "send.image",
     "send.forward",
     "config.get",
-    "config.get_plugin",
     "llm.generate",
     "message.get_by_time_in_chat",
     "chat.get_all_streams",

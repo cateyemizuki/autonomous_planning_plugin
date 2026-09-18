@@ -1,4 +1,4 @@
-﻿"""Automatic Schedule Scheduler.
+"""Automatic Schedule Scheduler.
 
 This module provides automatic scheduling functionality that generates
 daily schedules at configured times.

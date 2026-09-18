@@ -1,4 +1,4 @@
-﻿"""Schedule Generator Configuration Module.
+"""Schedule Generator Configuration Module.
 
 This module provides centralized configuration management for schedule generation,
 following the DRY principle by avoiding repeated config.get() calls.

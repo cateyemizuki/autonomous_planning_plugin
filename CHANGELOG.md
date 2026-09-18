@@ -16,6 +16,77 @@
 >
 > 各版本条目中标注了对应 issue 编号，方便溯源。
 
+## [4.9.0] - 2026-09-19
+
+### 变更（插件中心评审整改）
+
+- **数据目录迁移至宿主隔离目录**（评审阻断项"数据目录绕出"）：
+  - 全部持久化数据（`goals.db`、`llm_logs/`、日程图片）从插件安装目录下的
+    `data/` 迁移到宿主按插件 ID 注入的隔离目录 `ctx.paths.data_dir`
+    （即 `data/plugins/xuqian13.autonomous-planning-plugin-v4/`）。
+  - 首次加载时自动迁移旧数据（goals.db 及 -wal/-shm/.bak、llm_logs/、images/），
+    不覆盖已存在文件；旧目录保留作回退快照，不自动删除。
+  - 涉及：`plugin.py`（on_load + `_migrate_legacy_data_dir` + `llm_log_dir` 属性）、
+    `planner/goal_manager.py`（`get_goal_manager(data_dir)`）、
+    `services/tools_service.py`、`services/cleanup_service.py`、
+    `planner/schedule_generator.py`、`utils/schedule_image_generator.py`
+    （`configure_output_dir()`）。
+- **`/plan` 命令默认拒绝**：`admin_users` 留空时不再"所有人可用"，
+  改为仅本机控制台操作员可用（`is_local_operator` 放行）；配置后仅列表内
+  用户可用（兼容纯 ID 与 `qq:` 前缀写法）。未配置时的拒绝消息会提示配置方法。
+- **命令正则兼容引用回复**：`(?P<planning_cmd>^/(plan|规划).*$)` 的 `^` 锚点在
+  "引用+命令"场景失配，改为 `(?<!\S)/(?:plan|规划)(?:\s.*)?$` 负向前瞻写法。
+- **清理未声明/未使用的最小权限**：manifest 移除未使用的 `config.get_plugin`
+  能力（`chat.get_stream_by_group_id/user_id` 在 proactive_service 实际使用，保留）。
+- **依赖声明**：manifest `dependencies` 补充 `python_package: pillow`（>=9.0.0）。
+- **最低宿主版本抬高**：`host_application.min_version` 1.0.0 → 1.2.3。
+  插件依赖 `maisaka.*` Hook 与 `maisaka.proactive.trigger`，其 payload 契约以
+  1.2.3 为首个文档化基线；旧宿主上这些功能会静默失效，按文档要求抬高闸门。
+- **清理全部 .py 文件的 UTF-8 BOM**；`__init__.py` 的 `__version__` 同步为 4.9.0。
+
+## [4.8.0] - 2026-09-19
+
+### 变更
+
+- **`/plan list` 日程图片重排版**（`utils/schedule_image_generator.py` 整体重写）：
+  - **展示全天全部条目**：旧版固定 1280×720 画布最多渲染 5 条（以当前活动为
+    中心截取），与"列出今日日程"的诉求不符；新版按条目数**动态计算画布高度**，
+    一行一条完整铺开（空日程渲染紧凑占位图）。
+  - **排版重构**：浅色渐变背景 + 白色圆角卡片行，行内为
+    [类型色条 | 时间 | 活动名 | 状态胶囊] + 第二行描述；当前进行中的行主题色
+    描边高亮、时间加粗，已完成整行淡化；头部为 logo + 标题 +
+    "共 N 项 · 已完成 x · 进行中 y" 统计行。移除与内容无关的雪花装饰与
+    固定副标题"冬日温暖时光~"。
+  - **文字溢出治理**：活动名 / 描述按可用宽度测量并裁剪加省略号；
+    时间列固定宽度对齐。
+  - **状态判定修复**：跨午夜条目（`23:00-31:00` 累计分钟与 `23:00-07:00`
+    回绕两种写法）在凌晨判"进行中"、白天判"未开始"；旧版解析不兼容回绕写法。
+  - **时区一致**：新增 `tz_name` 参数，`/plan list` 传入配置时区
+    （旧版状态判定固定 Asia/Shanghai）。
+
+### 新增
+
+- **打包字体**：`assets/fonts/NotoSansSC-Regular.ttf`（Noto Sans SC /
+  思源黑体，SIL OFL 1.1 允许再分发，见 `assets/fonts/README.md` 与 `OFL.txt`）。
+  旧版依赖宿主机系统中文字体，裸 Linux/Docker 上常因找不到字体渲染失败
+  （静默降级为纯文字）；现在默认使用打包字体，系统字体仅作回退。
+
+## [4.7.0] - 2026-09-19
+
+### 变更（Breaking）
+
+- **无睡眠模式语义变更**：开启 `no_sleep_mode` 后，入睡（`sleep_time`）到次日起床
+  （`wake_time`）的时段不再安排"无所事事"占位活动，而是**不生成任何日程条目**
+  （`planner/schedule_generator.py` + `planner/generator/prompt_builder.py`）：
+  - 提示词层：动态 JSON 示例、无缝衔接演算、时间合理性框架均只覆盖清醒时段，
+    明确要求"睡眠时段整体留空、不生成条目"，最后一个活动恰好到入睡时刻收尾；
+  - 代码后处理层：LLM 生成日程后，完全落在睡眠时段内的日程直接销毁；与时段边界
+    部分重叠的活动截断到入睡/起床时刻（傍晚一侧截到入睡时刻，清晨一侧从起床时刻
+    起算），保证清醒时段的日程不被误删；无 `time_slot` 无法判定的条目原样保留；
+  - 质量评分的"时间覆盖率"本就按清醒时段（7:00-23:00 口径）衡量，与新语义一致，
+    多轮生成不会因睡眠时段留空而误判低分重试。
+  睡眠时段内主动行为不触发的既有行为不变。
+
 ## [4.6.1] - 2026-09-06
 
 ### 修复（Fixed）
@@ -42,10 +113,10 @@
 
 ### 验证（Tests）
 
-- 回归测试 `test9.6/test_planning_fix.py`（不启动 bot）：新旧两种 payload 注入、
-  全量 kwargs 回传、协作式合并、重试跳过、与 persona_style_injector 的链式组合，
+- 已在本地开发环境完成回归验证（不启动 bot）：新旧两种 payload 注入、
+  全量 kwargs 回传、协作式合并、重试跳过、与 persona 注入类插件的链式组合，
   以及用宿主真实 `deserialize_context_item_snapshot` + `validate_context_items`
-  校验注入快照——全部通过。
+  校验注入快照。回归脚本保留在开发工作区，不随插件仓库分发。
 
 ## [4.6.0] - 2026-09-02
 

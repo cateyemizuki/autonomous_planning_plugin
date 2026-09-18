@@ -1,4 +1,4 @@
-﻿"""Schedule Generator Module (Refactored).
+"""Schedule Generator Module (Refactored).
 
 重构版本：使用组件化设计，遵循SOLID原则
 - 职责单一：每个类只负责一件事
@@ -39,6 +39,28 @@ from .generator import (
 from .goal_manager import GoalManager
 
 logger = logging.getLogger(__name__)
+
+# 作息解析默认值（配置留空/非法时兜底）：07:00 起床，23:00 入睡
+_DEFAULT_WAKE_MINUTES = 7 * 60
+_DEFAULT_SLEEP_MINUTES = 23 * 60
+
+
+def _parse_minutes(value: Any, default: int) -> int:
+    """把 HH:MM 解析为当天分钟数；非法/留空返回 default（可为 -1 哨兵）。"""
+    try:
+        parts = str(value or "").strip().split(":")
+        hour, minute = int(parts[0]), int(parts[1])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+    except (ValueError, IndexError, TypeError):
+        pass
+    return default
+
+
+def _fmt_minutes(minutes: int) -> str:
+    """分钟数 → HH:MM（自动回绕 24 小时）。"""
+    minutes %= 24 * 60
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 # ============================================================================
@@ -577,7 +599,7 @@ class ScheduleGenerator:
                 # 验证和评分
                 validated_items, warnings = self.validator.validate(raw_items)
 
-                # v4.5.0：无睡眠模式后处理（把漏网的睡眠类活动改为无所事事）
+                # v4.7.0：无睡眠模式后处理（销毁睡眠时段内的日程）
                 validated_items, sleep_warnings = self._apply_no_sleep_postprocess(validated_items)
                 warnings.extend(sleep_warnings)
 
@@ -644,7 +666,7 @@ class ScheduleGenerator:
         # 验证
         validated_items, warnings = self.validator.validate(raw_items)
 
-        # v4.5.0：无睡眠模式后处理（把漏网的睡眠类活动改为无所事事）
+        # v4.7.0：无睡眠模式后处理（销毁睡眠时段内的日程）
         validated_items, sleep_warnings = self._apply_no_sleep_postprocess(validated_items)
         warnings.extend(sleep_warnings)
 
@@ -663,11 +685,16 @@ class ScheduleGenerator:
         self,
         items: List[Dict[str, Any]],
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        """v4.5.0：无睡眠模式后处理。
+        """v4.7.0：无睡眠模式后处理——销毁睡眠时段内的日程。
 
-        prompt 层已要求不生成睡眠类活动，但 LLM 偶尔会漏网。此方法把
-        仍带有睡眠语义的活动改为"无所事事"（自由活动 / 放空），保证
-        开启 ``no_sleep_mode`` 后日程中绝不出现睡眠活动。
+        语义（v4.7.0 起变更）：开启 ``no_sleep_mode`` 后，入睡（``sleep_time``）
+        到次日起床（``wake_time``）的时段**不保留任何日程条目**。prompt 层已
+        要求不在该时段生成日程，但 LLM 偶尔会漏网，此方法在落库前兜底：
+
+        - 完全落在睡眠时段内的日程项 → 直接删除（销毁）；
+        - 与睡眠时段部分重叠的日程项 → 截断到时段边界（傍晚一侧截到入睡
+          时刻，清晨一侧从起床时刻起算），保证清醒时段的日程不被误删；
+        - 无 time_slot 的条目无法判定归属，原样保留。
 
         Args:
             items: validator 校验后的日程项字典列表。
@@ -678,24 +705,80 @@ class ScheduleGenerator:
         if not bool(getattr(self.config, "no_sleep_mode", False)):
             return items, []
 
-        sleep_keywords = (
-            "睡觉", "睡眠", "安睡", "睡午觉", "午睡", "小憩", "补觉", "入睡",
-            "瞌睡", "就寝", "夜间睡眠", "安眠", "午休", "打盹", "赖床",
-        )
-        converted = 0
+        sleep_min = _parse_minutes(self.config.sleep_time, _DEFAULT_SLEEP_MINUTES)
+        wake_min = _parse_minutes(self.config.wake_time, _DEFAULT_WAKE_MINUTES)
+        window_len = (wake_min - sleep_min) % (24 * 60)
+        if window_len == 0:
+            # 起床 == 入睡：视为全天清醒，没有可销毁的时段
+            return items, []
+
+        kept: List[Dict[str, Any]] = []
+        removed = 0
+        truncated = 0
         for item in items:
-            name = str(item.get("name", "") or "")
-            if any(kw in name for kw in sleep_keywords):
-                item["name"] = "无所事事"
-                item["goal_type"] = "rest"
-                item["description"] = "放空发呆，什么也不做，享受一段没有安排的时间"
-                converted += 1
+            start = _parse_minutes(item.get("time_slot"), -1)
+            if start < 0:
+                kept.append(item)
+                continue
+            try:
+                duration = float(item.get("duration_hours") or 0) * 60
+            except (TypeError, ValueError):
+                duration = 0.0
+            if duration <= 0:
+                duration = 60.0  # 与 apply_schedule 的默认时长一致
+            end = start + duration
+
+            # 睡眠时段是环形区间（可跨午夜）：把窗口展开到 24h 周期上求重叠
+            overlap = 0.0
+            best = None  # 重叠最大的窗口副本 (win_start, win_end)
+            for k in range(-2, 3):
+                win_start = sleep_min + k * 24 * 60
+                win_end = win_start + window_len
+                o = min(end, win_end) - max(start, win_start)
+                if o > overlap:
+                    overlap = o
+                    best = (win_start, win_end)
+
+            if overlap <= 0:
+                kept.append(item)
+                continue
+
+            if overlap >= end - start:
+                removed += 1  # 完全落在睡眠时段：直接销毁
+                continue
+
+            # 部分重叠：截断到边界，保留清醒一侧
+            win_start, win_end = best
+            if start >= win_start:
+                # 从窗口内部开始（清晨越界）：起点平移到起床时刻
+                new_start = win_end
+                new_duration = end - new_start
+                if new_duration <= 0:
+                    removed += 1
+                    continue
+                item["time_slot"] = _fmt_minutes(new_start)
+                item["duration_hours"] = round(new_duration / 60, 2)
+            else:
+                # 从清醒时段越入窗口（傍晚越界）：终点截到入睡时刻
+                new_duration = win_start - start
+                if new_duration <= 0:
+                    removed += 1
+                    continue
+                item["duration_hours"] = round(new_duration / 60, 2)
+            truncated += 1
+            kept.append(item)
 
         warnings = []
-        if converted:
-            warnings.append(f"无睡眠模式：已将 {converted} 个睡眠类活动改为'无所事事'")
-            logger.info(f"😴→🛋️ 无睡眠模式：转换了 {converted} 个睡眠类活动为无所事事")
-        return items, warnings
+        if removed or truncated:
+            window_text = f"{_fmt_minutes(sleep_min)}-次日{_fmt_minutes(wake_min)}"
+            warnings.append(
+                f"无睡眠模式：已销毁睡眠时段（{window_text}）内 {removed} 个日程，"
+                f"截断 {truncated} 个越界活动"
+            )
+            logger.info(
+                f"🧹 无睡眠模式：销毁睡眠时段内 {removed} 个日程，截断 {truncated} 个越界活动"
+            )
+        return kept, warnings
 
     async def _call_llm(self, prompt: str) -> List[Dict[str, Any]]:
         """调用 LLM 并解析响应（v4：通过 ctx.llm.generate）
@@ -776,9 +859,9 @@ class ScheduleGenerator:
         log_dir = raw.get("llm_log_dir")
         if not log_dir:
             # plugin 未注入路径时跳过（测试场景）
-            if self._plugin is None or not hasattr(self._plugin, "_plugin_root"):
+            log_dir = getattr(self._plugin, "llm_log_dir", None)
+            if log_dir is None:
                 return
-            log_dir = self._plugin._plugin_root / "data" / "llm_logs"
         from pathlib import Path
         log_llm_call(call_type, prompt, response, model, success, Path(log_dir))
 

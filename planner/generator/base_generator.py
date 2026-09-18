@@ -1,4 +1,4 @@
-﻿"""Base Generator Module.
+"""Base Generator Module.
 
 职责：
     - 模型任务名解析（供 ScheduleGenerator 在调 ``ctx.llm.generate`` 时使用）

@@ -1,4 +1,4 @@
-﻿"""Parameter Validator Module.
+"""Parameter Validator Module.
 
 This module provides unified parameter validation functionality,
 eliminating code duplication across multiple modules.

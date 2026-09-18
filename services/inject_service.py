@@ -1,4 +1,4 @@
-﻿"""日程注入业务实现（HookHandler 入口：``maisaka.planner.before_request``）。
+"""日程注入业务实现（HookHandler 入口：``maisaka.planner.before_request``）。
 
 业务子模块（IntentClassifier / ActivityStateAnalyzer / InjectOptimizer /
 ConversationContextCache）实现于 ``handlers/inject/``。

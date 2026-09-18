@@ -1,4 +1,14 @@
-"""自主规划插件 v4 - 配置模型（v4.6.0）。
+"""自主规划插件 v4 - 配置模型（v4.8.0）。
+
+**v4.8.0 变更**：
+    - ``/plan list`` 日程图片重排版：展示全天全部条目（动态高度清单）、
+      进行中高亮 / 已完成淡化、文字截断、跨午夜状态修复；
+      打包 Noto Sans SC 字体（assets/fonts/），不再依赖宿主系统中文字体。
+
+**v4.7.0 变更**：
+    - 无睡眠模式语义变更：开启 ``no_sleep_mode`` 后，入睡到起床的时段不再安排
+      "无所事事"，而是**不生成任何日程条目**——LLM 生成日程后，该时段内的日程
+      会被代码后处理销毁（与睡眠时段部分重叠的活动截断到时段边界）。
 
 **v4.6.0 变更**：
     - 作息语义重构：``day_start_time`` / ``day_end_time`` 更名为 ``wake_time`` /
@@ -45,8 +55,8 @@ from typing import ClassVar, List
 
 from maibot_sdk import Field, PluginConfigBase
 
-# 配置版本（config_version）：与 _manifest.json 的 version 保持同步（v4.6.1）。
-SUPPORTED_CONFIG_VERSION = "4.6.1"
+# 配置版本（config_version）：与 _manifest.json 的 version 保持同步（v4.9.0）。
+SUPPORTED_CONFIG_VERSION = "4.9.0"
 
 
 # ============================================================
@@ -145,8 +155,8 @@ class ScheduleConfig(PluginConfigBase):
     sleep_time: str = Field(
         default="23:00",
         description="每天上床入睡的时间（HH:MM）。这一刻之后到次日起床是睡眠时段：正常模式下"
-                    "安排睡觉活动；无睡眠模式下改为'无所事事'，且主动行为不会在睡眠时段触发。"
-                    "入睡时间早于起床时间表示跨午夜作息。",
+                    "安排睡觉活动；无睡眠模式下该时段不生成任何日程（LLM 生成后销毁该时段的日程），"
+                    "且主动行为不会在睡眠时段触发。入睡时间早于起床时间表示跨午夜作息。",
         json_schema_extra={
             "label": "入睡时间",
             "hint": "HH:MM；这一刻之后进入睡眠时段（默认 23:00）",
@@ -156,13 +166,13 @@ class ScheduleConfig(PluginConfigBase):
     )
     no_sleep_mode: bool = Field(
         default=False,
-        description="无睡眠模式。开启后生成日程时不安排任何睡眠类活动（睡觉/午休/小憩/打盹等），"
-                    "入睡到起床的时段改为'无所事事'（自由活动 / 放空）；提示词与代码后处理双重保证，"
+        description="无睡眠模式。开启后入睡到起床的时段不生成任何日程：提示词要求 LLM 不在该时段"
+                    "安排活动，生成后代码再销毁该时段内残留的日程（与时段边界重叠的活动截断到边界），"
                     "且睡眠时段内主动行为（活动切换发起 / 早间问好）不会触发。"
                     "适合不需要睡眠的角色设定（机器人、AI、非人生物等）。",
         json_schema_extra={
             "label": "无睡眠模式",
-            "hint": "开启后睡眠时段改为无所事事，全天不出现睡眠类活动",
+            "hint": "开启后睡眠时段不生成任何日程（生成后自动销毁该时段日程）",
             "order": 3,
         },
     )
@@ -571,11 +581,13 @@ class AdminConfig(PluginConfigBase):
 
     admin_users: List[str] = Field(
         default_factory=list,
-        description="管理员 QQ 号列表，控制谁能执行 /plan 命令（list / regenerate / delete / clear 等）。"
-                    "留空 = 所有人可用。注意：只管命令权限，不影响自然语言触发的日程变更（那由角色裁判把关）。",
+        description="管理员列表，控制谁能执行 /plan 命令（list / regenerate / delete / clear 等）。"
+                    "v4.9.0 起默认拒绝：留空 = 仅本机控制台可用（QQ 侧用户一律拒绝），"
+                    "填写后 = 列表内用户可用（兼容纯 ID 与 qq: 前缀两种写法）。"
+                    "注意：只管命令权限，不影响自然语言触发的日程变更（那由角色裁判把关）。",
         json_schema_extra={
-            "label": "管理员 QQ",
-            "hint": '纯数字 QQ 号，例 ["123456"]；留空 = 所有人可用 /plan 命令',
+            "label": "管理员",
+            "hint": '例 ["123456"] 或 ["qq:123456"]；留空 = 仅本机控制台可用 /plan',
             "item_type": "string",
             "placeholder": '["123456"]',
             "order": 1,

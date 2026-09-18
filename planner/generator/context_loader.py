@@ -1,4 +1,4 @@
-﻿"""Context Loader Module.
+"""Context Loader Module.
 
 This module provides historical context loading functionality for schedule generation.
 Separated from BaseScheduleGenerator to follow Single Responsibility Principle.
