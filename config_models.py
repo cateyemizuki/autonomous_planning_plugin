@@ -55,8 +55,8 @@ from typing import ClassVar, List
 
 from maibot_sdk import Field, PluginConfigBase
 
-# 配置版本（config_version）：与 _manifest.json 的 version 保持同步（v4.9.0）。
-SUPPORTED_CONFIG_VERSION = "4.9.0"
+# 配置版本（config_version）：与 _manifest.json 的 version 保持同步（v4.9.1）。
+SUPPORTED_CONFIG_VERSION = "4.9.1"
 
 
 # ============================================================

@@ -76,12 +76,72 @@ class GoalDatabase:
             self._create_backup()
 
         # Initialize schema
+        # v4.7.1：损坏自愈——库文件损坏（malformed 等）时自动隔离坏文件并
+        # 重建空库，保证插件加载永不因数据库损坏而失败。库中只存日程/目标
+        # 类数据（日程可再生），重建的代价可接受；坏文件保留为
+        # *.corrupt-<时间戳> 供事后排查。
         try:
             self._init_schema()
             logger.debug(f"Initialized GoalDatabase at {self.db_path}")
-        except Exception as e:
-            logger.critical(f"❌ CRITICAL: Failed to initialize GoalDatabase at {self.db_path}: {e}", exc_info=True)
-            raise
+        except sqlite3.DatabaseError as e:
+            if not self._is_corruption_error(e):
+                logger.critical(
+                    f"❌ CRITICAL: Failed to initialize GoalDatabase at {self.db_path}: {e}",
+                    exc_info=True,
+                )
+                raise
+            logger.critical(
+                f"❌ CRITICAL: 数据库文件损坏（{self.db_path.name}）: {e} —— "
+                f"自动隔离损坏文件并重建空库（原文件保留为 *.corrupt-* 供排查）"
+            )
+            self._reset_connection()
+            self._quarantine_corrupt_files()
+            self._init_schema()
+
+    @staticmethod
+    def _is_corruption_error(e: BaseException) -> bool:
+        """判断是否为数据库文件损坏类错误（只有这类错误才值得隔离重建）。"""
+        text = str(e).lower()
+        return any(
+            kw in text
+            for kw in ("malformed", "not a database", "encrypted", "corrupt")
+        )
+
+    def _reset_connection(self) -> None:
+        """关闭并丢弃当前线程的连接（隔离文件前必须先释放文件句柄）。"""
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 —— 连接可能已处于损坏状态
+                pass
+            try:
+                del self._local.connection
+            except AttributeError:
+                pass
+
+    def _quarantine_corrupt_files(self) -> None:
+        """把损坏的库文件与 WAL/SHM 侧车按时间戳改名隔离（不删除，留证排查）。"""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(self.db_path) + suffix)
+            if not src.exists():
+                continue
+            dst = Path(f"{src}.corrupt-{stamp}")
+            try:
+                src.rename(dst)
+                logger.warning(f"已隔离损坏的数据库文件: {dst.name}")
+            except OSError as e:
+                # 隔离失败（如句柄未释放）则尝试直接删除，避免重建后仍读到坏文件
+                logger.error(f"隔离数据库文件失败: {src.name} - {e}")
+                try:
+                    src.unlink()
+                    logger.warning(f"已删除无法隔离的损坏文件: {src.name}")
+                except OSError:
+                    logger.critical(
+                        f"❌ CRITICAL: 无法隔离也无法删除损坏文件: {src.name}，"
+                        f"重建可能失败，请手动处理该文件后重启"
+                    )
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection.
