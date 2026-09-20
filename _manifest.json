@@ -2,14 +2,16 @@
   "manifest_version": 2,
   "version": "4.9.1",
   "name": "麦麦自主规划插件 v4",
-  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.9.1: 数据库损坏自愈（加载时检测到 goals.db malformed 自动隔离坏文件并重建空库，不再阻塞插件加载）；v4.9.0: 数据目录迁移至宿主隔离目录 ctx.paths.data_dir（首次加载自动迁移旧数据，修复评审阻断项'数据目录绕出'）；/plan 命令默认拒绝（admin_users 留空时仅本机控制台可用）；命令正则兼容引用回复场景；声明 Pillow 依赖。",
+  "description": "让麦麦具备自主规划能力，通过 LLM 智能生成符合人设的日常生活日程。v4.9.1: 数据库损坏自愈（加载时检测到 goals.db malformed 自动隔离坏文件并重建空库，不再阻塞插件加载）；v4.9.0: 数据目录迁移至宿主隔离目录 ctx.paths.data_dir（首次加载自动迁移旧数据，修复评审阻断项'数据目录绕出'）；/plan 命令默认拒绝（admin_users 留空时仅本机控制台可用）；命令正则兼容引用回复场景；声明 Pillow 依赖。本 fork 由 cateye 维护（原作者 靓仔/xuqian13）：https://github.com/cateyemizuki/autonomous_planning_plugin",
   "author": {
-    "name": "靓仔",
+    "name": "靓仔（原作者）",
     "url": "https://github.com/xuqian13"
   },
   "license": "AGPL-3.0",
   "urls": {
-    "repository": "https://github.com/xuqian13/autonomous_planning_plugin"
+    "repository": "https://github.com/cateyemizuki/autonomous_planning_plugin",
+    "homepage": "https://github.com/xuqian13/autonomous_planning_plugin",
+    "issues": "https://github.com/cateyemizuki/autonomous_planning_plugin/issues"
   },
   "host_application": {
     "min_version": "1.2.3",

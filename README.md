@@ -1,10 +1,25 @@
-# 麦麦自主规划插件 v4 · v4.6.0
+# 麦麦自主规划插件 v4 · v4.9.1
 
 > MaiBot 自主规划插件：让麦麦像真实生活着的人一样——有自己的作息、当下正在做的事，
 > 回复时贴合生活节奏，还会主动兑现和你的约定。
 >
 > 🗄️ 旧版说明（v4.5.0 及更早）已归档至 [README_v4.5_归档.md](README_v4.5_归档.md)，
 > 版本变更详见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 作者与维护
+
+| | |
+|---|---|
+| **原作者** | 靓仔 — 上游项目 [xuqian13/autonomous_planning_plugin](https://github.com/xuqian13/autonomous_planning_plugin) |
+| **现维护者** | cateye — [cateyemizuki](https://github.com/cateyemizuki) |
+| **本仓库** | <https://github.com/cateyemizuki/autonomous_planning_plugin>（上游的 fork） |
+| **许可证** | **AGPL-3.0** — 完整保留上游 `LICENSE` 全文与版权声明；本 fork 的改动在本 README 与 [CHANGELOG.md](CHANGELOG.md) 中逐项标注 |
+
+> 插件 ID `xuqian13.autonomous-planning-plugin-v4` **保持不变**——其他插件（如「麦麦恋人」
+> [cateyemizuki/Mai_love](https://github.com/cateyemizuki/Mai_love) 的外部日程模式）依赖它调用
+> 公开 API `get_current_activity`，改 ID 会让所有消费方失联。原作者信息保留在
+> `_manifest.json` 的 `author` 字段。
+> v4.5.0 起的改动依次对应上游仓库的 issues，见 [CHANGELOG.md](CHANGELOG.md) 的「Fork 溯源说明」。
 
 ---
 
@@ -226,11 +241,15 @@ if snapshot["has_activity"]:
 
 ## 开发与维护
 
+- **维护者**：cateye（[cateyemizuki](https://github.com/cateyemizuki)）维护本 fork，
+  上游原作者为 靓仔（[xuqian13](https://github.com/xuqian13)）。反馈与问题请提到本 fork 的
+  [Issues](https://github.com/cateyemizuki/autonomous_planning_plugin/issues)。
 - **源码结构**：`plugin.py`（组件外壳：4 Tool + 1 Command + 2 Hook + 1 API）→
   `services/`（业务）→ `planner/`（目标 / 日程生成 / 定时 / 裁判）→
   `handlers/inject/`（注入子算法）→ `utils/` `cache/` `database/` `core/`
 - **版本号同步**：修改版本时需同步 3 处——`_manifest.json` 的 `version`、
   `config_models.py` 的 `SUPPORTED_CONFIG_VERSION`、`__init__.py` 的 `__version__`
+  （v4.9.1 已把 `__init__.py` 落后的一处补齐）
 - **变更记录**：每个版本的变更写入 `CHANGELOG.md`
 - **数据目录**：v4.9.0 起使用宿主隔离目录 `ctx.paths.data_dir`
   （`data/plugins/<plugin_id>/`，goals.db / llm_logs/ 等）；旧版插件目录下的
@@ -239,4 +258,6 @@ if snapshot["has_activity"]:
 
 ## License
 
-AGPL-3.0（保留上游 LICENSE 全文；本项目未引入其他来源代码）
+**AGPL-3.0**（完整保留上游 `LICENSE` 全文与版权声明，未更换协议、未引入其他来源代码）。
+本 fork 的改动（v4.5.0 – v4.9.1）已在本 README 与 [CHANGELOG.md](CHANGELOG.md) 中逐项标注，
+符合 AGPL 对"修改版本需标明改动"的要求。

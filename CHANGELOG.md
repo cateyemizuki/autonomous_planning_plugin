@@ -4,9 +4,14 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **Fork 溯源说明**：本分支的 v4.5.0 修改主要依据
+> **Fork 溯源说明**：本仓库是
 > [xuqian13/autonomous_planning_plugin](https://github.com/xuqian13/autonomous_planning_plugin)
-> 仓库的以下 issues（链接可点击回溯）：
+> 的 fork——**原作者为 靓仔（[xuqian13](https://github.com/xuqian13)），现由
+> cateye（[cateyemizuki](https://github.com/cateyemizuki)）维护**。
+> 插件 ID `xuqian13.autonomous-planning-plugin-v4` **保持不变**（其他插件依赖它调用公开
+> API `get_current_activity`）；许可证保持上游的 **AGPL-3.0**，`LICENSE` 全文与版权声明原样保留。
+>
+> 本分支 v4.5.0 起的修改主要依据上游仓库的以下 issues（链接可点击回溯）：
 >
 > - [#14 请求更新 host_application.max_version 以兼容 MaiBot v1.1.0](https://github.com/xuqian13/autonomous_planning_plugin/issues/14)
 > - [#13 MaiBot 1.1.0 兼容: host_application.max_version 需要更新](https://github.com/xuqian13/autonomous_planning_plugin/issues/13)
@@ -28,6 +33,9 @@
   隔离失败则兜底删除），随后重建空库完成初始化。库中仅存日程/目标类
   数据：日程会自动再生，损失仅限未来约定与长期目标。非损坏类错误
   （如锁定、权限）仍按原路径抛出，不做破坏性处理。
+- **`__init__.py` 版本号补齐 4.9.1**：该文件此前停留在 `4.9.0`，与
+  `_manifest.json` / `config_models.py` 的 `4.9.1` 不一致（README「开发与维护」
+  要求三处同步）。本次一并修正，无行为变化。由维护者 cateye 修正。
 
 ## [4.9.0] - 2026-09-19
 
